@@ -1,2 +1,2 @@
-# strata-db
-A modular, layered database engine in Rust. Built for learning, experimentation, and exploring database internals — from key encoding to query execution. Pluggable storage backends, starting with sled.
+# 🌥️ strata-db — a layered database you can take apart
+StrataDB is an educational SQL database built in Rust, designed to make every layer of database engineering visible and swappable. The default storage backend is sled, but the architecture is designed so you can bring your own.
