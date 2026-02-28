@@ -6,7 +6,7 @@ This is not a production database. It's a playground for exploring database engi
 
 ## Architecture
 
-```
+```txt
 SQL Parser  (sqlparser-rs)
      ↓
 Query Executor

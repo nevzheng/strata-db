@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Node (used for husky + commitlint)
+node_modules/
+package-lock.json
