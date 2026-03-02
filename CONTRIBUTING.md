@@ -1,3 +1,24 @@
+# Contributing
+
+## Branches
+
+Branch names follow the pattern `type/short-description`:
+
+```md
+- feat/add-memtable
+- fix/null-query-result
+- refactor/split-query-engine
+- chore/bump-tokio
+- spike/duckdb-feasibility
+```
+
+A `spike` is a time-boxed investigation — the output is knowledge, not production code.
+
+Include a ticket or issue ID when one exists:
+`feat/ENG-42-add-memtable` or `fix/123-null-query-result`.
+
+Use the same types as commits. All lowercase, hyphens between words.
+
 ## Commits
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
@@ -19,7 +40,8 @@ Not every commit needs all four. A small fix might just be
 a body that explains the reasoning.
 
 ### Commit Template
-```
+
+```md
 type(scope): what changed
 
 Why:
