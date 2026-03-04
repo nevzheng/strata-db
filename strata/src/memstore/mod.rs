@@ -1,4 +1,5 @@
 mod btree;
+pub mod wal;
 pub use btree::BTreeMapStore;
 
 use thiserror::Error;
