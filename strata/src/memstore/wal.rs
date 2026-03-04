@@ -1,4 +1,6 @@
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
@@ -17,7 +19,7 @@ const OP_DELETE: u8 = 0x02;
 ///
 /// Put:    `| 0x01 (1B) | key_len (2B) | val_len (2B) | key | value | crc32 (4B) |`
 /// Delete: `| 0x02 (1B) | key_len (2B) | key | crc32 (4B) |`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WalOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
@@ -133,6 +135,65 @@ impl WalOp {
         }
 
         Ok(entry)
+    }
+}
+
+/// A write-ahead log backed by a file on disk.
+///
+/// Writes are unbuffered and synced to disk after each append
+/// to ensure durability across crashes.
+#[derive(Debug)]
+pub struct WriteAheadLog {
+    dir: PathBuf,
+    file: File,
+}
+
+impl WriteAheadLog {
+    /// Create a new WAL in the given directory.
+    ///
+    /// Creates the directory if it does not exist.
+    /// Returns an error if `wal_dir` is empty.
+    pub fn new(wal_dir: &Path) -> io::Result<Self> {
+        if wal_dir.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WAL directory path cannot be empty",
+            ));
+        }
+        fs::create_dir_all(wal_dir)?;
+        let path = wal_dir.join("wal");
+        let file = File::options().create(true).append(true).open(&path)?;
+        Ok(Self {
+            dir: wal_dir.to_path_buf(),
+            file,
+        })
+    }
+
+    /// Append a WAL operation to the log and sync to disk.
+    pub fn append(&mut self, op: &WalOp) -> io::Result<()> {
+        op.encode(&mut self.file)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Replay all entries in the WAL, returning them in order.
+    ///
+    /// Stops at EOF or at the first corrupted entry.
+    pub fn replay(&self) -> io::Result<Vec<WalOp>> {
+        let path = self.dir.join("wal");
+        let file = File::open(&path)?;
+        let mut reader = io::BufReader::new(file);
+        let mut ops = Vec::new();
+
+        loop {
+            match WalOp::decode(&mut reader) {
+                Ok(op) => ops.push(op),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(ops)
     }
 }
 
@@ -270,6 +331,114 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    // --- WriteAheadLog creation ---
+
+    #[test]
+    fn wal_creates_directory_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal_data");
+
+        let _wal = WriteAheadLog::new(&wal_dir).unwrap();
+        assert!(wal_dir.exists());
+        assert!(wal_dir.join("wal").exists());
+    }
+
+    #[test]
+    fn wal_opens_existing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal_data");
+        fs::create_dir_all(&wal_dir).unwrap();
+
+        let _wal = WriteAheadLog::new(&wal_dir).unwrap();
+        assert!(wal_dir.join("wal").exists());
+    }
+
+    #[test]
+    fn wal_rejects_empty_path() {
+        let result = WriteAheadLog::new(Path::new(""));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    // --- append and replay ---
+
+    #[test]
+    fn append_and_replay_single_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = WriteAheadLog::new(&tmp.path().join("wal_data")).unwrap();
+
+        let op = WalOp::Put {
+            key: b"user:alice".to_vec(),
+            value: b"admin".to_vec(),
+        };
+        wal.append(&op).unwrap();
+
+        let replayed = wal.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0], op);
+    }
+
+    #[test]
+    fn append_and_replay_multiple_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = WriteAheadLog::new(&tmp.path().join("wal_data")).unwrap();
+
+        let ops = vec![
+            WalOp::Put {
+                key: b"order:1001".to_vec(),
+                value: b"pending".to_vec(),
+            },
+            WalOp::Delete {
+                key: b"order:0999".to_vec(),
+            },
+            WalOp::Put {
+                key: b"order:1002".to_vec(),
+                value: b"shipped".to_vec(),
+            },
+        ];
+
+        for op in &ops {
+            wal.append(op).unwrap();
+        }
+
+        let replayed = wal.replay().unwrap();
+        assert_eq!(replayed, ops);
+    }
+
+    #[test]
+    fn replay_empty_wal_returns_no_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = WriteAheadLog::new(&tmp.path().join("wal_data")).unwrap();
+
+        let replayed = wal.replay().unwrap();
+        assert!(replayed.is_empty());
+    }
+
+    #[test]
+    fn replay_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal_data");
+
+        let op = WalOp::Put {
+            key: b"config:theme".to_vec(),
+            value: b"dark".to_vec(),
+        };
+
+        // Write and drop.
+        {
+            let mut wal = WriteAheadLog::new(&wal_dir).unwrap();
+            wal.append(&op).unwrap();
+        }
+
+        // Reopen and replay.
+        let wal = WriteAheadLog::new(&wal_dir).unwrap();
+        let replayed = wal.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0], op);
     }
 
     #[test]
