@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// A key-value pair of owned byte vectors.
+pub type KVPair = (Vec<u8>, Vec<u8>);
+
 /// Errors that can occur during write operations.
 #[derive(Debug, Error)]
 pub enum WriteError {
@@ -97,7 +100,7 @@ pub trait MemStore {
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ReadError>;
+    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<KVPair>, ReadError>;
 
     /// Current size in bytes of the store's contents.
     fn size(&self) -> usize;
