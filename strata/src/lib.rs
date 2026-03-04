@@ -131,6 +131,60 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "TODO: engine should flush memtable before it fills up"]
+    fn put_returns_error_when_memtable_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Tiny capacity: 64 bytes
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+
+        // Fill the memtable with small entries until it rejects a write.
+        let mut i = 0u32;
+        let err = loop {
+            let key = format!("k:{i}");
+            let val = format!("v:{i}");
+            if let Err(e) = engine.put(key.as_bytes(), val.as_bytes()) {
+                break e;
+            }
+            i += 1;
+            assert!(i < 1000, "expected StoreFull but wrote 1000 entries");
+        };
+
+        // Should surface as a WriteError::StoreFull through StorageError.
+        assert!(
+            matches!(err, StorageError::WriteError(WriteError::StoreFull)),
+            "expected StoreFull, got: {err:?}"
+        );
+
+        // Earlier keys should still be readable.
+        assert!(engine.get(b"k:0").unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "TODO: engine should flush memtable before it fills up"]
+    fn reopen_with_full_memtable_fails_on_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Fill a tiny memtable until it's full, then drop the engine.
+        {
+            let mut engine =
+                StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+            let mut i = 0u32;
+            loop {
+                let key = format!("k:{i}");
+                let val = format!("v:{i}");
+                if engine.put(key.as_bytes(), val.as_bytes()).is_err() {
+                    break;
+                }
+                i += 1;
+            }
+        }
+
+        // Reopen with the same tiny capacity — WAL replay should hit StoreFull.
+        let result = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64));
+        assert!(result.is_err(), "expected replay to fail, but it succeeded");
+    }
+
+    #[test]
     fn data_survives_reopen() {
         let tmp = tempfile::tempdir().unwrap();
 
