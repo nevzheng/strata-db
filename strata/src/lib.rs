@@ -4,7 +4,7 @@ use std::path::Path;
 
 use memstore::{
     MemStore, ReadError, WriteError,
-    wal::{WalOp, WriteAheadLog},
+    wal::{WalMeta, WalOp, WriteAheadLog},
 };
 use thiserror::Error;
 use tracing::{info, instrument};
@@ -45,18 +45,21 @@ impl From<std::io::Error> for StorageError {
 pub struct StorageEngine<M: MemStore> {
     mem: M,
     wal: WriteAheadLog,
+    seq: u64,
 }
 
 impl<M: MemStore> StorageEngine<M> {
     pub fn new(dir: &Path, mut mem: M) -> Result<Self, StorageError> {
         let wal = WriteAheadLog::new(&dir.join("wal"))?;
+        let mut seq = 0u64;
         for op in wal.replay()? {
+            seq = op.meta().seq;
             match op {
-                WalOp::Put { key, value } => mem.put(&key, &value)?,
-                WalOp::Delete { key } => mem.delete(&key)?,
+                WalOp::Put { key, value, .. } => mem.put(&key, &value)?,
+                WalOp::Delete { key, .. } => mem.delete(&key)?,
             }
         }
-        Ok(Self { mem, wal })
+        Ok(Self { mem, wal, seq })
     }
 
     /// Insert a key-value pair.
@@ -64,14 +67,17 @@ impl<M: MemStore> StorageEngine<M> {
     /// Writes to the WAL first (blocking until durable), then inserts into the memstore.
     #[instrument(skip(self, key, value), fields(key_len = key.len(), value_len = value.len()))]
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let next_seq = self.seq + 1;
         let op = WalOp::Put {
+            meta: WalMeta { seq: next_seq },
             key: key.to_vec(),
             value: value.to_vec(),
         };
         self.wal.append(&op)?;
         info!("wal ok");
         self.mem.put(key, value)?;
-        info!("memstore ok");
+        self.seq = next_seq;
+        info!(seq = self.seq, "memstore ok");
         Ok(())
     }
 
@@ -80,12 +86,22 @@ impl<M: MemStore> StorageEngine<M> {
     /// Writes to the WAL first (blocking until durable), then deletes from the memstore.
     #[instrument(skip(self, key), fields(key_len = key.len()))]
     pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
-        let op = WalOp::Delete { key: key.to_vec() };
+        let next_seq = self.seq + 1;
+        let op = WalOp::Delete {
+            meta: WalMeta { seq: next_seq },
+            key: key.to_vec(),
+        };
         self.wal.append(&op)?;
         info!("wal ok");
         self.mem.delete(key)?;
-        info!("memstore ok");
+        self.seq = next_seq;
+        info!(seq = self.seq, "memstore ok");
         Ok(())
+    }
+
+    /// Current monotonic write sequence number.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// Retrieve the value for a given key.
@@ -182,6 +198,36 @@ mod tests {
         // Reopen with the same tiny capacity — WAL replay should hit StoreFull.
         let result = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64));
         assert!(result.is_err(), "expected replay to fail, but it succeeded");
+    }
+
+    #[test]
+    fn seq_increments_on_writes_and_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+
+        assert_eq!(engine.seq(), 0);
+        engine.put(b"a", b"1").unwrap();
+        assert_eq!(engine.seq(), 1);
+        engine.put(b"b", b"2").unwrap();
+        assert_eq!(engine.seq(), 2);
+        engine.delete(b"a").unwrap();
+        assert_eq!(engine.seq(), 3);
+    }
+
+    #[test]
+    fn seq_restored_from_wal_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        {
+            let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+            engine.put(b"x", b"1").unwrap();
+            engine.put(b"y", b"2").unwrap();
+            engine.delete(b"x").unwrap();
+            assert_eq!(engine.seq(), 3);
+        }
+
+        let engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+        assert_eq!(engine.seq(), 3);
     }
 
     #[test]
