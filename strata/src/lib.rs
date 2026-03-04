@@ -7,6 +7,7 @@ use memstore::{
     wal::{WalOp, WriteAheadLog},
 };
 use thiserror::Error;
+use tracing::{info, instrument};
 
 /// Errors returned by [`StorageEngine`] operations.
 #[derive(Debug, Error)]
@@ -61,23 +62,29 @@ impl<M: MemStore> StorageEngine<M> {
     /// Insert a key-value pair.
     ///
     /// Writes to the WAL first (blocking until durable), then inserts into the memstore.
+    #[instrument(skip(self, key, value), fields(key_len = key.len(), value_len = value.len()))]
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let op = WalOp::Put {
             key: key.to_vec(),
             value: value.to_vec(),
         };
         self.wal.append(&op)?;
+        info!("wal ok");
         self.mem.put(key, value)?;
+        info!("memstore ok");
         Ok(())
     }
 
     /// Delete a key.
     ///
     /// Writes to the WAL first (blocking until durable), then deletes from the memstore.
+    #[instrument(skip(self, key), fields(key_len = key.len()))]
     pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
         let op = WalOp::Delete { key: key.to_vec() };
         self.wal.append(&op)?;
+        info!("wal ok");
         self.mem.delete(key)?;
+        info!("memstore ok");
         Ok(())
     }
 
