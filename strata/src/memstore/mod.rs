@@ -1,3 +1,6 @@
+mod btree;
+pub use btree::BTreeMapStore;
+
 use thiserror::Error;
 
 /// A key-value pair of owned byte vectors.
