@@ -13,73 +13,18 @@ pub const MAX_VALUE_SIZE: usize = u16::MAX as usize;
 const OP_PUT: u8 = 0x01;
 const OP_DELETE: u8 = 0x02;
 
-/// Current metadata size: just seq (8 bytes).
-const META_SIZE: u16 = 8;
-
 /// Per-entry metadata written to the WAL.
-///
-/// Wire format (big-endian): `| meta_len (2B) | seq (8B) | ...future fields... |`
-///
-/// The `meta_len` prefix allows adding fields without breaking the format.
-/// Decoders skip any unrecognised trailing bytes inside the metadata region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalMeta {
     pub seq: u64,
-}
-
-impl WalMeta {
-    fn encode(&self, w: &mut impl Write, hasher: &mut Hasher) -> io::Result<()> {
-        let meta_len = META_SIZE.to_be_bytes();
-        let seq = self.seq.to_be_bytes();
-
-        hasher.update(&meta_len);
-        hasher.update(&seq);
-
-        w.write_all(&meta_len)?;
-        w.write_all(&seq)?;
-        Ok(())
-    }
-
-    fn decode(r: &mut impl Read, hasher: &mut Hasher) -> io::Result<Self> {
-        let mut meta_len_buf = [0u8; 2];
-        r.read_exact(&mut meta_len_buf)?;
-        hasher.update(&meta_len_buf);
-        let meta_len = u16::from_be_bytes(meta_len_buf) as usize;
-
-        if meta_len < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("metadata too short: {meta_len} bytes, need at least 8"),
-            ));
-        }
-
-        let mut seq_buf = [0u8; 8];
-        r.read_exact(&mut seq_buf)?;
-        hasher.update(&seq_buf);
-        let seq = u64::from_be_bytes(seq_buf);
-
-        // Skip any future metadata fields we don't understand.
-        let remaining = meta_len - 8;
-        if remaining > 0 {
-            let mut skip = vec![0u8; remaining];
-            r.read_exact(&mut skip)?;
-            hasher.update(&skip);
-        }
-
-        Ok(Self { seq })
-    }
 }
 
 /// The operation type for a WAL entry.
 ///
 /// Wire formats (all integers big-endian):
 ///
-/// Put:    `| 0x01 (1B) | meta_len (2B) | seq (8B) | key_len (2B) | val_len (2B) | key | value | crc32 (4B) |`
-/// Delete: `| 0x02 (1B) | meta_len (2B) | seq (8B) | key_len (2B) | key | crc32 (4B) |`
-///
-/// The metadata section is length-prefixed so future fields can be added
-/// without breaking the format. Decoders skip any unrecognised trailing
-/// bytes inside the metadata region.
+/// Put:    `| 0x01 (1B) | seq (8B) | key_len (2B) | val_len (2B) | key | value | crc32 (4B) |`
+/// Delete: `| 0x02 (1B) | seq (8B) | key_len (2B) | key | crc32 (4B) |`
 #[derive(Debug, PartialEq, Eq)]
 pub enum WalOp {
     Put {
@@ -91,6 +36,19 @@ pub enum WalOp {
         meta: WalMeta,
         key: Vec<u8>,
     },
+}
+
+/// Helper to write bytes to both a writer and a hasher.
+fn write_and_hash(w: &mut impl Write, hasher: &mut Hasher, bytes: &[u8]) -> io::Result<()> {
+    hasher.update(bytes);
+    w.write_all(bytes)
+}
+
+/// Helper to read exact bytes into a buffer, updating the hasher.
+fn read_and_hash(r: &mut impl Read, hasher: &mut Hasher, buf: &mut [u8]) -> io::Result<()> {
+    r.read_exact(buf)?;
+    hasher.update(buf);
+    Ok(())
 }
 
 impl WalOp {
@@ -106,39 +64,18 @@ impl WalOp {
 
         match self {
             WalOp::Put { meta, key, value } => {
-                let op = [OP_PUT];
-                hasher.update(&op);
-                w.write_all(&op)?;
-
-                meta.encode(w, &mut hasher)?;
-
-                let key_len = (key.len() as u16).to_be_bytes();
-                let val_len = (value.len() as u16).to_be_bytes();
-
-                hasher.update(&key_len);
-                hasher.update(&val_len);
-                hasher.update(key);
-                hasher.update(value);
-
-                w.write_all(&key_len)?;
-                w.write_all(&val_len)?;
-                w.write_all(key)?;
-                w.write_all(value)?;
+                write_and_hash(w, &mut hasher, &[OP_PUT])?;
+                write_and_hash(w, &mut hasher, &meta.seq.to_be_bytes())?;
+                write_and_hash(w, &mut hasher, &(key.len() as u16).to_be_bytes())?;
+                write_and_hash(w, &mut hasher, &(value.len() as u16).to_be_bytes())?;
+                write_and_hash(w, &mut hasher, key)?;
+                write_and_hash(w, &mut hasher, value)?;
             }
             WalOp::Delete { meta, key } => {
-                let op = [OP_DELETE];
-                hasher.update(&op);
-                w.write_all(&op)?;
-
-                meta.encode(w, &mut hasher)?;
-
-                let key_len = (key.len() as u16).to_be_bytes();
-
-                hasher.update(&key_len);
-                hasher.update(key);
-
-                w.write_all(&key_len)?;
-                w.write_all(key)?;
+                write_and_hash(w, &mut hasher, &[OP_DELETE])?;
+                write_and_hash(w, &mut hasher, &meta.seq.to_be_bytes())?;
+                write_and_hash(w, &mut hasher, &(key.len() as u16).to_be_bytes())?;
+                write_and_hash(w, &mut hasher, key)?;
             }
         }
 
@@ -151,45 +88,39 @@ impl WalOp {
     pub fn decode(r: &mut impl Read) -> io::Result<Self> {
         let mut hasher = Hasher::new();
 
-        // Read op code.
+        // Op code.
         let mut op = [0u8; 1];
-        r.read_exact(&mut op)?;
-        hasher.update(&op);
+        read_and_hash(r, &mut hasher, &mut op)?;
 
-        // Read metadata.
-        let meta = WalMeta::decode(r, &mut hasher)?;
+        // Sequence number.
+        let mut seq_buf = [0u8; 8];
+        read_and_hash(r, &mut hasher, &mut seq_buf)?;
+        let meta = WalMeta {
+            seq: u64::from_be_bytes(seq_buf),
+        };
 
-        // Read key_len.
+        // Key length.
         let mut key_len_buf = [0u8; 2];
-        r.read_exact(&mut key_len_buf)?;
-        hasher.update(&key_len_buf);
+        read_and_hash(r, &mut hasher, &mut key_len_buf)?;
         let key_len = u16::from_be_bytes(key_len_buf) as usize;
 
         let entry = match op[0] {
             OP_PUT => {
-                // Read val_len.
                 let mut val_len_buf = [0u8; 2];
-                r.read_exact(&mut val_len_buf)?;
-                hasher.update(&val_len_buf);
+                read_and_hash(r, &mut hasher, &mut val_len_buf)?;
                 let val_len = u16::from_be_bytes(val_len_buf) as usize;
 
-                // Read key.
                 let mut key = vec![0u8; key_len];
-                r.read_exact(&mut key)?;
-                hasher.update(&key);
+                read_and_hash(r, &mut hasher, &mut key)?;
 
-                // Read value.
                 let mut value = vec![0u8; val_len];
-                r.read_exact(&mut value)?;
-                hasher.update(&value);
+                read_and_hash(r, &mut hasher, &mut value)?;
 
                 WalOp::Put { meta, key, value }
             }
             OP_DELETE => {
-                // Read key.
                 let mut key = vec![0u8; key_len];
-                r.read_exact(&mut key)?;
-                hasher.update(&key);
+                read_and_hash(r, &mut hasher, &mut key)?;
 
                 WalOp::Delete { meta, key }
             }
@@ -201,7 +132,7 @@ impl WalOp {
             }
         };
 
-        // Read and verify checksum.
+        // Verify checksum.
         let mut checksum_buf = [0u8; 4];
         r.read_exact(&mut checksum_buf)?;
         let stored = u32::from_be_bytes(checksum_buf);
@@ -380,8 +311,8 @@ mod tests {
         op.encode(&mut buf).unwrap();
 
         // Flip a byte in the value region.
-        // Header: op(1) + meta_len(2) + seq(8) + key_len(2) + val_len(2) + key(15) = 30
-        buf[30] ^= 0xFF;
+        // op(1) + seq(8) + key_len(2) + val_len(2) + key(15) = 28, value starts at 28.
+        buf[28] ^= 0xFF;
 
         let result = WalOp::decode(&mut Cursor::new(&buf));
         assert!(result.is_err());
@@ -401,8 +332,8 @@ mod tests {
         op.encode(&mut buf).unwrap();
 
         // Flip a byte in the key region.
-        // Header: op(1) + meta_len(2) + seq(8) + key_len(2) = 13, key starts at 13.
-        buf[13] ^= 0xFF;
+        // op(1) + seq(8) + key_len(2) = 11, key starts at 11.
+        buf[11] ^= 0xFF;
 
         let result = WalOp::decode(&mut Cursor::new(&buf));
         assert!(result.is_err());
@@ -425,8 +356,8 @@ mod tests {
         let mut buf = Vec::new();
         op.encode(&mut buf).unwrap();
 
-        // Flip a byte in the seq region (starts at offset 3, after op + meta_len).
-        buf[3] ^= 0xFF;
+        // Flip a byte in the seq region (starts at offset 1, after op).
+        buf[1] ^= 0xFF;
 
         let result = WalOp::decode(&mut Cursor::new(&buf));
         assert!(result.is_err());
@@ -553,10 +484,8 @@ mod tests {
 
     #[test]
     fn unknown_op_code_fails() {
-        // op=0xFF, then enough bytes for meta_len + padding
-        let buf = vec![
-            0xFF, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x41, 0, 0, 0, 0,
-        ];
+        // op=0xFF, then 8 bytes for seq, then key_len + key + fake crc
+        let buf = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0x41, 0, 0, 0, 0];
 
         let result = WalOp::decode(&mut Cursor::new(&buf));
         assert!(result.is_err());
