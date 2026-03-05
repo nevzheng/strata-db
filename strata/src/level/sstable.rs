@@ -98,7 +98,7 @@ impl ReadStore for SsTable {
 }
 
 /// Lightweight metadata for an SSTable on disk.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SsTableRef {
     pub id: u64,
     pub path: PathBuf,

@@ -1,5 +1,7 @@
+mod manifest;
 mod sstable;
 
+pub use manifest::{Manifest, ManifestEntry, ManifestOp};
 pub use sstable::{SsTable, SsTableRef, read_sstable_ref};
 
 use sstable::write_sstables;
