@@ -1,5 +1,6 @@
 pub mod memstore;
 
+use std::ops::RangeBounds;
 use std::path::Path;
 
 use memstore::{
@@ -134,8 +135,11 @@ impl<M: MemStore> StorageEngine<M> {
     }
 
     /// Return key-value pairs within the given range, sorted by key ascending.
-    pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<memstore::KVPair>, StorageError> {
-        Ok(self.mem.scan(start, end)?)
+    pub fn scan(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+    ) -> Result<Vec<memstore::KVPair>, StorageError> {
+        Ok(self.mem.scan(range)?)
     }
 }
 
@@ -165,7 +169,7 @@ mod tests {
         engine.put(b"key:a", b"1").unwrap();
         engine.put(b"key:b", b"2").unwrap();
 
-        let results = engine.scan(b"key:a", b"key:c").unwrap();
+        let results = engine.scan(b"key:a".to_vec()..=b"key:c".to_vec()).unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(keys, vec![&b"key:a"[..], &b"key:b"[..], &b"key:c"[..]]);
     }

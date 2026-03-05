@@ -4,6 +4,7 @@ pub use btree::BTreeMapStore;
 
 use std::cmp::Ordering;
 use std::io::{self, Read, Write};
+use std::ops::RangeBounds;
 
 use thiserror::Error;
 
@@ -185,12 +186,12 @@ pub trait MemStore {
 
     /// Return key-value pairs within the given user-key range, sorted by key ascending.
     ///
-    /// Both bounds are inclusive. For each user key, only the latest version
-    /// is considered. Tombstoned keys are excluded.
+    /// For each user key, only the latest version is considered.
+    /// Tombstoned keys are excluded.
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<KVPair>, ReadError>;
+    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, ReadError>;
 
     /// Current size in bytes of the store's contents.
     fn size(&self) -> usize;

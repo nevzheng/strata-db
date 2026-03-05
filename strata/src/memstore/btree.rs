@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::{Bound, RangeBounds};
 
 use super::{InternalKey, KVPair, MemStore, OpType, ReadError, WriteError};
 
@@ -67,22 +68,38 @@ impl MemStore for BTreeMapStore {
         Ok(())
     }
 
-    fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<KVPair>, ReadError> {
-        let start_probe = InternalKey {
-            key: start.to_vec(),
-            seq: u64::MAX,
-            op: OpType::Put,
+    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, ReadError> {
+        let start = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(InternalKey {
+                key: k.clone(),
+                seq: u64::MAX,
+                op: OpType::Put,
+            }),
+            Bound::Excluded(k) => Bound::Excluded(InternalKey {
+                key: k.clone(),
+                seq: 0,
+                op: OpType::Put,
+            }),
+            Bound::Unbounded => Bound::Unbounded,
         };
-        let end_probe = InternalKey {
-            key: end.to_vec(),
-            seq: 0,
-            op: OpType::Put,
+        let end = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(InternalKey {
+                key: k.clone(),
+                seq: 0,
+                op: OpType::Put,
+            }),
+            Bound::Excluded(k) => Bound::Excluded(InternalKey {
+                key: k.clone(),
+                seq: u64::MAX,
+                op: OpType::Put,
+            }),
+            Bound::Unbounded => Bound::Unbounded,
         };
 
         let mut results = Vec::new();
         let mut last_key: Option<&[u8]> = None;
 
-        for (ikey, value) in self.store.range(start_probe..=end_probe) {
+        for (ikey, value) in self.store.range((start, end)) {
             if last_key == Some(ikey.key.as_slice()) {
                 continue;
             }
@@ -139,7 +156,9 @@ mod tests {
         put_key(&mut store, b"user:alice", b"viewer", 2);
         put_key(&mut store, b"user:bob", b"editor", 3);
 
-        let results = store.scan(b"user:alice", b"user:charlie").unwrap();
+        let results = store
+            .scan(b"user:alice".to_vec()..=b"user:charlie".to_vec())
+            .unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(
             keys,
@@ -155,7 +174,7 @@ mod tests {
         put_key(&mut store, &42u64.to_be_bytes(), b"forty-two", 3);
 
         let results = store
-            .scan(&1u64.to_be_bytes(), &100u64.to_be_bytes())
+            .scan(1u64.to_be_bytes().to_vec()..=100u64.to_be_bytes().to_vec())
             .unwrap();
         let keys: Vec<u64> = results
             .iter()
@@ -208,7 +227,9 @@ mod tests {
         put_key(&mut store, b"metric:mem_free", b"2048", 3);
         delete_key(&mut store, b"metric:disk_io", 4);
 
-        let results = store.scan(b"metric:cpu_usage", b"metric:mem_free").unwrap();
+        let results = store
+            .scan(b"metric:cpu_usage".to_vec()..=b"metric:mem_free".to_vec())
+            .unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(
             keys,
@@ -234,7 +255,7 @@ mod tests {
         put_key(&mut store, b"k:a", b"new", 2);
         put_key(&mut store, b"k:b", b"only", 3);
 
-        let results = store.scan(b"k:a", b"k:b").unwrap();
+        let results = store.scan(b"k:a".to_vec()..=b"k:b".to_vec()).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (b"k:a".to_vec(), b"new".to_vec()));
         assert_eq!(results[1], (b"k:b".to_vec(), b"only".to_vec()));
