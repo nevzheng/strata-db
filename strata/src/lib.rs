@@ -3,7 +3,7 @@ pub mod memstore;
 use std::path::Path;
 
 use memstore::{
-    MemStore, ReadError, WriteError,
+    InternalKey, MemStore, OpType, ReadError, WriteError,
     wal::{WalOp, WriteAheadLog},
 };
 use thiserror::Error;
@@ -55,8 +55,21 @@ impl<M: MemStore> StorageEngine<M> {
         for op in wal.replay()? {
             seq = op.seq();
             match op {
-                WalOp::Put { key, value, .. } => mem.put(&key, &value)?,
-                WalOp::Delete { key, .. } => mem.delete(&key)?,
+                WalOp::Put {
+                    seq: s, key, value, ..
+                } => mem.put(
+                    InternalKey {
+                        key,
+                        seq: s,
+                        op: OpType::Put,
+                    },
+                    value,
+                )?,
+                WalOp::Delete { seq: s, key, .. } => mem.delete(InternalKey {
+                    key,
+                    seq: s,
+                    op: OpType::Delete,
+                })?,
             }
         }
         Ok(Self { mem, wal, seq })
@@ -75,7 +88,14 @@ impl<M: MemStore> StorageEngine<M> {
         };
         self.wal.append(&op)?;
         info!("wal ok");
-        self.mem.put(key, value)?;
+        self.mem.put(
+            InternalKey {
+                key: key.to_vec(),
+                seq: next_seq,
+                op: OpType::Put,
+            },
+            value.to_vec(),
+        )?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())
@@ -93,7 +113,11 @@ impl<M: MemStore> StorageEngine<M> {
         };
         self.wal.append(&op)?;
         info!("wal ok");
-        self.mem.delete(key)?;
+        self.mem.delete(InternalKey {
+            key: key.to_vec(),
+            seq: next_seq,
+            op: OpType::Delete,
+        })?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())

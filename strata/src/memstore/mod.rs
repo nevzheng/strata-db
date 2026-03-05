@@ -2,10 +2,93 @@ mod btree;
 pub mod wal;
 pub use btree::BTreeMapStore;
 
+use std::cmp::Ordering;
+use std::io::{self, Read, Write};
+
 use thiserror::Error;
 
 /// A key-value pair of owned byte vectors.
 pub type KVPair = (Vec<u8>, Vec<u8>);
+
+/// The type of operation recorded in an internal key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpType {
+    Put = 0x01,
+    Delete = 0x02,
+}
+
+impl OpType {
+    fn from_u8(b: u8) -> io::Result<Self> {
+        match b {
+            0x01 => Ok(OpType::Put),
+            0x02 => Ok(OpType::Delete),
+            unknown => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown op type: {:#x}", unknown),
+            )),
+        }
+    }
+}
+
+/// A versioned internal key used by the memstore layer.
+///
+/// Ordering: user key ascending, then sequence number descending.
+/// The operation type is not included in the ordering.
+///
+/// Wire format (all integers big-endian):
+///
+/// `| key_len (2B) | key | seq (8B) | op (1B) |`
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InternalKey {
+    pub key: Vec<u8>,
+    pub seq: u64,
+    pub op: OpType,
+}
+
+impl InternalKey {
+    /// Encode this internal key to the writer.
+    pub fn encode(&self, w: &mut impl Write) -> io::Result<()> {
+        w.write_all(&(self.key.len() as u16).to_be_bytes())?;
+        w.write_all(&self.key)?;
+        w.write_all(&self.seq.to_be_bytes())?;
+        w.write_all(&[self.op as u8])?;
+        Ok(())
+    }
+
+    /// Decode an internal key from the reader.
+    pub fn decode(r: &mut impl Read) -> io::Result<Self> {
+        let mut key_len_buf = [0u8; 2];
+        r.read_exact(&mut key_len_buf)?;
+        let key_len = u16::from_be_bytes(key_len_buf) as usize;
+
+        let mut key = vec![0u8; key_len];
+        r.read_exact(&mut key)?;
+
+        let mut seq_buf = [0u8; 8];
+        r.read_exact(&mut seq_buf)?;
+        let seq = u64::from_be_bytes(seq_buf);
+
+        let mut op_buf = [0u8; 1];
+        r.read_exact(&mut op_buf)?;
+        let op = OpType::from_u8(op_buf[0])?;
+
+        Ok(Self { key, seq, op })
+    }
+}
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key
+            .cmp(&other.key)
+            .then(self.seq.cmp(&other.seq).reverse())
+    }
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Errors that can occur during write operations.
 #[derive(Debug, Error)]
@@ -70,37 +153,40 @@ pub enum ReadError {
 /// `scan` return owned `Vec<u8>` values. This is simple and correct
 /// but not zero-copy.
 pub trait MemStore {
-    /// Insert or update a key-value pair.
+    /// Insert a key-value pair.
     ///
-    /// Copies both key and value into the store.
+    /// The [`InternalKey`] must have [`OpType::Put`].
     ///
     /// # Errors
     /// - `WriteError::StoreFull` — store has reached capacity
     /// - `WriteError::InvalidArgument` — key or value rejected by implementation
     /// - `WriteError::Internal` — unexpected error
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WriteError>;
+    fn put(&mut self, key: InternalKey, value: Vec<u8>) -> Result<(), WriteError>;
 
-    /// Retrieve the value for a given key.
+    /// Retrieve the value for a given user key.
     ///
-    /// Returns a copy of the value, or `None` if the key does not exist.
+    /// Finds the entry with the highest sequence number for the user key.
+    /// Returns `None` if the key does not exist or the latest entry is a
+    /// tombstone ([`OpType::Delete`]).
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ReadError>;
 
-    /// Delete a key from the store.
+    /// Write a tombstone for the given key.
     ///
-    /// After deletion, `get` for this key should return `None`.
-    /// How the deletion is represented internally is implementation-defined.
+    /// The [`InternalKey`] must have [`OpType::Delete`].
     ///
     /// # Errors
-    /// - `WriteError::StoreFull` — deletion may require additional storage
+    /// - `WriteError::StoreFull` — tombstone requires additional storage
     /// - `WriteError::InvalidArgument` — key rejected by implementation
     /// - `WriteError::Internal` — unexpected error
-    fn delete(&mut self, key: &[u8]) -> Result<(), WriteError>;
-    /// Return key-value pairs within the given range, sorted by key ascending.
+    fn delete(&mut self, key: InternalKey) -> Result<(), WriteError>;
+
+    /// Return key-value pairs within the given user-key range, sorted by key ascending.
     ///
-    /// Both bounds are inclusive. Returns owned copies of each pair.
+    /// Both bounds are inclusive. For each user key, only the latest version
+    /// is considered. Tombstoned keys are excluded.
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
