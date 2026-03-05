@@ -186,6 +186,49 @@ fn read_footer(data: &[u8]) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
     Ok((data_size, min_key, max_key))
 }
 
+/// Pull entries from `iter` and write them into a single SSTable file at `path`,
+/// stopping when the next entry would exceed `max_file_size`.
+fn write_sstable_file(
+    path: &Path,
+    id: u64,
+    max_file_size: usize,
+    iter: &mut std::iter::Peekable<impl Iterator<Item = (InternalKey, Vec<u8>)>>,
+) -> io::Result<SsTableRef> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let mut bytes_written = 0usize;
+    let mut min_key: Option<Vec<u8>> = None;
+    let mut max_key: Vec<u8> = Vec::new();
+
+    while let Some((key, value)) = iter.peek() {
+        let size = encoded_entry_size(key, value);
+        if bytes_written > 0 && bytes_written + size > max_file_size {
+            break;
+        }
+        let (key, value) = iter.next().unwrap();
+        write_entry(&mut writer, &key, &value)?;
+        bytes_written += size;
+        if min_key.is_none() {
+            min_key = Some(key.key.clone());
+        }
+        max_key = key.key;
+    }
+
+    let min_key = min_key.unwrap_or_default();
+    write_footer(&mut writer, bytes_written as u32, &min_key, &max_key)?;
+    writer.flush()?;
+    writer.get_ref().sync_data()?;
+
+    Ok(SsTableRef {
+        id,
+        path: path.to_path_buf(),
+        min_key,
+        max_key,
+        data_size: bytes_written,
+    })
+}
+
 /// Write sorted entries to SSTable files on disk, splitting when a file
 /// exceeds `max_file_size`. Returns an `SsTableRef` per file written.
 ///
@@ -205,39 +248,7 @@ pub fn write_sstables(
 
     while iter.peek().is_some() {
         let path = dir.join(format!("{id}.sst"));
-        let file = File::create(&path)?;
-        let mut writer = BufWriter::new(file);
-
-        let mut bytes_written = 0usize;
-        let mut min_key: Option<Vec<u8>> = None;
-        let mut max_key: Vec<u8> = Vec::new();
-
-        while let Some((key, value)) = iter.peek() {
-            let size = encoded_entry_size(key, value);
-            if bytes_written > 0 && bytes_written + size > max_file_size {
-                break;
-            }
-            let (key, value) = iter.next().unwrap();
-            write_entry(&mut writer, &key, &value)?;
-            bytes_written += size;
-            if min_key.is_none() {
-                min_key = Some(key.key.clone());
-            }
-            max_key = key.key;
-        }
-
-        let min_key = min_key.unwrap_or_default();
-        write_footer(&mut writer, bytes_written as u32, &min_key, &max_key)?;
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-
-        tables.push(SsTableRef {
-            id,
-            path,
-            min_key,
-            max_key,
-            data_size: bytes_written,
-        });
+        tables.push(write_sstable_file(&path, id, max_file_size, &mut iter)?);
         id += 1;
     }
 

@@ -1,5 +1,5 @@
-use strata::StorageEngine;
 use strata::memstore::BTreeMapStore;
+use strata::{LevelConfig, StorageEngine};
 
 #[test]
 fn put_get_delete_round_trip() {
@@ -156,6 +156,163 @@ fn delete_shadows_compacted_data() {
         .scan(b"k:0000".to_vec()..=b"k:0049".to_vec())
         .unwrap();
     assert_eq!(results.len(), 25);
+}
+
+/// Helper: 3-level engine (L0: 2 runs, L1: 2 runs, L2: 1 run) with a tiny memtable.
+fn three_level_engine(dir: &std::path::Path) -> StorageEngine<BTreeMapStore> {
+    StorageEngine::with_levels(
+        dir,
+        BTreeMapStore::with_capacity(32),
+        vec![
+            LevelConfig {
+                max_runs: 2,
+                max_run_size_bytes: usize::MAX,
+            },
+            LevelConfig {
+                max_runs: 2,
+                max_run_size_bytes: usize::MAX,
+            },
+            LevelConfig {
+                max_runs: 1,
+                max_run_size_bytes: usize::MAX,
+            },
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn compaction_fills_l0_then_cascades_to_l1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = three_level_engine(tmp.path());
+
+    // Write enough to trigger multiple memtable compactions.
+    // L0 max_runs=2, so once it fills it cascades to L1.
+    for i in 0..20u32 {
+        engine.put(format!("k:{i:04}").as_bytes(), b"v").unwrap();
+    }
+
+    // L0 should have been drained at least once into L1.
+    assert!(
+        !engine.level_is_empty(1),
+        "L1 should have runs from L0 cascade"
+    );
+    // L0 should not have grown unbounded (max_runs=2).
+    assert!(
+        engine.level_run_count(0) <= 2,
+        "L0 should stay bounded, got {} runs",
+        engine.level_run_count(0)
+    );
+
+    for i in 0..20u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(b"v".to_vec()),
+            "missing k:{i:04}"
+        );
+    }
+}
+
+#[test]
+fn compaction_cascades_from_l1_to_l2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = three_level_engine(tmp.path());
+
+    // 4 memtable compactions → 2 L0→L1 cascades → L1 full → cascades to L2.
+    for i in 0..40u32 {
+        engine.put(format!("k:{i:04}").as_bytes(), b"v").unwrap();
+    }
+
+    assert!(
+        !engine.level_is_empty(2),
+        "L2 should have data after L1 cascade"
+    );
+
+    for i in 0..40u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(b"v".to_vec()),
+            "missing k:{i:04}"
+        );
+    }
+}
+
+#[test]
+fn last_level_merges_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = three_level_engine(tmp.path());
+
+    // Write enough to cascade to L2 multiple times.
+    for round in 0..3u32 {
+        for i in 0..40u32 {
+            engine
+                .put(
+                    format!("k:{i:04}").as_bytes(),
+                    format!("r{round}").as_bytes(),
+                )
+                .unwrap();
+        }
+    }
+
+    // L2 (max_runs=1) should merge in place, staying compact.
+    assert!(
+        engine.level_run_count(2) <= 2,
+        "L2 should stay compact, got {} runs",
+        engine.level_run_count(2)
+    );
+
+    // Latest values should win.
+    for i in 0..40u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(b"r2".to_vec()),
+            "k:{i:04} should have latest value"
+        );
+    }
+}
+
+#[test]
+fn compaction_shrinks_levels() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = three_level_engine(tmp.path());
+
+    let mut l0_peaked = 0;
+    let mut l0_shrank = false;
+    let mut l1_peaked = 0;
+    let mut l1_shrank = false;
+
+    for i in 0..500u32 {
+        engine.put(format!("k:{i:04}").as_bytes(), b"v").unwrap();
+
+        let l0 = engine.level_run_count(0);
+        if l0 > l0_peaked {
+            l0_peaked = l0;
+        }
+        if l0 < l0_peaked && l0_peaked >= 2 {
+            l0_shrank = true;
+        }
+
+        let l1 = engine.level_run_count(1);
+        if l1 > l1_peaked {
+            l1_peaked = l1;
+        }
+        if l1 < l1_peaked && l1_peaked >= 2 {
+            l1_shrank = true;
+        }
+
+        if l0_shrank && l1_shrank {
+            break;
+        }
+    }
+
+    assert!(
+        l0_shrank,
+        "L0 should have shrunk after cascading to L1 (peaked at {l0_peaked})"
+    );
+    assert!(
+        l1_shrank,
+        "L1 should have shrunk after cascading to L2 (peaked at {l1_peaked})"
+    );
 }
 
 /// get_at returns the version visible at a given sequence number.

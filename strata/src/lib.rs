@@ -3,6 +3,7 @@ pub mod level;
 pub mod memstore;
 
 pub use engine::StorageEngine;
+pub use level::LevelConfig;
 
 use std::ops::RangeBounds;
 

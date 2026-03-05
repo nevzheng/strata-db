@@ -1,8 +1,13 @@
 mod sstable;
 
-pub use sstable::{SsTable, SsTableRef, read_sstable_ref, write_sstables};
+pub use sstable::{SsTable, SsTableRef, read_sstable_ref};
+
+use sstable::write_sstables;
 
 use std::ops::{Bound, RangeBounds};
+use std::path::PathBuf;
+
+use itertools::Itertools;
 
 use crate::memstore::{InternalKey, OpType, ReadError};
 use crate::{ReadStore, StorageError};
@@ -17,27 +22,48 @@ pub struct LevelConfig {
 pub struct Level {
     pub runs: Vec<Run>,
     pub config: LevelConfig,
+    dir: PathBuf,
+    next_sst_id: u64,
 }
 
 impl Level {
-    pub fn new(config: LevelConfig) -> Self {
+    pub fn new(dir: PathBuf, config: LevelConfig) -> Self {
         Self {
             runs: Vec::new(),
             config,
+            dir,
+            next_sst_id: 0,
         }
     }
 
-    /// Add a run to this level. Newest runs are pushed to the end.
-    pub fn add_run(&mut self, run: Run) -> Result<(), StorageError> {
-        if self.runs.len() >= self.config.max_runs {
-            return Err(StorageError::InternalError(format!(
-                "level full: {} runs exceeds max {}",
-                self.runs.len() + 1,
-                self.config.max_runs
-            )));
-        }
-        self.runs.push(run);
-        Ok(())
+    /// Write entries to disk as SSTables and add the resulting run to this level.
+    ///
+    /// Entries must be sorted by `InternalKey` (user key asc, seq desc).
+    /// Returns `true` if the level has reached its compaction threshold.
+    pub fn add_run(
+        &mut self,
+        entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
+    ) -> Result<bool, StorageError> {
+        let sst_id = self.next_sst_id;
+        self.next_sst_id += 1;
+        let refs = write_sstables(&self.dir, sst_id, usize::MAX, entries)?;
+        self.runs.push(Run::from_refs(refs));
+        Ok(self.runs.len() >= self.config.max_runs)
+    }
+
+    /// Open all SSTables and return a merged iterator over their entries,
+    /// sorted by `InternalKey` order.
+    pub fn merge_iter(
+        &self,
+    ) -> Result<impl Iterator<Item = (InternalKey, Vec<u8>)> + use<>, ReadError> {
+        let tables: Vec<SsTable> = self
+            .runs
+            .iter()
+            .flat_map(|run| &run.tables)
+            .map(|r| SsTable::open(r.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Internal(e.to_string()))?;
+        Ok(tables.into_iter().map(|t| t.entries.into_iter()).kmerge())
     }
 
     /// Return all entries within the given user-key range across all runs.
@@ -47,24 +73,33 @@ impl Level {
         &self,
         range: impl RangeBounds<Vec<u8>>,
     ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
-        let mut result: Vec<_> = self
+        let tables: Vec<SsTable> = self
             .runs
             .iter()
             .flat_map(|run| &run.tables)
             .filter(|r| overlaps(r, &range))
             .map(|r| SsTable::open(r.clone()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ReadError::Internal(e.to_string()))?
+            .map_err(|e| ReadError::Internal(e.to_string()))?;
+        let result = tables
             .into_iter()
-            .flat_map(|t| t.entries)
+            .map(|t| t.entries.into_iter())
+            .kmerge()
             .filter(|(ik, _)| in_range(&ik.key, &range))
             .collect();
-        result.sort_by(|(a, _): &(InternalKey, Vec<u8>), (b, _)| a.cmp(b));
         Ok(result)
+    }
+
+    pub fn clear(&mut self) {
+        self.runs.clear();
     }
 
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.runs.len() >= self.config.max_runs
     }
 }
 
@@ -160,8 +195,6 @@ impl Run {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     fn put_entry(key: &[u8], value: &[u8], seq: u64) -> (InternalKey, Vec<u8>) {
@@ -175,74 +208,49 @@ mod tests {
         )
     }
 
-    fn test_config() -> LevelConfig {
-        LevelConfig {
-            max_runs: 64,
-            max_run_size_bytes: 64 * 1024 * 1024,
-        }
+    fn test_level(tmp: &std::path::Path) -> Level {
+        Level::new(
+            tmp.to_path_buf(),
+            LevelConfig {
+                max_runs: 64,
+                max_run_size_bytes: 64 * 1024 * 1024,
+            },
+        )
     }
-
-    /// Write entries to disk and return a Run of SsTableRefs.
-    fn make_run(dir: &Path, id: u64, mut entries: Vec<(InternalKey, Vec<u8>)>) -> Run {
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let refs = write_sstables(dir, id, usize::MAX, entries).unwrap();
-        Run::from_refs(refs)
-    }
-
-    // --- Run tests ---
 
     #[test]
-    fn run_from_refs_computes_size() {
+    fn level_add_run_writes_to_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        let run = make_run(
-            tmp.path(),
-            1,
-            vec![put_entry(b"c", b"3", 3), put_entry(b"a", b"1", 1)],
-        );
-        assert_eq!(run.tables.len(), 1);
-        assert_eq!(run.tables[0].min_key, b"a");
-        assert_eq!(run.tables[0].max_key, b"c");
-        assert!(run.size_bytes > 0);
+        let mut level = test_level(tmp.path());
+        level
+            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)])
+            .unwrap();
+        assert_eq!(level.runs.len(), 1);
+        assert_eq!(level.runs[0].tables[0].min_key, b"a");
+        assert_eq!(level.runs[0].tables[0].max_key, b"c");
+        assert!(level.runs[0].size_bytes > 0);
     }
-
-    // --- Level tests ---
 
     #[test]
     fn level_get_at_returns_latest_from_newest_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut level = Level::new(test_config());
-        level
-            .add_run(make_run(
-                &tmp.path().join("r1"),
-                1,
-                vec![put_entry(b"a", b"old", 1)],
-            ))
-            .unwrap();
-        level
-            .add_run(make_run(
-                &tmp.path().join("r2"),
-                2,
-                vec![put_entry(b"a", b"new", 2)],
-            ))
-            .unwrap();
+        let mut level = test_level(tmp.path());
+        level.add_run(vec![put_entry(b"a", b"old", 1)]).unwrap();
+        level.add_run(vec![put_entry(b"a", b"new", 2)]).unwrap();
         assert_eq!(level.get_at(b"a", u64::MAX).unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]
     fn level_scan_returns_range() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut level = Level::new(test_config());
+        let mut level = test_level(tmp.path());
         level
-            .add_run(make_run(
-                tmp.path(),
-                1,
-                vec![
-                    put_entry(b"a", b"1", 1),
-                    put_entry(b"b", b"2", 2),
-                    put_entry(b"c", b"3", 3),
-                    put_entry(b"d", b"4", 4),
-                ],
-            ))
+            .add_run(vec![
+                put_entry(b"a", b"1", 1),
+                put_entry(b"b", b"2", 2),
+                put_entry(b"c", b"3", 3),
+                put_entry(b"d", b"4", 4),
+            ])
             .unwrap();
 
         let results = level.scan(b"b".to_vec()..=b"c".to_vec()).unwrap();
@@ -254,71 +262,38 @@ mod tests {
     #[test]
     fn level_scan_unbounded_returns_all() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut level = Level::new(test_config());
+        let mut level = test_level(tmp.path());
         level
-            .add_run(make_run(
-                tmp.path(),
-                1,
-                vec![put_entry(b"a", b"1", 1), put_entry(b"b", b"2", 2)],
-            ))
+            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"b", b"2", 2)])
             .unwrap();
         let results = level.scan(..).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
-    fn level_add_run_returns_error_when_full() {
+    fn level_add_run_signals_compaction_needed() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut level = Level::new(LevelConfig {
-            max_runs: 2,
-            max_run_size_bytes: 64 * 1024 * 1024,
-        });
-        level
-            .add_run(make_run(
-                &tmp.path().join("r1"),
-                1,
-                vec![put_entry(b"a", b"1", 1)],
-            ))
-            .unwrap();
-        level
-            .add_run(make_run(
-                &tmp.path().join("r2"),
-                2,
-                vec![put_entry(b"b", b"2", 2)],
-            ))
-            .unwrap();
-
-        let err = level
-            .add_run(make_run(
-                &tmp.path().join("r3"),
-                3,
-                vec![put_entry(b"c", b"3", 3)],
-            ))
-            .unwrap_err();
-        assert!(
-            matches!(err, StorageError::InternalError(ref msg) if msg.contains("level full")),
-            "expected level full, got: {err:?}"
+        let mut level = Level::new(
+            tmp.path().to_path_buf(),
+            LevelConfig {
+                max_runs: 2,
+                max_run_size_bytes: 64 * 1024 * 1024,
+            },
         );
+        assert!(!level.add_run(vec![put_entry(b"a", b"1", 1)]).unwrap());
+        assert!(level.add_run(vec![put_entry(b"b", b"2", 2)]).unwrap());
+        // Can still add beyond threshold.
+        assert!(level.add_run(vec![put_entry(b"c", b"3", 3)]).unwrap());
     }
 
     #[test]
     fn level_scan_merges_across_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut level = Level::new(test_config());
+        let mut level = test_level(tmp.path());
         level
-            .add_run(make_run(
-                &tmp.path().join("r1"),
-                1,
-                vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)],
-            ))
+            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)])
             .unwrap();
-        level
-            .add_run(make_run(
-                &tmp.path().join("r2"),
-                2,
-                vec![put_entry(b"b", b"2", 4)],
-            ))
-            .unwrap();
+        level.add_run(vec![put_entry(b"b", b"2", 4)]).unwrap();
 
         let results = level.scan(..).unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(ik, _)| ik.key.as_slice()).collect();

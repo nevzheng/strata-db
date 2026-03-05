@@ -1,28 +1,50 @@
 use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::level::{Level, LevelConfig, Run, write_sstables};
+use crate::level::{Level, LevelConfig};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
 };
 use crate::{KVPair, ReadStore, StorageError};
+use itertools::Itertools;
 use tracing::{info, instrument};
 
 const DEFAULT_NUM_LEVELS: usize = 7;
 
 /// Core engine coordinating between storage components.
 pub struct StorageEngine<M: MemStore> {
-    dir: PathBuf,
     mem: M,
     wal: WriteAheadLog,
     seq: u64,
     levels: Vec<Level>,
-    next_sst_id: u64,
 }
 
 impl<M: MemStore> StorageEngine<M> {
-    pub fn new(dir: &Path, mut mem: M) -> Result<Self, StorageError> {
+    pub fn new(dir: &Path, mem: M) -> Result<Self, StorageError> {
+        let configs: Vec<LevelConfig> = (0..DEFAULT_NUM_LEVELS)
+            .map(|i| {
+                if i == 0 {
+                    LevelConfig {
+                        max_runs: 64,
+                        max_run_size_bytes: 64 * 1024 * 1024,
+                    }
+                } else {
+                    LevelConfig {
+                        max_runs: 1,
+                        max_run_size_bytes: 64 * 1024 * 1024 * (1 << i),
+                    }
+                }
+            })
+            .collect();
+        Self::with_levels(dir, mem, configs)
+    }
+
+    pub fn with_levels(
+        dir: &Path,
+        mut mem: M,
+        level_configs: Vec<LevelConfig>,
+    ) -> Result<Self, StorageError> {
         let wal = WriteAheadLog::new(&dir.join("wal"))?;
         let mut seq = 0u64;
         for op in wal.replay()? {
@@ -48,14 +70,16 @@ impl<M: MemStore> StorageEngine<M> {
                 )?,
             }
         }
-        let levels = Self::default_levels();
+        let levels = level_configs
+            .into_iter()
+            .enumerate()
+            .map(|(i, config)| Level::new(dir.join(format!("l{i}")), config))
+            .collect();
         Ok(Self {
-            dir: dir.to_path_buf(),
             mem,
             wal,
             seq,
             levels,
-            next_sst_id: 0,
         })
     }
 
@@ -107,40 +131,55 @@ impl<M: MemStore> StorageEngine<M> {
     /// Flush the current memtable into L0, truncate the WAL, and reset the memtable.
     fn compact(&mut self) -> Result<(), StorageError> {
         let incoming: Vec<_> = self.mem.scan_at(.., u64::MAX).collect::<Result<_, _>>()?;
-        let sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
-        let sst_dir = self.dir.join("sst");
-        let refs = write_sstables(&sst_dir, sst_id, usize::MAX, incoming)?;
-        let run = Run::from_refs(refs);
-        self.levels[0].add_run(run)?;
+        Self::compact_level(&mut self.levels, 0, Box::new(incoming.into_iter()))?;
         self.wal.truncate()?;
-        info!(sst_id, "compacted memtable to l0");
+        info!("compacted memtable to l0");
         self.mem.clear();
         Ok(())
     }
 
-    fn default_levels() -> Vec<Level> {
-        let mut levels = Vec::with_capacity(DEFAULT_NUM_LEVELS);
-        for i in 0..DEFAULT_NUM_LEVELS {
-            let config = if i == 0 {
-                LevelConfig {
-                    max_runs: 64,
-                    max_run_size_bytes: 64 * 1024 * 1024,
-                }
-            } else {
-                LevelConfig {
-                    max_runs: 1,
-                    max_run_size_bytes: 64 * 1024 * 1024 * (1 << i),
-                }
-            };
-            levels.push(Level::new(config));
+    /// Add entries to the given level. If that level exceeds its compaction
+    /// threshold, merge all its runs and push the result into the next level.
+    /// At the last level, merges incoming data with existing data in place.
+    fn compact_level(
+        levels: &mut [Level],
+        level: usize,
+        entries: Box<dyn Iterator<Item = (InternalKey, Vec<u8>)>>,
+    ) -> Result<(), StorageError> {
+        let is_last = level + 1 >= levels.len();
+        if levels[level].is_full() && is_last {
+            let merged = levels[level].merge_iter()?.merge(entries);
+            levels[level].clear();
+            levels[level].add_run(merged)?;
+        } else if levels[level].is_full() {
+            let merged = levels[level].merge_iter()?;
+            Self::compact_level(&mut levels[level + 1..], 0, Box::new(merged))?;
+            levels[level].clear();
+            levels[level].add_run(entries)?;
+        } else {
+            levels[level].add_run(entries)?;
         }
-        levels
+        Ok(())
     }
 
     /// Current monotonic write sequence number.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Number of levels in the LSM tree.
+    pub fn num_levels(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Number of runs in a given level.
+    pub fn level_run_count(&self, level: usize) -> usize {
+        self.levels[level].runs.len()
+    }
+
+    /// Whether a given level has no runs.
+    pub fn level_is_empty(&self, level: usize) -> bool {
+        self.levels[level].is_empty()
     }
 
     /// Retrieve the latest value for a given key.
@@ -308,30 +347,40 @@ mod tests {
     }
 
     #[test]
-    fn compact_returns_error_when_l0_full() {
+    fn compact_cascades_from_l0_to_l1() {
         let tmp = tempfile::tempdir().unwrap();
-        // Tiny memtable + tiny L0 capacity (max 2 runs).
         let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
-        engine.levels[0] = Level::new(LevelConfig {
-            max_runs: 2,
-            max_run_size_bytes: 64 * 1024 * 1024,
-        });
-
-        let mut i = 0u32;
-        let err = loop {
-            let key = format!("k:{i:04}");
-            let val = format!("v:{i}");
-            if let Err(e) = engine.put(key.as_bytes(), val.as_bytes()) {
-                break e;
-            }
-            i += 1;
-            assert!(i < 1000, "expected level full but wrote 1000 entries");
-        };
-
-        assert!(
-            matches!(err, StorageError::InternalError(ref msg) if msg.contains("level full")),
-            "expected level full error, got: {err:?}"
+        // Tiny L0: triggers inter-level compaction after 2 runs.
+        engine.levels[0] = Level::new(
+            tmp.path().join("l0"),
+            LevelConfig {
+                max_runs: 2,
+                max_run_size_bytes: 64 * 1024 * 1024,
+            },
         );
+        // Give L1 plenty of room so it doesn't cascade further.
+        engine.levels[1] = Level::new(
+            tmp.path().join("l1"),
+            LevelConfig {
+                max_runs: 64,
+                max_run_size_bytes: 256 * 1024 * 1024,
+            },
+        );
+
+        // Write enough to trigger L0 compaction into L1.
+        for i in 0..40u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+
+        // L0 should have been drained into L1.
+        assert!(
+            !engine.levels[1].is_empty(),
+            "L1 should have runs from L0 compaction"
+        );
+        // All data should still be readable.
+        assert_eq!(engine.get(b"k:0000").unwrap(), Some(b"v:0".to_vec()),);
     }
 
     #[test]
