@@ -25,15 +25,16 @@ pub trait ReadStore {
     /// tombstone.
     fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError>;
 
-    /// Return entries within the given user-key range where `seq <= max_seq`.
+    /// Return all entries within the given user-key range where `seq <= max_seq`,
+    /// sorted by `InternalKey` order (user key ascending, seq descending).
     ///
-    /// For each user key, only the latest version with `seq <= max_seq` is returned.
-    /// Tombstoned keys are excluded.
+    /// Returns all versions of each key, including tombstones.
+    /// Version resolution is the caller's responsibility.
     fn scan_at(
         &self,
         range: impl RangeBounds<Vec<u8>>,
         max_seq: u64,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError>;
+    ) -> impl Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + '_;
 }
 
 /// Errors returned by [`StorageEngine`] operations.

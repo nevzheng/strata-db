@@ -4,7 +4,6 @@ pub use btree::BTreeMapStore;
 
 use std::cmp::Ordering;
 use std::io::{self, Read, Write};
-use std::ops::RangeBounds;
 
 use thiserror::Error;
 
@@ -132,7 +131,7 @@ pub enum ReadError {
 /// # What this does
 ///
 /// - Stores key-value pairs in sorted byte order
-/// - Supports range scans, inserts, and tombstone deletes
+/// - Supports inserts and tombstone deletes
 /// - Tracks its own size to signal when it should be flushed
 ///
 /// # What this does not do
@@ -147,10 +146,10 @@ pub enum ReadError {
 /// Keys and values are raw bytes (`&[u8]` / `Vec<u8>`). This keeps
 /// the interface general — type-safe wrappers can be layered on top.
 ///
-/// This API copies data on read and write. Methods like `get` and
-/// `scan` return owned `Vec<u8>` values. This is simple and correct
+/// Reads are provided by the [`ReadStore`](crate::ReadStore) supertrait.
+/// This API copies data on read and write — simple and correct
 /// but not zero-copy.
-pub trait MemStore {
+pub trait MemStore: crate::ReadStore {
     /// Insert a key-value pair or tombstone.
     ///
     /// The [`InternalKey::op`] field determines the operation type:
@@ -163,24 +162,8 @@ pub trait MemStore {
     /// - `WriteError::Internal` — unexpected error
     fn put(&mut self, key: InternalKey, value: &[u8]) -> Result<(), WriteError>;
 
-    /// Return all entries within the given user-key range, sorted by
-    /// `InternalKey` order (user key ascending, seq descending).
-    ///
-    /// Returns all versions of each key, including tombstones.
-    /// Version resolution is the caller's responsibility.
-    ///
-    /// # Errors
-    /// - `ReadError::Internal` — unexpected error
-    fn scan(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError>;
-
     /// Current size in bytes of keys and values in the store.
     fn size(&self) -> usize;
-
-    /// Whether the store has reached its capacity threshold.
-    fn is_full(&self) -> bool;
 
     /// Whether an entry with the given key and value size would fit.
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool;

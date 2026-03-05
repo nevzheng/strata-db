@@ -3,16 +3,6 @@ use std::ops::{Bound, RangeBounds};
 use crate::memstore::{InternalKey, OpType, ReadError};
 use crate::{ReadStore, StorageError};
 
-/// Result of a point lookup in an SSTable, Run, or Level.
-pub enum Lookup<'a> {
-    /// Key found with a `Put` value.
-    Found(&'a [u8]),
-    /// Key found but latest entry is a `Delete`.
-    Deleted,
-    /// Key not present.
-    NotFound,
-}
-
 /// Configuration for a single level in the LSM tree.
 pub struct LevelConfig {
     pub max_runs: usize,
@@ -46,40 +36,6 @@ impl Level {
         Ok(())
     }
 
-    /// Look up a user key, distinguishing "found", "deleted", and "not present".
-    ///
-    /// Searches runs newest-first (last to first).
-    pub fn lookup(&self, key: &[u8]) -> Lookup<'_> {
-        self.lookup_at(key, u64::MAX)
-    }
-
-    /// Look up a user key at a specific sequence number.
-    ///
-    /// Returns the most recent version with `seq <= max_seq`.
-    pub fn lookup_at(&self, key: &[u8], max_seq: u64) -> Lookup<'_> {
-        for run in self.runs.iter().rev() {
-            for table in &run.tables {
-                if table.contains_key(key) {
-                    match table.lookup_at(key, max_seq) {
-                        Lookup::NotFound => {}
-                        result => return result,
-                    }
-                }
-            }
-        }
-        Lookup::NotFound
-    }
-
-    /// Look up the latest version of a user key.
-    ///
-    /// Returns `Some` with the value if found, `None` if deleted or missing.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        match self.lookup(key) {
-            Lookup::Found(val) => Some(val),
-            Lookup::Deleted | Lookup::NotFound => None,
-        }
-    }
-
     /// Return all entries within the given user-key range across all runs.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Vec<(InternalKey, Vec<u8>)> {
         let mut result = Vec::new();
@@ -101,33 +57,33 @@ impl Level {
 
 impl ReadStore for Level {
     fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError> {
-        match self.lookup_at(key, max_seq) {
-            Lookup::Found(val) => Ok(Some(val.to_vec())),
-            Lookup::Deleted | Lookup::NotFound => Ok(None),
+        let key_vec = key.to_vec();
+        for run in self.runs.iter().rev() {
+            for table in run.tables.iter().rev() {
+                if let Some((ik, value)) = table
+                    .scan_at(key_vec.clone()..=key_vec.clone(), max_seq)
+                    .next()
+                    .transpose()?
+                {
+                    return match ik.op {
+                        OpType::Put => Ok(Some(value)),
+                        OpType::Delete => Ok(None),
+                    };
+                }
+            }
         }
+        Ok(None)
     }
 
     fn scan_at(
         &self,
         range: impl std::ops::RangeBounds<Vec<u8>>,
         max_seq: u64,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
-        let raw = self.scan(range);
-        let mut results = Vec::new();
-        let mut last_key: Option<&[u8]> = None;
-        for (ik, value) in &raw {
-            if ik.seq > max_seq {
-                continue;
-            }
-            if last_key == Some(ik.key.as_slice()) {
-                continue;
-            }
-            last_key = Some(&ik.key);
-            if ik.op == OpType::Put {
-                results.push((ik.clone(), value.clone()));
-            }
-        }
-        Ok(results)
+    ) -> impl Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + '_ {
+        self.scan(range)
+            .into_iter()
+            .filter(move |(ik, _)| ik.seq <= max_seq)
+            .map(Ok)
     }
 }
 
@@ -174,46 +130,6 @@ pub struct SsTableRef {
 }
 
 impl SsTableRef {
-    /// Whether the given user key falls within this table's key range.
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        key >= self.min_key.as_slice() && key <= self.max_key.as_slice()
-    }
-
-    /// Look up the latest version of a user key.
-    ///
-    /// Returns `Some` with the value if the latest entry is a `Put`,
-    /// `None` if it's a `Delete` or the key doesn't exist.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        match self.lookup(key) {
-            Lookup::Found(val) => Some(val),
-            Lookup::Deleted | Lookup::NotFound => None,
-        }
-    }
-
-    fn lookup(&self, key: &[u8]) -> Lookup<'_> {
-        self.lookup_at(key, u64::MAX)
-    }
-
-    fn lookup_at(&self, key: &[u8], max_seq: u64) -> Lookup<'_> {
-        let entries = match self.entries.as_ref() {
-            Some(e) => e,
-            None => return Lookup::NotFound,
-        };
-        let probe = InternalKey {
-            key: key.to_vec(),
-            seq: max_seq,
-            op: OpType::Put,
-        };
-        let idx = entries.partition_point(|(ik, _)| ik < &probe);
-        if idx < entries.len() && entries[idx].0.key == key {
-            return match entries[idx].0.op {
-                OpType::Put => Lookup::Found(entries[idx].1.as_slice()),
-                OpType::Delete => Lookup::Deleted,
-            };
-        }
-        Lookup::NotFound
-    }
-
     /// Return all entries within the given user-key range, in `InternalKey` order.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> &[(InternalKey, Vec<u8>)] {
         let entries = match self.entries.as_ref() {
@@ -262,6 +178,39 @@ impl SsTableRef {
     }
 }
 
+impl ReadStore for SsTableRef {
+    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError> {
+        let entries = match self.entries.as_ref() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let probe = InternalKey {
+            key: key.to_vec(),
+            seq: max_seq,
+            op: OpType::Put,
+        };
+        let idx = entries.partition_point(|(ik, _)| ik < &probe);
+        if idx < entries.len() && entries[idx].0.key == key {
+            return match entries[idx].0.op {
+                OpType::Put => Ok(Some(entries[idx].1.clone())),
+                OpType::Delete => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    fn scan_at(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+        max_seq: u64,
+    ) -> impl Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + '_ {
+        self.scan(range)
+            .iter()
+            .filter(move |(ik, _)| ik.seq <= max_seq)
+            .map(|(ik, v)| Ok((ik.clone(), v.clone())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,27 +247,27 @@ mod tests {
     // --- SsTableRef tests ---
 
     #[test]
-    fn sstable_get_returns_latest_put() {
+    fn sstable_get_at_returns_latest_put() {
         let run = Run::from_entries(
             1,
             vec![put_entry(b"a", b"v1", 1), put_entry(b"a", b"v2", 2)],
         );
         let table = &run.tables[0];
-        assert_eq!(table.get(b"a"), Some(&b"v2"[..]));
+        assert_eq!(table.get_at(b"a", u64::MAX).unwrap(), Some(b"v2".to_vec()));
     }
 
     #[test]
-    fn sstable_get_returns_none_for_tombstone() {
+    fn sstable_get_at_returns_none_for_tombstone() {
         let run = Run::from_entries(1, vec![put_entry(b"a", b"v1", 1), delete_entry(b"a", 2)]);
         let table = &run.tables[0];
-        assert_eq!(table.get(b"a"), None);
+        assert_eq!(table.get_at(b"a", u64::MAX).unwrap(), None);
     }
 
     #[test]
-    fn sstable_get_returns_none_for_missing_key() {
+    fn sstable_get_at_returns_none_for_missing_key() {
         let run = Run::from_entries(1, vec![put_entry(b"a", b"v1", 1)]);
         let table = &run.tables[0];
-        assert_eq!(table.get(b"missing"), None);
+        assert_eq!(table.get_at(b"missing", u64::MAX).unwrap(), None);
     }
 
     #[test]
@@ -347,17 +296,6 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    #[test]
-    fn sstable_contains_key() {
-        let run = Run::from_entries(1, vec![put_entry(b"b", b"1", 1), put_entry(b"d", b"2", 2)]);
-        let table = &run.tables[0];
-        assert!(table.contains_key(b"b"));
-        assert!(table.contains_key(b"c")); // within range
-        assert!(table.contains_key(b"d"));
-        assert!(!table.contains_key(b"a"));
-        assert!(!table.contains_key(b"e"));
-    }
-
     // --- Run tests ---
 
     #[test]
@@ -372,7 +310,7 @@ mod tests {
     // --- Level tests ---
 
     #[test]
-    fn level_get_returns_latest_from_newest_run() {
+    fn level_get_at_returns_latest_from_newest_run() {
         let mut level = Level::new(test_config());
         level
             .add_run(Run::from_entries(1, vec![put_entry(b"a", b"old", 1)]))
@@ -380,7 +318,7 @@ mod tests {
         level
             .add_run(Run::from_entries(2, vec![put_entry(b"a", b"new", 2)]))
             .unwrap();
-        assert_eq!(level.get(b"a"), Some(&b"new"[..]));
+        assert_eq!(level.get_at(b"a", u64::MAX).unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]

@@ -1,12 +1,12 @@
 use std::ops::RangeBounds;
 use std::path::Path;
 
-use crate::level::{Level, LevelConfig, Lookup, Run};
+use crate::level::{Level, LevelConfig, Run};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
 };
-use crate::{KVPair, StorageError};
+use crate::{KVPair, ReadStore, StorageError};
 use tracing::{info, instrument};
 
 const DEFAULT_NUM_LEVELS: usize = 7;
@@ -104,7 +104,7 @@ impl<M: MemStore> StorageEngine<M> {
 
     /// Flush the current memtable into L0, truncate the WAL, and reset the memtable.
     fn compact(&mut self) -> Result<(), StorageError> {
-        let incoming = self.mem.scan(..)?;
+        let incoming: Vec<_> = self.mem.scan_at(.., u64::MAX).collect::<Result<_, _>>()?;
         let sst_id = self.next_sst_id;
         self.next_sst_id += 1;
         let run = Run::from_entries(sst_id, incoming);
@@ -139,52 +139,42 @@ impl<M: MemStore> StorageEngine<M> {
         self.seq
     }
 
-    /// Retrieve the value for a given key.
+    /// Retrieve the latest value for a given key.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.get_at(key, u64::MAX)
+    }
+
+    /// Retrieve the value for a given key at a specific sequence number.
     ///
     /// Checks the memtable first, then each level from L0 downward.
     /// Stops at the first layer that contains the key — a tombstone in
     /// a newer layer shadows any value in older layers.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        // Check memtable via single-key scan to distinguish "not found" from "deleted".
+    /// Returns the most recent version with `seq <= max_seq`.
+    pub fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, StorageError> {
         let key_vec = key.to_vec();
-        let mem_entries = self.mem.scan(key_vec.clone()..=key_vec)?;
-        if let Some((ik, value)) = mem_entries.first() {
+        if let Some((ik, value)) = self
+            .mem
+            .scan_at(key_vec.clone()..=key_vec, max_seq)
+            .next()
+            .transpose()?
+        {
             return match ik.op {
                 OpType::Put => Ok(Some(value.clone())),
                 OpType::Delete => Ok(None),
             };
         }
         for level in &self.levels {
-            match level.lookup(key) {
-                Lookup::Found(val) => return Ok(Some(val.to_vec())),
-                Lookup::Deleted => return Ok(None),
-                Lookup::NotFound => {}
-            }
-        }
-        Ok(None)
-    }
-
-    /// Retrieve the value for a given key at a specific sequence number.
-    ///
-    /// Returns the most recent version with `seq <= max_seq`.
-    pub fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, StorageError> {
-        // Check memtable: get_at returns None for both "not found" and "deleted",
-        // so we need to distinguish via raw scan to handle tombstone shadowing.
-        let key_vec = key.to_vec();
-        let raw_entries = self.mem.scan(key_vec.clone()..=key_vec)?;
-        for (ik, value) in &raw_entries {
-            if ik.seq <= max_seq {
+            let key_range = key.to_vec()..=key.to_vec();
+            if let Some((ik, value)) = level
+                .scan_at(key_range, max_seq)
+                .next()
+                .transpose()
+                .map_err(StorageError::from)?
+            {
                 return match ik.op {
-                    OpType::Put => Ok(Some(value.clone())),
+                    OpType::Put => Ok(Some(value)),
                     OpType::Delete => Ok(None),
                 };
-            }
-        }
-        for level in &self.levels {
-            match level.lookup_at(key, max_seq) {
-                Lookup::Found(val) => return Ok(Some(val.to_vec())),
-                Lookup::Deleted => return Ok(None),
-                Lookup::NotFound => {}
             }
         }
         Ok(None)
@@ -207,31 +197,36 @@ impl<M: MemStore> StorageEngine<M> {
         range: impl RangeBounds<Vec<u8>>,
         max_seq: u64,
     ) -> Result<Vec<KVPair>, StorageError> {
-        let mut entries = self
+        let mut entries: Vec<_> = self
             .mem
-            .scan((range.start_bound().cloned(), range.end_bound().cloned()))?;
+            .scan_at(
+                (range.start_bound().cloned(), range.end_bound().cloned()),
+                max_seq,
+            )
+            .collect::<Result<_, _>>()?;
         for level in &self.levels {
-            let level_entries =
-                level.scan((range.start_bound().cloned(), range.end_bound().cloned()));
+            let level_entries: Vec<_> = level
+                .scan_at(
+                    (range.start_bound().cloned(), range.end_bound().cloned()),
+                    max_seq,
+                )
+                .collect::<Result<_, _>>()?;
             entries.extend(level_entries);
         }
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Ok(Self::resolve_versions_at(&entries, max_seq))
+        Ok(Self::resolve_versions(&entries))
     }
 
-    /// Collapse a sorted `InternalKey` stream into user-key pairs,
-    /// only considering entries with `seq <= max_seq`.
+    /// Collapse a sorted `InternalKey` stream into user-key pairs.
     ///
+    /// Entries must already be filtered to `seq <= max_seq`.
     /// Because `InternalKey` sorts by user key ascending then seq descending,
-    /// the first entry for each user key with `seq <= max_seq` is the latest
-    /// visible version. Tombstones (`OpType::Delete`) are dropped.
-    fn resolve_versions_at(entries: &[(InternalKey, Vec<u8>)], max_seq: u64) -> Vec<KVPair> {
+    /// the first entry for each user key is the latest visible version.
+    /// Tombstones (`OpType::Delete`) are dropped.
+    fn resolve_versions(entries: &[(InternalKey, Vec<u8>)]) -> Vec<KVPair> {
         let mut result = Vec::new();
         let mut last_key: Option<&[u8]> = None;
         for (ik, value) in entries {
-            if ik.seq > max_seq {
-                continue;
-            }
             if last_key == Some(ik.key.as_slice()) {
                 continue;
             }

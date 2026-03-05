@@ -45,51 +45,8 @@ impl MemStore for BTreeMapStore {
         Ok(())
     }
 
-    fn scan(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
-        let start = match range.start_bound() {
-            Bound::Included(k) => Bound::Included(InternalKey {
-                key: k.clone(),
-                seq: u64::MAX,
-                op: OpType::Put,
-            }),
-            Bound::Excluded(k) => Bound::Excluded(InternalKey {
-                key: k.clone(),
-                seq: 0,
-                op: OpType::Put,
-            }),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(k) => Bound::Included(InternalKey {
-                key: k.clone(),
-                seq: 0,
-                op: OpType::Put,
-            }),
-            Bound::Excluded(k) => Bound::Excluded(InternalKey {
-                key: k.clone(),
-                seq: u64::MAX,
-                op: OpType::Put,
-            }),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        let results = self
-            .store
-            .range((start, end))
-            .map(|(ikey, value)| (ikey.clone(), value.to_vec()))
-            .collect();
-        Ok(results)
-    }
-
     fn size(&self) -> usize {
         self.current_size
-    }
-
-    fn is_full(&self) -> bool {
-        self.current_size >= self.capacity
     }
 
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool {
@@ -124,11 +81,11 @@ impl ReadStore for BTreeMapStore {
         &self,
         range: impl RangeBounds<Vec<u8>>,
         max_seq: u64,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
+    ) -> impl Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + '_ {
         let start = match range.start_bound() {
             Bound::Included(k) => Bound::Included(InternalKey {
                 key: k.clone(),
-                seq: max_seq,
+                seq: u64::MAX,
                 op: OpType::Put,
             }),
             Bound::Excluded(k) => Bound::Excluded(InternalKey {
@@ -146,27 +103,16 @@ impl ReadStore for BTreeMapStore {
             }),
             Bound::Excluded(k) => Bound::Excluded(InternalKey {
                 key: k.clone(),
-                seq: max_seq,
+                seq: u64::MAX,
                 op: OpType::Put,
             }),
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        let mut results = Vec::new();
-        let mut last_key: Option<&[u8]> = None;
-        for (ikey, value) in self.store.range((start, end)) {
-            if ikey.seq > max_seq {
-                continue;
-            }
-            if last_key == Some(ikey.key.as_slice()) {
-                continue;
-            }
-            last_key = Some(&ikey.key);
-            if ikey.op == OpType::Put {
-                results.push((ikey.clone(), value.to_vec()));
-            }
-        }
-        Ok(results)
+        self.store
+            .range((start, end))
+            .filter(move |(ikey, _)| ikey.seq <= max_seq)
+            .map(|(ikey, value)| Ok((ikey.clone(), value.to_vec())))
     }
 }
 
@@ -200,17 +146,18 @@ mod tests {
             .unwrap();
     }
 
-    // --- scan returns sorted order ---
+    // --- scan_at returns sorted order ---
 
     #[test]
-    fn scan_returns_results_in_sorted_order() {
+    fn scan_at_returns_results_in_sorted_order() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"user:charlie", b"admin", 1);
         put_key(&mut store, b"user:alice", b"viewer", 2);
         put_key(&mut store, b"user:bob", b"editor", 3);
 
         let results = store
-            .scan(b"user:alice".to_vec()..=b"user:charlie".to_vec())
+            .scan_at(b"user:alice".to_vec()..=b"user:charlie".to_vec(), u64::MAX)
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(ik, _)| ik.key.as_slice()).collect();
         assert_eq!(
@@ -220,14 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn scan_with_integer_keys_preserves_big_endian_order() {
+    fn scan_at_with_integer_keys_preserves_big_endian_order() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, &100u64.to_be_bytes(), b"hundred", 1);
         put_key(&mut store, &1u64.to_be_bytes(), b"one", 2);
         put_key(&mut store, &42u64.to_be_bytes(), b"forty-two", 3);
 
         let results = store
-            .scan(1u64.to_be_bytes().to_vec()..=100u64.to_be_bytes().to_vec())
+            .scan_at(
+                1u64.to_be_bytes().to_vec()..=100u64.to_be_bytes().to_vec(),
+                u64::MAX,
+            )
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let keys: Vec<u64> = results
             .iter()
@@ -252,13 +203,6 @@ mod tests {
         assert!(!store.fits(&ikey, b"shipped".len()));
     }
 
-    #[test]
-    fn is_full_returns_true_at_capacity() {
-        let mut store = BTreeMapStore::with_capacity(20);
-        put_key(&mut store, b"session:xyz789", b"active", 1); // exactly 20
-        assert!(store.is_full());
-    }
-
     // --- delete correctness ---
 
     #[test]
@@ -273,13 +217,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_includes_tombstones() {
+    fn scan_at_includes_tombstones() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"a", b"1", 1);
         put_key(&mut store, b"b", b"2", 2);
         delete_key(&mut store, b"b", 3);
 
-        let results = store.scan(b"a".to_vec()..=b"b".to_vec()).unwrap();
+        let results = store
+            .scan_at(b"a".to_vec()..=b"b".to_vec(), u64::MAX)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0.key, b"a");
         // b has seq 3 (delete) before seq 2 (put) due to InternalKey ordering
@@ -304,13 +251,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_returns_all_versions() {
+    fn scan_at_returns_all_versions() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"k:a", b"old", 1);
         put_key(&mut store, b"k:a", b"new", 2);
         put_key(&mut store, b"k:b", b"only", 3);
 
-        let results = store.scan(b"k:a".to_vec()..=b"k:b".to_vec()).unwrap();
+        let results = store
+            .scan_at(b"k:a".to_vec()..=b"k:b".to_vec(), u64::MAX)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 3);
         // k:a seq 2 (newest) first, then k:a seq 1
         assert_eq!(results[0].0.seq, 2);
@@ -357,24 +307,36 @@ mod tests {
         put_key(&mut store, b"b", b"v1", 2);
         put_key(&mut store, b"b", b"v2", 4);
 
-        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 2).unwrap();
+        let results: Vec<_> = store
+            .scan_at(b"a".to_vec()..=b"b".to_vec(), 2)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // seq <= 2: a@1, b@2 (a@3 and b@4 excluded)
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0.key, b"a");
-        assert_eq!(results[0].1, b"v1");
+        assert_eq!(results[0].0.seq, 1);
         assert_eq!(results[1].0.key, b"b");
-        assert_eq!(results[1].1, b"v1");
+        assert_eq!(results[1].0.seq, 2);
     }
 
     #[test]
-    fn scan_at_excludes_tombstones() {
+    fn scan_at_includes_tombstones_in_results() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"a", b"val", 1);
         delete_key(&mut store, b"a", 2);
         put_key(&mut store, b"b", b"val", 3);
 
-        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 3).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.key, b"b");
+        let results: Vec<_> = store
+            .scan_at(b"a".to_vec()..=b"b".to_vec(), 3)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // All 3 entries: a@2 (delete), a@1 (put), b@3 (put)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0.key, b"a");
+        assert_eq!(results[0].0.op, OpType::Delete);
+        assert_eq!(results[1].0.key, b"a");
+        assert_eq!(results[1].0.op, OpType::Put);
+        assert_eq!(results[2].0.key, b"b");
     }
 
     #[test]
@@ -383,7 +345,10 @@ mod tests {
         put_key(&mut store, b"a", b"v1", 1);
         put_key(&mut store, b"b", b"v1", 5); // only version, but seq > max_seq
 
-        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 3).unwrap();
+        let results: Vec<_> = store
+            .scan_at(b"a".to_vec()..=b"b".to_vec(), 3)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.key, b"a");
     }
