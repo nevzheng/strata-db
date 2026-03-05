@@ -171,6 +171,7 @@ impl<M: MemStore> StorageEngine<M> {
             return Err(e);
         }
         self.writer.commit(self.seq)?;
+        self.writer.cleanup_orphans()?;
         self.wal.truncate()?;
         info!("compacted memtable to l0");
         self.mem.clear();
@@ -230,6 +231,11 @@ impl<M: MemStore> StorageEngine<M> {
     /// Whether a given level has no runs.
     pub fn level_is_empty(&self, level: usize) -> bool {
         self.levels[level].is_empty()
+    }
+
+    /// Active SSTable entries tracked by the manifest.
+    pub fn writer_tables(&self) -> &std::collections::HashMap<u64, crate::level::ManifestEntry> {
+        self.writer.tables()
     }
 
     /// Retrieve the latest value for a given key.

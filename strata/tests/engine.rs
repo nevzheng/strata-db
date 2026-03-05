@@ -538,6 +538,39 @@ fn deleted_data_stays_deleted_after_reopen() {
     }
 }
 
+/// Orphaned SST files are cleaned up after compaction.
+#[test]
+fn orphan_sst_files_cleaned_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = three_level_engine(tmp.path());
+
+    // Write enough to trigger cascading compaction (L0 → L1 → L2).
+    for i in 0..80u32 {
+        engine
+            .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+            .unwrap();
+    }
+
+    // Collect live SST IDs from the engine's manifest.
+    let live_ids: std::collections::HashSet<u64> = engine.writer_tables().keys().copied().collect();
+    assert!(!live_ids.is_empty(), "should have live SSTs after writes");
+
+    // Every .sst file on disk should be in the live set.
+    let sst_dir = tmp.path().join("sst");
+    for entry in std::fs::read_dir(&sst_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "sst") {
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            let id: u64 = stem.parse().unwrap();
+            assert!(
+                live_ids.contains(&id),
+                "orphan SST file {id}.sst still on disk"
+            );
+        }
+    }
+}
+
 /// Sequence number is recovered from manifest after compaction + WAL truncate.
 #[test]
 fn seq_recovered_from_manifest_after_compaction() {

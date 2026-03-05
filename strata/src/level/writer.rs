@@ -104,6 +104,29 @@ impl SsTableWriter {
     pub fn max_seq(&self) -> u64 {
         self.manifest.max_seq()
     }
+
+    /// Delete SSTable files on disk that are not referenced by the manifest.
+    pub fn cleanup_orphans(&self) -> Result<(), StorageError> {
+        let sst_dir = self.dir.join("sst");
+        if !sst_dir.exists() {
+            return Ok(());
+        }
+
+        let live_ids: std::collections::HashSet<u64> =
+            self.manifest.tables().keys().copied().collect();
+
+        for entry in fs::read_dir(&sst_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(id) = sst_file_id(&path)
+                && !live_ids.contains(&id)
+            {
+                fs::remove_file(&path)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // --- SSTable file writing ---
@@ -181,6 +204,13 @@ fn write_sstable_file(
         max_key,
         data_size: bytes_written,
     })
+}
+
+/// Extract the numeric ID from a `.sst` file path (e.g. `42.sst` → `Some(42)`).
+fn sst_file_id(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".sst")?;
+    stem.parse().ok()
 }
 
 /// Write sorted entries to SSTable files on disk, splitting when a file
