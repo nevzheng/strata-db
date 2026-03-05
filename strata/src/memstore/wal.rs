@@ -13,12 +13,6 @@ pub const MAX_VALUE_SIZE: usize = u16::MAX as usize;
 const OP_PUT: u8 = 0x01;
 const OP_DELETE: u8 = 0x02;
 
-/// Per-entry metadata written to the WAL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalMeta {
-    pub seq: u64,
-}
-
 /// The operation type for a WAL entry.
 ///
 /// Wire formats (all integers big-endian):
@@ -28,12 +22,12 @@ pub struct WalMeta {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WalOp {
     Put {
-        meta: WalMeta,
+        seq: u64,
         key: Vec<u8>,
         value: Vec<u8>,
     },
     Delete {
-        meta: WalMeta,
+        seq: u64,
         key: Vec<u8>,
     },
 }
@@ -52,9 +46,9 @@ fn read_and_hash(r: &mut impl Read, hasher: &mut Hasher, buf: &mut [u8]) -> io::
 }
 
 impl WalOp {
-    pub fn meta(&self) -> &WalMeta {
+    pub fn seq(&self) -> u64 {
         match self {
-            WalOp::Put { meta, .. } | WalOp::Delete { meta, .. } => meta,
+            WalOp::Put { seq, .. } | WalOp::Delete { seq, .. } => *seq,
         }
     }
 
@@ -63,17 +57,17 @@ impl WalOp {
         let mut hasher = Hasher::new();
 
         match self {
-            WalOp::Put { meta, key, value } => {
+            WalOp::Put { seq, key, value } => {
                 write_and_hash(w, &mut hasher, &[OP_PUT])?;
-                write_and_hash(w, &mut hasher, &meta.seq.to_be_bytes())?;
+                write_and_hash(w, &mut hasher, &seq.to_be_bytes())?;
                 write_and_hash(w, &mut hasher, &(key.len() as u16).to_be_bytes())?;
                 write_and_hash(w, &mut hasher, &(value.len() as u16).to_be_bytes())?;
                 write_and_hash(w, &mut hasher, key)?;
                 write_and_hash(w, &mut hasher, value)?;
             }
-            WalOp::Delete { meta, key } => {
+            WalOp::Delete { seq, key } => {
                 write_and_hash(w, &mut hasher, &[OP_DELETE])?;
-                write_and_hash(w, &mut hasher, &meta.seq.to_be_bytes())?;
+                write_and_hash(w, &mut hasher, &seq.to_be_bytes())?;
                 write_and_hash(w, &mut hasher, &(key.len() as u16).to_be_bytes())?;
                 write_and_hash(w, &mut hasher, key)?;
             }
@@ -95,9 +89,7 @@ impl WalOp {
         // Sequence number.
         let mut seq_buf = [0u8; 8];
         read_and_hash(r, &mut hasher, &mut seq_buf)?;
-        let meta = WalMeta {
-            seq: u64::from_be_bytes(seq_buf),
-        };
+        let seq = u64::from_be_bytes(seq_buf);
 
         // Key length.
         let mut key_len_buf = [0u8; 2];
@@ -116,13 +108,13 @@ impl WalOp {
                 let mut value = vec![0u8; val_len];
                 read_and_hash(r, &mut hasher, &mut value)?;
 
-                WalOp::Put { meta, key, value }
+                WalOp::Put { seq, key, value }
             }
             OP_DELETE => {
                 let mut key = vec![0u8; key_len];
                 read_and_hash(r, &mut hasher, &mut key)?;
 
-                WalOp::Delete { meta, key }
+                WalOp::Delete { seq, key }
             }
             unknown => {
                 return Err(io::Error::new(
@@ -216,16 +208,12 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn meta(seq: u64) -> WalMeta {
-        WalMeta { seq }
-    }
-
     // --- round-trip ---
 
     #[test]
     fn put_round_trip() {
         let op = WalOp::Put {
-            meta: meta(1),
+            seq: 1,
             key: b"user:alice".to_vec(),
             value: b"admin".to_vec(),
         };
@@ -240,7 +228,7 @@ mod tests {
     #[test]
     fn delete_round_trip() {
         let op = WalOp::Delete {
-            meta: meta(42),
+            seq: 42,
             key: b"session:expired:abc123".to_vec(),
         };
 
@@ -255,16 +243,16 @@ mod tests {
     fn multiple_entries_round_trip() {
         let ops = vec![
             WalOp::Put {
-                meta: meta(1),
+                seq: 1,
                 key: b"order:1001".to_vec(),
                 value: b"pending".to_vec(),
             },
             WalOp::Delete {
-                meta: meta(2),
+                seq: 2,
                 key: b"order:0999".to_vec(),
             },
             WalOp::Put {
-                meta: meta(3),
+                seq: 3,
                 key: b"order:1002".to_vec(),
                 value: b"shipped".to_vec(),
             },
@@ -285,7 +273,7 @@ mod tests {
     #[test]
     fn seq_is_preserved_in_round_trip() {
         let op = WalOp::Put {
-            meta: meta(99),
+            seq: 99,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
@@ -294,7 +282,7 @@ mod tests {
         op.encode(&mut buf).unwrap();
 
         let decoded = WalOp::decode(&mut Cursor::new(&buf)).unwrap();
-        assert_eq!(decoded.meta().seq, 99);
+        assert_eq!(decoded.seq(), 99);
     }
 
     // --- checksum verification ---
@@ -302,7 +290,7 @@ mod tests {
     #[test]
     fn corrupted_value_fails_checksum() {
         let op = WalOp::Put {
-            meta: meta(1),
+            seq: 1,
             key: b"metric:cpu_usage".to_vec(),
             value: b"72.5".to_vec(),
         };
@@ -324,7 +312,7 @@ mod tests {
     #[test]
     fn corrupted_key_fails_checksum() {
         let op = WalOp::Delete {
-            meta: meta(1),
+            seq: 1,
             key: b"cache:page:/home".to_vec(),
         };
 
@@ -348,7 +336,7 @@ mod tests {
     #[test]
     fn corrupted_seq_fails_checksum() {
         let op = WalOp::Put {
-            meta: meta(1),
+            seq: 1,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         };
@@ -408,7 +396,7 @@ mod tests {
         let mut wal = WriteAheadLog::new(&tmp.path().join("wal_data")).unwrap();
 
         let op = WalOp::Put {
-            meta: meta(1),
+            seq: 1,
             key: b"user:alice".to_vec(),
             value: b"admin".to_vec(),
         };
@@ -426,16 +414,16 @@ mod tests {
 
         let ops = vec![
             WalOp::Put {
-                meta: meta(1),
+                seq: 1,
                 key: b"order:1001".to_vec(),
                 value: b"pending".to_vec(),
             },
             WalOp::Delete {
-                meta: meta(2),
+                seq: 2,
                 key: b"order:0999".to_vec(),
             },
             WalOp::Put {
-                meta: meta(3),
+                seq: 3,
                 key: b"order:1002".to_vec(),
                 value: b"shipped".to_vec(),
             },
@@ -464,7 +452,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal_data");
 
         let op = WalOp::Put {
-            meta: meta(1),
+            seq: 1,
             key: b"config:theme".to_vec(),
             value: b"dark".to_vec(),
         };

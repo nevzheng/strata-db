@@ -4,7 +4,7 @@ use std::path::Path;
 
 use memstore::{
     MemStore, ReadError, WriteError,
-    wal::{WalMeta, WalOp, WriteAheadLog},
+    wal::{WalOp, WriteAheadLog},
 };
 use thiserror::Error;
 use tracing::{info, instrument};
@@ -53,7 +53,7 @@ impl<M: MemStore> StorageEngine<M> {
         let wal = WriteAheadLog::new(&dir.join("wal"))?;
         let mut seq = 0u64;
         for op in wal.replay()? {
-            seq = op.meta().seq;
+            seq = op.seq();
             match op {
                 WalOp::Put { key, value, .. } => mem.put(&key, &value)?,
                 WalOp::Delete { key, .. } => mem.delete(&key)?,
@@ -69,7 +69,7 @@ impl<M: MemStore> StorageEngine<M> {
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let next_seq = self.seq + 1;
         let op = WalOp::Put {
-            meta: WalMeta { seq: next_seq },
+            seq: next_seq,
             key: key.to_vec(),
             value: value.to_vec(),
         };
@@ -88,7 +88,7 @@ impl<M: MemStore> StorageEngine<M> {
     pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
         let next_seq = self.seq + 1;
         let op = WalOp::Delete {
-            meta: WalMeta { seq: next_seq },
+            seq: next_seq,
             key: key.to_vec(),
         };
         self.wal.append(&op)?;
