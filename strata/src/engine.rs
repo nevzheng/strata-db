@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
 use std::path::Path;
 
-use crate::level::{Level, LevelConfig, Run};
+use crate::level::{Level, LevelConfig, Lookup, Run};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
@@ -142,13 +142,23 @@ impl<M: MemStore> StorageEngine<M> {
     /// Retrieve the value for a given key.
     ///
     /// Checks the memtable first, then each level from L0 downward.
+    /// Stops at the first layer that contains the key — a tombstone in
+    /// a newer layer shadows any value in older layers.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        if let Some(val) = self.mem.get(key)? {
-            return Ok(Some(val));
+        // Check memtable via single-key scan to distinguish "not found" from "deleted".
+        let key_vec = key.to_vec();
+        let mem_entries = self.mem.scan(key_vec.clone()..=key_vec)?;
+        if let Some((ik, value)) = mem_entries.first() {
+            return match ik.op {
+                OpType::Put => Ok(Some(value.clone())),
+                OpType::Delete => Ok(None),
+            };
         }
         for level in &self.levels {
-            if let Some(val) = level.get(key) {
-                return Ok(Some(val.to_vec()));
+            match level.lookup(key) {
+                Lookup::Found(val) => return Ok(Some(val.to_vec())),
+                Lookup::Deleted => return Ok(None),
+                Lookup::NotFound => {}
             }
         }
         Ok(None)

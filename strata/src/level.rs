@@ -3,6 +3,16 @@ use std::ops::{Bound, RangeBounds};
 use crate::StorageError;
 use crate::memstore::{InternalKey, OpType};
 
+/// Result of a point lookup in an SSTable, Run, or Level.
+pub enum Lookup<'a> {
+    /// Key found with a `Put` value.
+    Found(&'a [u8]),
+    /// Key found but latest entry is a `Delete`.
+    Deleted,
+    /// Key not present.
+    NotFound,
+}
+
 /// Configuration for a single level in the LSM tree.
 pub struct LevelConfig {
     pub max_runs: usize,
@@ -36,22 +46,31 @@ impl Level {
         Ok(())
     }
 
-    /// Look up the latest version of a user key.
+    /// Look up a user key, distinguishing "found", "deleted", and "not present".
     ///
-    /// Searches runs newest-first (last to first). Returns `Some` with the
-    /// value if the latest entry is a `Put`, `None` if it's a `Delete` or
-    /// the key doesn't exist.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+    /// Searches runs newest-first (last to first).
+    pub fn lookup(&self, key: &[u8]) -> Lookup<'_> {
         for run in self.runs.iter().rev() {
             for table in &run.tables {
-                if table.contains_key(key)
-                    && let Some(val) = table.get(key)
-                {
-                    return Some(val);
+                if table.contains_key(key) {
+                    match table.lookup(key) {
+                        Lookup::NotFound => {}
+                        result => return result,
+                    }
                 }
             }
         }
-        None
+        Lookup::NotFound
+    }
+
+    /// Look up the latest version of a user key.
+    ///
+    /// Returns `Some` with the value if found, `None` if deleted or missing.
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        match self.lookup(key) {
+            Lookup::Found(val) => Some(val),
+            Lookup::Deleted | Lookup::NotFound => None,
+        }
     }
 
     /// Return all entries within the given user-key range across all runs.
@@ -126,7 +145,17 @@ impl SsTableRef {
     /// Returns `Some` with the value if the latest entry is a `Put`,
     /// `None` if it's a `Delete` or the key doesn't exist.
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        let entries = self.entries.as_ref()?;
+        match self.lookup(key) {
+            Lookup::Found(val) => Some(val),
+            Lookup::Deleted | Lookup::NotFound => None,
+        }
+    }
+
+    fn lookup(&self, key: &[u8]) -> Lookup<'_> {
+        let entries = match self.entries.as_ref() {
+            Some(e) => e,
+            None => return Lookup::NotFound,
+        };
         let probe = InternalKey {
             key: key.to_vec(),
             seq: u64::MAX,
@@ -134,13 +163,12 @@ impl SsTableRef {
         };
         let idx = entries.partition_point(|(ik, _)| ik < &probe);
         if idx < entries.len() && entries[idx].0.key == key {
-            let (ik, value) = &entries[idx];
-            return match ik.op {
-                OpType::Put => Some(value.as_slice()),
-                OpType::Delete => None,
+            return match entries[idx].0.op {
+                OpType::Put => Lookup::Found(entries[idx].1.as_slice()),
+                OpType::Delete => Lookup::Deleted,
             };
         }
-        None
+        Lookup::NotFound
     }
 
     /// Return all entries within the given user-key range, in `InternalKey` order.
