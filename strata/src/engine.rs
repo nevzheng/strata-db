@@ -97,10 +97,11 @@ impl<M: MemStore> StorageEngine<M> {
         Ok(())
     }
 
-    /// Flush the current memtable into L0 and reset it.
+    /// Flush the current memtable into L0, truncate the WAL, and reset the memtable.
     fn compact(&mut self) -> Result<(), StorageError> {
         let incoming = self.mem.scan(..)?;
         self.l0.merge(incoming)?;
+        self.wal.truncate()?;
         info!(entries = self.l0.len(), "compacted memtable to l0");
         self.mem.clear();
         Ok(())

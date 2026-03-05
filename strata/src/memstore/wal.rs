@@ -182,6 +182,13 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// Truncate the WAL, discarding all entries.
+    pub fn truncate(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Replay all entries in the WAL, returning them in order.
     ///
     /// Stops at EOF or at the first corrupted entry.
