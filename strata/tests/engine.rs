@@ -157,3 +157,65 @@ fn delete_shadows_compacted_data() {
         .unwrap();
     assert_eq!(results.len(), 25);
 }
+
+/// get_at returns the version visible at a given sequence number.
+#[test]
+fn get_at_returns_version_at_seq() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+
+    engine.put(b"key", b"v1").unwrap(); // seq 1
+    engine.put(b"key", b"v2").unwrap(); // seq 2
+    engine.put(b"key", b"v3").unwrap(); // seq 3
+
+    assert_eq!(engine.get_at(b"key", 1).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(engine.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(engine.get_at(b"key", 3).unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(engine.get_at(b"key", 0).unwrap(), None);
+}
+
+/// get_at respects tombstones at the given sequence number.
+#[test]
+fn get_at_respects_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+
+    engine.put(b"key", b"val").unwrap(); // seq 1
+    engine.delete(b"key").unwrap(); // seq 2
+    engine.put(b"key", b"revived").unwrap(); // seq 3
+
+    assert_eq!(engine.get_at(b"key", 1).unwrap(), Some(b"val".to_vec()));
+    assert_eq!(engine.get_at(b"key", 2).unwrap(), None);
+    assert_eq!(engine.get_at(b"key", 3).unwrap(), Some(b"revived".to_vec()));
+}
+
+/// get_at works across compaction boundaries.
+#[test]
+fn get_at_across_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+
+    engine.put(b"key", b"v1").unwrap(); // seq 1
+
+    // Trigger compaction so "key" lands in L0.
+    for i in 0..20u32 {
+        engine
+            .put(format!("z:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+            .unwrap();
+    }
+
+    // Overwrite in the fresh memtable.
+    let seq_before = engine.seq();
+    engine.put(b"key", b"v2").unwrap();
+
+    // Should see old value at seq 1, new value at current seq.
+    assert_eq!(engine.get_at(b"key", 1).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(
+        engine.get_at(b"key", seq_before).unwrap(),
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(
+        engine.get_at(b"key", engine.seq()).unwrap(),
+        Some(b"v2".to_vec())
+    );
+}

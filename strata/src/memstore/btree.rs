@@ -106,6 +106,74 @@ impl MemStore for BTreeMapStore {
         Ok(results)
     }
 
+    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError> {
+        let probe = InternalKey {
+            key: key.to_vec(),
+            seq: max_seq,
+            op: OpType::Put,
+        };
+        if let Some((ikey, value)) = self.store.range(probe..).next()
+            && ikey.key == key
+        {
+            return match ikey.op {
+                OpType::Put => Ok(Some(value.to_vec())),
+                OpType::Delete => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    fn scan_at(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+        max_seq: u64,
+    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
+        let start = match range.start_bound() {
+            Bound::Included(k) => Bound::Included(InternalKey {
+                key: k.clone(),
+                seq: max_seq,
+                op: OpType::Put,
+            }),
+            Bound::Excluded(k) => Bound::Excluded(InternalKey {
+                key: k.clone(),
+                seq: 0,
+                op: OpType::Put,
+            }),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(k) => Bound::Included(InternalKey {
+                key: k.clone(),
+                seq: 0,
+                op: OpType::Put,
+            }),
+            Bound::Excluded(k) => Bound::Excluded(InternalKey {
+                key: k.clone(),
+                seq: max_seq,
+                op: OpType::Put,
+            }),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let mut results = Vec::new();
+        let mut last_key: Option<&[u8]> = None;
+        for (ikey, value) in self.store.range((start, end)) {
+            if ikey.seq > max_seq {
+                continue;
+            }
+            // InternalKey ordering: user key asc, seq desc.
+            // First entry per user key with seq <= max_seq is the latest visible version.
+            if last_key == Some(ikey.key.as_slice()) {
+                continue;
+            }
+            last_key = Some(&ikey.key);
+            if ikey.op == OpType::Put {
+                results.push((ikey.clone(), value.to_vec()));
+            }
+        }
+        Ok(results)
+    }
+
     fn size(&self) -> usize {
         self.current_size
     }
@@ -263,6 +331,74 @@ mod tests {
         assert_eq!(results[1].0.seq, 1);
         assert_eq!(results[1].1, b"old");
         assert_eq!(results[2].0.key, b"k:b");
+    }
+
+    // --- get_at ---
+
+    #[test]
+    fn get_at_returns_version_at_seq() {
+        let mut store = BTreeMapStore::new();
+        put_key(&mut store, b"key", b"v1", 1);
+        put_key(&mut store, b"key", b"v2", 2);
+        put_key(&mut store, b"key", b"v3", 3);
+
+        assert_eq!(store.get_at(b"key", 1).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(store.get_at(b"key", 2).unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(store.get_at(b"key", 3).unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(store.get_at(b"key", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn get_at_respects_tombstones() {
+        let mut store = BTreeMapStore::new();
+        put_key(&mut store, b"key", b"val", 1);
+        delete_key(&mut store, b"key", 2);
+        put_key(&mut store, b"key", b"revived", 3);
+
+        assert_eq!(store.get_at(b"key", 1).unwrap(), Some(b"val".to_vec()));
+        assert_eq!(store.get_at(b"key", 2).unwrap(), None);
+        assert_eq!(store.get_at(b"key", 3).unwrap(), Some(b"revived".to_vec()));
+    }
+
+    // --- scan_at ---
+
+    #[test]
+    fn scan_at_returns_entries_at_seq() {
+        let mut store = BTreeMapStore::new();
+        put_key(&mut store, b"a", b"v1", 1);
+        put_key(&mut store, b"a", b"v2", 3);
+        put_key(&mut store, b"b", b"v1", 2);
+        put_key(&mut store, b"b", b"v2", 4);
+
+        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.key, b"a");
+        assert_eq!(results[0].1, b"v1");
+        assert_eq!(results[1].0.key, b"b");
+        assert_eq!(results[1].1, b"v1");
+    }
+
+    #[test]
+    fn scan_at_excludes_tombstones() {
+        let mut store = BTreeMapStore::new();
+        put_key(&mut store, b"a", b"val", 1);
+        delete_key(&mut store, b"a", 2);
+        put_key(&mut store, b"b", b"val", 3);
+
+        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 3).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.key, b"b");
+    }
+
+    #[test]
+    fn scan_at_skips_future_versions() {
+        let mut store = BTreeMapStore::new();
+        put_key(&mut store, b"a", b"v1", 1);
+        put_key(&mut store, b"b", b"v1", 5); // only version, but seq > max_seq
+
+        let results = store.scan_at(b"a".to_vec()..=b"b".to_vec(), 3).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.key, b"a");
     }
 
     // --- InternalKey ordering ---

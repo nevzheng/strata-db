@@ -164,6 +164,32 @@ impl<M: MemStore> StorageEngine<M> {
         Ok(None)
     }
 
+    /// Retrieve the value for a given key at a specific sequence number.
+    ///
+    /// Returns the most recent version with `seq <= max_seq`.
+    pub fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        // Check memtable: get_at returns None for both "not found" and "deleted",
+        // so we need to distinguish via raw scan to handle tombstone shadowing.
+        let key_vec = key.to_vec();
+        let raw_entries = self.mem.scan(key_vec.clone()..=key_vec)?;
+        for (ik, value) in &raw_entries {
+            if ik.seq <= max_seq {
+                return match ik.op {
+                    OpType::Put => Ok(Some(value.clone())),
+                    OpType::Delete => Ok(None),
+                };
+            }
+        }
+        for level in &self.levels {
+            match level.lookup_at(key, max_seq) {
+                Lookup::Found(val) => return Ok(Some(val.to_vec())),
+                Lookup::Deleted => return Ok(None),
+                Lookup::NotFound => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Return key-value pairs within the given range, sorted by key ascending.
     ///
     /// Merges entries from the memtable and all levels, then resolves versions:

@@ -50,10 +50,17 @@ impl Level {
     ///
     /// Searches runs newest-first (last to first).
     pub fn lookup(&self, key: &[u8]) -> Lookup<'_> {
+        self.lookup_at(key, u64::MAX)
+    }
+
+    /// Look up a user key at a specific sequence number.
+    ///
+    /// Returns the most recent version with `seq <= max_seq`.
+    pub fn lookup_at(&self, key: &[u8], max_seq: u64) -> Lookup<'_> {
         for run in self.runs.iter().rev() {
             for table in &run.tables {
                 if table.contains_key(key) {
-                    match table.lookup(key) {
+                    match table.lookup_at(key, max_seq) {
                         Lookup::NotFound => {}
                         result => return result,
                     }
@@ -152,13 +159,17 @@ impl SsTableRef {
     }
 
     fn lookup(&self, key: &[u8]) -> Lookup<'_> {
+        self.lookup_at(key, u64::MAX)
+    }
+
+    fn lookup_at(&self, key: &[u8], max_seq: u64) -> Lookup<'_> {
         let entries = match self.entries.as_ref() {
             Some(e) => e,
             None => return Lookup::NotFound,
         };
         let probe = InternalKey {
             key: key.to_vec(),
-            seq: u64::MAX,
+            seq: max_seq,
             op: OpType::Put,
         };
         let idx = entries.partition_point(|(ik, _)| ik < &probe);

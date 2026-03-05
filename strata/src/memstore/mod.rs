@@ -202,6 +202,29 @@ pub trait MemStore {
     /// Whether an entry with the given key and value size would fit.
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool;
 
+    /// Retrieve the value for a given user key at a specific sequence number.
+    ///
+    /// Finds the most recent entry with `seq <= max_seq` for the user key.
+    /// Returns `None` if no such entry exists or the matching entry is a
+    /// tombstone ([`OpType::Delete`]).
+    ///
+    /// # Errors
+    /// - `ReadError::Internal` — unexpected error
+    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError>;
+
+    /// Return entries within the given user-key range where `seq <= max_seq`.
+    ///
+    /// For each user key, only the latest version with `seq <= max_seq` is returned.
+    /// Tombstoned keys are excluded.
+    ///
+    /// # Errors
+    /// - `ReadError::Internal` — unexpected error
+    fn scan_at(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+        max_seq: u64,
+    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError>;
+
     /// Remove all entries from the store, resetting its size to zero.
     fn clear(&mut self);
 }
