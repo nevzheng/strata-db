@@ -331,6 +331,48 @@ mod tests {
     }
 
     #[test]
+    fn compact_truncates_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Capacity 16: "k:0"(3) + "v:0"(3) = 6 bytes per entry, fits ~2 entries.
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(16)).unwrap();
+
+        // Fill memtable (2 entries fit).
+        engine.put(b"k:0", b"v:0").unwrap();
+        engine.put(b"k:1", b"v:1").unwrap();
+
+        // This write triggers compaction (memtable full), then appends itself.
+        // After compaction the WAL is truncated, so only this entry remains.
+        engine.put(b"k:2", b"v:2").unwrap();
+        assert!(!engine.levels[0].is_empty(), "compaction should have fired");
+
+        // Replay the WAL — should contain only the 1 entry written after truncation.
+        drop(engine);
+        let wal = WriteAheadLog::new(&tmp.path().join("wal")).unwrap();
+        let replayed: Vec<_> = wal.replay().unwrap();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "WAL should have 1 entry after compaction"
+        );
+        assert_eq!(replayed[0].seq(), 3);
+
+        // Write more entries after reopening, they accumulate in the WAL.
+        let mut engine =
+            StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(1024)).unwrap();
+        engine.put(b"k:3", b"v:3").unwrap();
+        engine.put(b"k:4", b"v:4").unwrap();
+        drop(engine);
+
+        let wal = WriteAheadLog::new(&tmp.path().join("wal")).unwrap();
+        let replayed: Vec<_> = wal.replay().unwrap();
+        assert_eq!(
+            replayed.len(),
+            3,
+            "WAL should have 3 entries (1 from before + 2 new)"
+        );
+    }
+
+    #[test]
     fn seq_increments_on_writes_and_deletes() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
