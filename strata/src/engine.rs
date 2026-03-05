@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
 use std::path::Path;
 
-use crate::level::{Level, LevelConfig};
+use crate::level::{Level, LevelConfig, Manifest, SsTableWriter};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
@@ -17,6 +17,7 @@ pub struct StorageEngine<M: MemStore> {
     mem: M,
     wal: WriteAheadLog,
     seq: u64,
+    writer: SsTableWriter,
     levels: Vec<Level>,
 }
 
@@ -70,6 +71,8 @@ impl<M: MemStore> StorageEngine<M> {
                 )?,
             }
         }
+        let manifest = Manifest::new(&dir.join("MANIFEST"))?;
+        let writer = SsTableWriter::new(manifest, dir.to_path_buf());
         let levels = level_configs
             .into_iter()
             .enumerate()
@@ -79,6 +82,7 @@ impl<M: MemStore> StorageEngine<M> {
             mem,
             wal,
             seq,
+            writer,
             levels,
         })
     }
@@ -131,7 +135,17 @@ impl<M: MemStore> StorageEngine<M> {
     /// Flush the current memtable into L0, truncate the WAL, and reset the memtable.
     fn compact(&mut self) -> Result<(), StorageError> {
         let incoming: Vec<_> = self.mem.scan_at(.., u64::MAX).collect::<Result<_, _>>()?;
-        Self::compact_level(&mut self.levels, 0, Box::new(incoming.into_iter()))?;
+        if let Err(e) = Self::compact_level(
+            &mut self.levels,
+            &mut self.writer,
+            0,
+            0,
+            Box::new(incoming.into_iter()),
+        ) {
+            self.writer.rollback();
+            return Err(e);
+        }
+        self.writer.commit()?;
         self.wal.truncate()?;
         info!("compacted memtable to l0");
         self.mem.clear();
@@ -141,23 +155,34 @@ impl<M: MemStore> StorageEngine<M> {
     /// Add entries to the given level. If that level exceeds its compaction
     /// threshold, merge all its runs and push the result into the next level.
     /// At the last level, merges incoming data with existing data in place.
+    ///
+    /// `abs_level` tracks the absolute level index for manifest ops (since
+    /// `levels` is a slice that may start at an offset).
     fn compact_level(
         levels: &mut [Level],
+        writer: &mut SsTableWriter,
         level: usize,
+        abs_level: u16,
         entries: Box<dyn Iterator<Item = (InternalKey, Vec<u8>)>>,
     ) -> Result<(), StorageError> {
         let is_last = level + 1 >= levels.len();
         if levels[level].is_full() && is_last {
             let merged = levels[level].merge_iter()?.merge(entries);
-            levels[level].clear();
-            levels[level].add_run(merged)?;
+            levels[level].clear_with_writer(writer, abs_level);
+            levels[level].add_run(writer, abs_level, merged)?;
         } else if levels[level].is_full() {
             let merged = levels[level].merge_iter()?;
-            Self::compact_level(&mut levels[level + 1..], 0, Box::new(merged))?;
-            levels[level].clear();
-            levels[level].add_run(entries)?;
+            Self::compact_level(
+                &mut levels[level + 1..],
+                writer,
+                0,
+                abs_level + 1,
+                Box::new(merged),
+            )?;
+            levels[level].clear_with_writer(writer, abs_level);
+            levels[level].add_run(writer, abs_level, entries)?;
         } else {
-            levels[level].add_run(entries)?;
+            levels[level].add_run(writer, abs_level, entries)?;
         }
         Ok(())
     }

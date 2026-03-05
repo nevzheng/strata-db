@@ -1,10 +1,10 @@
 mod manifest;
 mod sstable;
+mod writer;
 
 pub use manifest::{Manifest, ManifestEntry, ManifestOp};
 pub use sstable::{SsTable, SsTableRef, read_sstable_ref};
-
-use sstable::write_sstables;
+pub use writer::SsTableWriter;
 
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
@@ -25,7 +25,6 @@ pub struct Level {
     pub runs: Vec<Run>,
     pub config: LevelConfig,
     dir: PathBuf,
-    next_sst_id: u64,
 }
 
 impl Level {
@@ -34,23 +33,32 @@ impl Level {
             runs: Vec::new(),
             config,
             dir,
-            next_sst_id: 0,
         }
     }
 
     /// Write entries to disk as SSTables and add the resulting run to this level.
     ///
+    /// Uses the `SsTableWriter` for globally unique IDs and manifest tracking.
     /// Entries must be sorted by `InternalKey` (user key asc, seq desc).
-    /// Returns `true` if the level has reached its compaction threshold.
     pub fn add_run(
         &mut self,
+        writer: &mut SsTableWriter,
+        level_idx: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
-    ) -> Result<bool, StorageError> {
-        let sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
-        let refs = write_sstables(&self.dir, sst_id, usize::MAX, entries)?;
-        self.runs.push(Run::from_refs(refs));
-        Ok(self.runs.len() >= self.config.max_runs)
+    ) -> Result<(), StorageError> {
+        let run = writer.write_run(&self.dir, level_idx, entries)?;
+        self.runs.push(run);
+        Ok(())
+    }
+
+    /// Record removal of all current SSTables in the writer, then clear runs.
+    pub fn clear_with_writer(&mut self, writer: &mut SsTableWriter, level_idx: u16) {
+        for run in &self.runs {
+            for table in &run.tables {
+                writer.remove(level_idx, table.id);
+            }
+        }
+        self.runs.clear();
     }
 
     /// Open all SSTables and return a merged iterator over their entries,
@@ -210,6 +218,11 @@ mod tests {
         )
     }
 
+    fn test_writer(tmp: &std::path::Path) -> SsTableWriter {
+        let manifest = Manifest::new(&tmp.join("MANIFEST")).unwrap();
+        SsTableWriter::new(manifest, tmp.to_path_buf())
+    }
+
     fn test_level(tmp: &std::path::Path) -> Level {
         Level::new(
             tmp.to_path_buf(),
@@ -223,9 +236,14 @@ mod tests {
     #[test]
     fn level_add_run_writes_to_disk() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = test_level(tmp.path());
         level
-            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)])
+            .add_run(
+                &mut writer,
+                0,
+                vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)],
+            )
             .unwrap();
         assert_eq!(level.runs.len(), 1);
         assert_eq!(level.runs[0].tables[0].min_key, b"a");
@@ -236,23 +254,33 @@ mod tests {
     #[test]
     fn level_get_at_returns_latest_from_newest_run() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = test_level(tmp.path());
-        level.add_run(vec![put_entry(b"a", b"old", 1)]).unwrap();
-        level.add_run(vec![put_entry(b"a", b"new", 2)]).unwrap();
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"a", b"old", 1)])
+            .unwrap();
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"a", b"new", 2)])
+            .unwrap();
         assert_eq!(level.get_at(b"a", u64::MAX).unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]
     fn level_scan_returns_range() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = test_level(tmp.path());
         level
-            .add_run(vec![
-                put_entry(b"a", b"1", 1),
-                put_entry(b"b", b"2", 2),
-                put_entry(b"c", b"3", 3),
-                put_entry(b"d", b"4", 4),
-            ])
+            .add_run(
+                &mut writer,
+                0,
+                vec![
+                    put_entry(b"a", b"1", 1),
+                    put_entry(b"b", b"2", 2),
+                    put_entry(b"c", b"3", 3),
+                    put_entry(b"d", b"4", 4),
+                ],
+            )
             .unwrap();
 
         let results = level.scan(b"b".to_vec()..=b"c".to_vec()).unwrap();
@@ -264,9 +292,14 @@ mod tests {
     #[test]
     fn level_scan_unbounded_returns_all() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = test_level(tmp.path());
         level
-            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"b", b"2", 2)])
+            .add_run(
+                &mut writer,
+                0,
+                vec![put_entry(b"a", b"1", 1), put_entry(b"b", b"2", 2)],
+            )
             .unwrap();
         let results = level.scan(..).unwrap();
         assert_eq!(results.len(), 2);
@@ -275,6 +308,7 @@ mod tests {
     #[test]
     fn level_add_run_signals_compaction_needed() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = Level::new(
             tmp.path().to_path_buf(),
             LevelConfig {
@@ -282,20 +316,36 @@ mod tests {
                 max_run_size_bytes: 64 * 1024 * 1024,
             },
         );
-        assert!(!level.add_run(vec![put_entry(b"a", b"1", 1)]).unwrap());
-        assert!(level.add_run(vec![put_entry(b"b", b"2", 2)]).unwrap());
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"a", b"1", 1)])
+            .unwrap();
+        assert!(!level.is_full());
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"b", b"2", 2)])
+            .unwrap();
+        assert!(level.is_full());
         // Can still add beyond threshold.
-        assert!(level.add_run(vec![put_entry(b"c", b"3", 3)]).unwrap());
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"c", b"3", 3)])
+            .unwrap();
+        assert!(level.is_full());
     }
 
     #[test]
     fn level_scan_merges_across_runs() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut writer = test_writer(tmp.path());
         let mut level = test_level(tmp.path());
         level
-            .add_run(vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)])
+            .add_run(
+                &mut writer,
+                0,
+                vec![put_entry(b"a", b"1", 1), put_entry(b"c", b"3", 3)],
+            )
             .unwrap();
-        level.add_run(vec![put_entry(b"b", b"2", 4)]).unwrap();
+        level
+            .add_run(&mut writer, 0, vec![put_entry(b"b", b"2", 4)])
+            .unwrap();
 
         let results = level.scan(..).unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(ik, _)| ik.key.as_slice()).collect();

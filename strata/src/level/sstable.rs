@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{self, Read};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 
@@ -107,20 +107,6 @@ pub struct SsTableRef {
     pub data_size: usize,
 }
 
-/// Encoded byte size of one entry.
-///
-/// Wire format: `| key_len (2B) | key | seq (8B) | op (1B) | val_len (2B) | value |`
-fn encoded_entry_size(key: &InternalKey, value: &[u8]) -> usize {
-    2 + key.key.len() + 8 + 1 + 2 + value.len()
-}
-
-fn write_entry(w: &mut impl Write, key: &InternalKey, value: &[u8]) -> io::Result<()> {
-    key.encode(w)?;
-    w.write_all(&(value.len() as u16).to_be_bytes())?;
-    w.write_all(value)?;
-    Ok(())
-}
-
 fn read_entry(r: &mut impl Read) -> io::Result<(InternalKey, Vec<u8>)> {
     let ik = InternalKey::decode(r)?;
     let mut val_len_buf = [0u8; 2];
@@ -129,25 +115,6 @@ fn read_entry(r: &mut impl Read) -> io::Result<(InternalKey, Vec<u8>)> {
     let mut value = vec![0u8; val_len];
     r.read_exact(&mut value)?;
     Ok((ik, value))
-}
-
-/// Footer wire format:
-/// `| data_size (4B) | max_key_len (2B) | max_key | min_key_len (2B) | min_key | footer_size (4B) |`
-fn write_footer(
-    w: &mut impl Write,
-    data_size: u32,
-    min_key: &[u8],
-    max_key: &[u8],
-) -> io::Result<()> {
-    // footer_size = 4 (data_size) + 2 + max_key.len() + 2 + min_key.len() + 4 (footer_size itself)
-    let footer_size: u32 = 4 + 2 + max_key.len() as u32 + 2 + min_key.len() as u32 + 4;
-    w.write_all(&data_size.to_be_bytes())?;
-    w.write_all(&(max_key.len() as u16).to_be_bytes())?;
-    w.write_all(max_key)?;
-    w.write_all(&(min_key.len() as u16).to_be_bytes())?;
-    w.write_all(min_key)?;
-    w.write_all(&footer_size.to_be_bytes())?;
-    Ok(())
 }
 
 /// Read the footer from the end of a file's bytes, returning `(data_size, min_key, max_key)`.
@@ -186,75 +153,6 @@ fn read_footer(data: &[u8]) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
     Ok((data_size, min_key, max_key))
 }
 
-/// Pull entries from `iter` and write them into a single SSTable file at `path`,
-/// stopping when the next entry would exceed `max_file_size`.
-fn write_sstable_file(
-    path: &Path,
-    id: u64,
-    max_file_size: usize,
-    iter: &mut std::iter::Peekable<impl Iterator<Item = (InternalKey, Vec<u8>)>>,
-) -> io::Result<SsTableRef> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-
-    let mut bytes_written = 0usize;
-    let mut min_key: Option<Vec<u8>> = None;
-    let mut max_key: Vec<u8> = Vec::new();
-
-    while let Some((key, value)) = iter.peek() {
-        let size = encoded_entry_size(key, value);
-        if bytes_written > 0 && bytes_written + size > max_file_size {
-            break;
-        }
-        let (key, value) = iter.next().unwrap();
-        write_entry(&mut writer, &key, &value)?;
-        bytes_written += size;
-        if min_key.is_none() {
-            min_key = Some(key.key.clone());
-        }
-        max_key = key.key;
-    }
-
-    let min_key = min_key.unwrap_or_default();
-    write_footer(&mut writer, bytes_written as u32, &min_key, &max_key)?;
-    writer.flush()?;
-    writer.get_ref().sync_data()?;
-
-    Ok(SsTableRef {
-        id,
-        path: path.to_path_buf(),
-        min_key,
-        max_key,
-        data_size: bytes_written,
-    })
-}
-
-/// Write sorted entries to SSTable files on disk, splitting when a file
-/// exceeds `max_file_size`. Returns an `SsTableRef` per file written.
-///
-/// Each file is named `{id}.sst` in `dir`. IDs start at `start_id` and
-/// increment. A footer with min/max keys and data size is appended to each file.
-pub fn write_sstables(
-    dir: &Path,
-    start_id: u64,
-    max_file_size: usize,
-    entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
-) -> io::Result<Vec<SsTableRef>> {
-    fs::create_dir_all(dir)?;
-
-    let mut tables = Vec::new();
-    let mut iter = entries.into_iter().peekable();
-    let mut id = start_id;
-
-    while iter.peek().is_some() {
-        let path = dir.join(format!("{id}.sst"));
-        tables.push(write_sstable_file(&path, id, max_file_size, &mut iter)?);
-        id += 1;
-    }
-
-    Ok(tables)
-}
-
 /// Read an SSTable's metadata from a file on disk, returning an `SsTableRef`.
 pub fn read_sstable_ref(path: &Path, id: u64) -> io::Result<SsTableRef> {
     let mut data = Vec::new();
@@ -273,6 +171,7 @@ pub fn read_sstable_ref(path: &Path, id: u64) -> io::Result<SsTableRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::level::writer::write_sstables;
 
     fn put_entry(key: &[u8], value: &[u8], seq: u64) -> (InternalKey, Vec<u8>) {
         (
@@ -386,6 +285,8 @@ mod tests {
 
     #[test]
     fn write_splits_files_on_overflow() {
+        use crate::level::writer::encoded_entry_size;
+
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sst");
 
@@ -434,6 +335,8 @@ mod tests {
 
     #[test]
     fn encoded_entry_size_is_correct() {
+        use crate::level::writer::encoded_entry_size;
+
         let key = InternalKey {
             key: b"hello".to_vec(),
             seq: 1,
