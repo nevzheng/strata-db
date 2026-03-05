@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::level::{Level, LevelConfig, Run};
+use crate::level::{Level, LevelConfig, Run, write_sstables};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
@@ -13,6 +13,7 @@ const DEFAULT_NUM_LEVELS: usize = 7;
 
 /// Core engine coordinating between storage components.
 pub struct StorageEngine<M: MemStore> {
+    dir: PathBuf,
     mem: M,
     wal: WriteAheadLog,
     seq: u64,
@@ -49,6 +50,7 @@ impl<M: MemStore> StorageEngine<M> {
         }
         let levels = Self::default_levels();
         Ok(Self {
+            dir: dir.to_path_buf(),
             mem,
             wal,
             seq,
@@ -107,7 +109,9 @@ impl<M: MemStore> StorageEngine<M> {
         let incoming: Vec<_> = self.mem.scan_at(.., u64::MAX).collect::<Result<_, _>>()?;
         let sst_id = self.next_sst_id;
         self.next_sst_id += 1;
-        let run = Run::from_entries(sst_id, incoming);
+        let sst_dir = self.dir.join("sst");
+        let refs = write_sstables(&sst_dir, sst_id, usize::MAX, incoming)?;
+        let run = Run::from_refs(refs);
         self.levels[0].add_run(run)?;
         self.wal.truncate()?;
         info!(sst_id, "compacted memtable to l0");
