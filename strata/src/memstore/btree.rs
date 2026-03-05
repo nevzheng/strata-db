@@ -7,8 +7,9 @@ const DEFAULT_CAPACITY: usize = 4 * 1024 * 1024; // 4 MB
 
 /// A [`MemStore`] backed by [`BTreeMap`].
 pub struct BTreeMapStore {
-    store: BTreeMap<InternalKey, Vec<u8>>,
+    store: BTreeMap<InternalKey, Box<[u8]>>,
     capacity: usize,
+    current_size: usize,
 }
 
 impl Default for BTreeMapStore {
@@ -22,6 +23,7 @@ impl BTreeMapStore {
         Self {
             store: BTreeMap::new(),
             capacity: DEFAULT_CAPACITY,
+            current_size: 0,
         }
     }
 
@@ -29,16 +31,15 @@ impl BTreeMapStore {
         Self {
             store: BTreeMap::new(),
             capacity,
+            current_size: 0,
         }
     }
 }
 
 impl MemStore for BTreeMapStore {
-    fn put(&mut self, key: InternalKey, value: Vec<u8>) -> Result<(), WriteError> {
-        if self.size() + key.key.len() + value.len() > self.capacity {
-            return Err(WriteError::StoreFull);
-        }
-        self.store.insert(key, value);
+    fn put(&mut self, key: InternalKey, value: &[u8]) -> Result<(), WriteError> {
+        self.current_size += key.key.len() + value.len();
+        self.store.insert(key, value.into());
         Ok(())
     }
 
@@ -53,7 +54,7 @@ impl MemStore for BTreeMapStore {
             && ikey.key == key
         {
             return match ikey.op {
-                OpType::Put => Ok(Some(value.clone())),
+                OpType::Put => Ok(Some(value.to_vec())),
                 OpType::Delete => Ok(None),
             };
         }
@@ -61,10 +62,8 @@ impl MemStore for BTreeMapStore {
     }
 
     fn delete(&mut self, key: InternalKey) -> Result<(), WriteError> {
-        if self.size() + key.key.len() > self.capacity {
-            return Err(WriteError::StoreFull);
-        }
-        self.store.insert(key, Vec::new());
+        self.current_size += key.key.len();
+        self.store.insert(key, Box::default());
         Ok(())
     }
 
@@ -105,18 +104,22 @@ impl MemStore for BTreeMapStore {
             }
             last_key = Some(&ikey.key);
             if ikey.op == OpType::Put {
-                results.push((ikey.key.clone(), value.clone()));
+                results.push((ikey.key.clone(), value.to_vec()));
             }
         }
         Ok(results)
     }
 
     fn size(&self) -> usize {
-        self.store.iter().map(|(k, v)| k.key.len() + v.len()).sum()
+        self.current_size
     }
 
     fn is_full(&self) -> bool {
-        self.size() >= self.capacity
+        self.current_size >= self.capacity
+    }
+
+    fn fits(&self, key: &InternalKey, value_len: usize) -> bool {
+        self.current_size + key.key.len() + value_len <= self.capacity
     }
 }
 
@@ -132,7 +135,7 @@ mod tests {
                     seq,
                     op: OpType::Put,
                 },
-                value.to_vec(),
+                value,
             )
             .unwrap();
     }
@@ -186,20 +189,17 @@ mod tests {
     // --- capacity enforcement ---
 
     #[test]
-    fn put_returns_store_full_when_capacity_exceeded() {
+    fn fits_returns_false_when_capacity_exceeded() {
         let mut store = BTreeMapStore::with_capacity(30);
         // "order:1001" (10) + "pending" (7) = 17 bytes
         put_key(&mut store, b"order:1001", b"pending", 1);
         // "order:1002" (10) + "shipped" (7) = 17 more, total 34 > 30
-        let result = store.put(
-            InternalKey {
-                key: b"order:1002".to_vec(),
-                seq: 2,
-                op: OpType::Put,
-            },
-            b"shipped".to_vec(),
-        );
-        assert!(matches!(result, Err(WriteError::StoreFull)));
+        let ikey = InternalKey {
+            key: b"order:1002".to_vec(),
+            seq: 2,
+            op: OpType::Put,
+        };
+        assert!(!store.fits(&ikey, b"shipped".len()));
     }
 
     #[test]

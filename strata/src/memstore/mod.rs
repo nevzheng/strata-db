@@ -162,7 +162,7 @@ pub trait MemStore {
     /// - `WriteError::StoreFull` — store has reached capacity
     /// - `WriteError::InvalidArgument` — key or value rejected by implementation
     /// - `WriteError::Internal` — unexpected error
-    fn put(&mut self, key: InternalKey, value: Vec<u8>) -> Result<(), WriteError>;
+    fn put(&mut self, key: InternalKey, value: &[u8]) -> Result<(), WriteError>;
 
     /// Retrieve the value for a given user key.
     ///
@@ -193,9 +193,12 @@ pub trait MemStore {
     /// - `ReadError::Internal` — unexpected error
     fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, ReadError>;
 
-    /// Current size in bytes of the store's contents.
+    /// Current size in bytes of keys and values in the store.
     fn size(&self) -> usize;
 
     /// Whether the store has reached its capacity threshold.
     fn is_full(&self) -> bool;
+
+    /// Whether an entry with the given key and value size would fit.
+    fn fits(&self, key: &InternalKey, value_len: usize) -> bool;
 }

@@ -64,7 +64,7 @@ impl<M: MemStore> StorageEngine<M> {
                         seq: s,
                         op: OpType::Put,
                     },
-                    value,
+                    &value,
                 )?,
                 WalOp::Delete { seq: s, key, .. } => mem.delete(InternalKey {
                     key,
@@ -82,6 +82,14 @@ impl<M: MemStore> StorageEngine<M> {
     #[instrument(skip(self, key, value), fields(key_len = key.len(), value_len = value.len()))]
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
         let next_seq = self.seq + 1;
+        let ikey = InternalKey {
+            key: key.to_vec(),
+            seq: next_seq,
+            op: OpType::Put,
+        };
+        if !self.mem.fits(&ikey, value.len()) {
+            unimplemented!("memtable full — compaction not yet implemented");
+        }
         let op = WalOp::Put {
             seq: next_seq,
             key: key.to_vec(),
@@ -89,14 +97,7 @@ impl<M: MemStore> StorageEngine<M> {
         };
         self.wal.append(&op)?;
         info!("wal ok");
-        self.mem.put(
-            InternalKey {
-                key: key.to_vec(),
-                seq: next_seq,
-                op: OpType::Put,
-            },
-            value.to_vec(),
-        )?;
+        self.mem.put(ikey, value)?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())
@@ -108,17 +109,21 @@ impl<M: MemStore> StorageEngine<M> {
     #[instrument(skip(self, key), fields(key_len = key.len()))]
     pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
         let next_seq = self.seq + 1;
+        let ikey = InternalKey {
+            key: key.to_vec(),
+            seq: next_seq,
+            op: OpType::Delete,
+        };
+        if !self.mem.fits(&ikey, 0) {
+            unimplemented!("memtable full — compaction not yet implemented");
+        }
         let op = WalOp::Delete {
             seq: next_seq,
             key: key.to_vec(),
         };
         self.wal.append(&op)?;
         info!("wal ok");
-        self.mem.delete(InternalKey {
-            key: key.to_vec(),
-            seq: next_seq,
-            op: OpType::Delete,
-        })?;
+        self.mem.delete(ikey)?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())
