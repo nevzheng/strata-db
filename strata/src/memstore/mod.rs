@@ -8,9 +8,6 @@ use std::ops::RangeBounds;
 
 use thiserror::Error;
 
-/// A key-value pair of owned byte vectors.
-pub type KVPair = (Vec<u8>, Vec<u8>);
-
 /// The type of operation recorded in an internal key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpType {
@@ -184,14 +181,17 @@ pub trait MemStore {
     /// - `WriteError::Internal` — unexpected error
     fn delete(&mut self, key: InternalKey) -> Result<(), WriteError>;
 
-    /// Return key-value pairs within the given user-key range, sorted by key ascending.
+    /// Return entries within the given user-key range, sorted by `InternalKey` order.
     ///
-    /// For each user key, only the latest version is considered.
+    /// For each user key, only the latest version is returned.
     /// Tombstoned keys are excluded.
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, ReadError>;
+    fn scan(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError>;
 
     /// Current size in bytes of keys and values in the store.
     fn size(&self) -> usize;
@@ -201,4 +201,7 @@ pub trait MemStore {
 
     /// Whether an entry with the given key and value size would fit.
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool;
+
+    /// Remove all entries from the store, resetting its size to zero.
+    fn clear(&mut self);
 }

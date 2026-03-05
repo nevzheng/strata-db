@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
-use super::{InternalKey, KVPair, MemStore, OpType, ReadError, WriteError};
+use super::{InternalKey, MemStore, OpType, ReadError, WriteError};
 
 const DEFAULT_CAPACITY: usize = 4 * 1024 * 1024; // 4 MB
 
@@ -67,7 +67,10 @@ impl MemStore for BTreeMapStore {
         Ok(())
     }
 
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, ReadError> {
+    fn scan(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
         let start = match range.start_bound() {
             Bound::Included(k) => Bound::Included(InternalKey {
                 key: k.clone(),
@@ -95,18 +98,11 @@ impl MemStore for BTreeMapStore {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        let mut results = Vec::new();
-        let mut last_key: Option<&[u8]> = None;
-
-        for (ikey, value) in self.store.range((start, end)) {
-            if last_key == Some(ikey.key.as_slice()) {
-                continue;
-            }
-            last_key = Some(&ikey.key);
-            if ikey.op == OpType::Put {
-                results.push((ikey.key.clone(), value.to_vec()));
-            }
-        }
+        let results = self
+            .store
+            .range((start, end))
+            .map(|(ikey, value)| (ikey.clone(), value.to_vec()))
+            .collect();
         Ok(results)
     }
 
@@ -120,6 +116,11 @@ impl MemStore for BTreeMapStore {
 
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool {
         self.current_size + key.key.len() + value_len <= self.capacity
+    }
+
+    fn clear(&mut self) {
+        self.store.clear();
+        self.current_size = 0;
     }
 }
 
@@ -162,7 +163,7 @@ mod tests {
         let results = store
             .scan(b"user:alice".to_vec()..=b"user:charlie".to_vec())
             .unwrap();
-        let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
+        let keys: Vec<&[u8]> = results.iter().map(|(ik, _)| ik.key.as_slice()).collect();
         assert_eq!(
             keys,
             vec![&b"user:alice"[..], &b"user:bob"[..], &b"user:charlie"[..]]
@@ -181,7 +182,7 @@ mod tests {
             .unwrap();
         let keys: Vec<u64> = results
             .iter()
-            .map(|(k, _)| u64::from_be_bytes(k.as_slice().try_into().unwrap()))
+            .map(|(ik, _)| u64::from_be_bytes(ik.key.as_slice().try_into().unwrap()))
             .collect();
         assert_eq!(keys, vec![1, 42, 100]);
     }
@@ -220,21 +221,20 @@ mod tests {
     }
 
     #[test]
-    fn scan_excludes_deleted_keys() {
+    fn scan_includes_tombstones() {
         let mut store = BTreeMapStore::new();
-        put_key(&mut store, b"metric:cpu_usage", b"72.5", 1);
-        put_key(&mut store, b"metric:disk_io", b"150.3", 2);
-        put_key(&mut store, b"metric:mem_free", b"2048", 3);
-        delete_key(&mut store, b"metric:disk_io", 4);
+        put_key(&mut store, b"a", b"1", 1);
+        put_key(&mut store, b"b", b"2", 2);
+        delete_key(&mut store, b"b", 3);
 
-        let results = store
-            .scan(b"metric:cpu_usage".to_vec()..=b"metric:mem_free".to_vec())
-            .unwrap();
-        let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
-        assert_eq!(
-            keys,
-            vec![&b"metric:cpu_usage"[..], &b"metric:mem_free"[..]]
-        );
+        let results = store.scan(b"a".to_vec()..=b"b".to_vec()).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0.key, b"a");
+        // b has seq 3 (delete) before seq 2 (put) due to InternalKey ordering
+        assert_eq!(results[1].0.key, b"b");
+        assert_eq!(results[1].0.op, OpType::Delete);
+        assert_eq!(results[2].0.key, b"b");
+        assert_eq!(results[2].0.op, OpType::Put);
     }
 
     // --- versioning ---
@@ -249,16 +249,20 @@ mod tests {
     }
 
     #[test]
-    fn scan_returns_latest_version_per_key() {
+    fn scan_returns_all_versions() {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"k:a", b"old", 1);
         put_key(&mut store, b"k:a", b"new", 2);
         put_key(&mut store, b"k:b", b"only", 3);
 
         let results = store.scan(b"k:a".to_vec()..=b"k:b".to_vec()).unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0], (b"k:a".to_vec(), b"new".to_vec()));
-        assert_eq!(results[1], (b"k:b".to_vec(), b"only".to_vec()));
+        assert_eq!(results.len(), 3);
+        // k:a seq 2 (newest) first, then k:a seq 1
+        assert_eq!(results[0].0.seq, 2);
+        assert_eq!(results[0].1, b"new");
+        assert_eq!(results[1].0.seq, 1);
+        assert_eq!(results[1].1, b"old");
+        assert_eq!(results[2].0.key, b"k:b");
     }
 
     // --- InternalKey ordering ---

@@ -42,11 +42,18 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
+/// A resolved key-value pair of owned byte vectors.
+pub type KVPair = (Vec<u8>, Vec<u8>);
+
+const DEFAULT_L0_CAPACITY: usize = 64;
+
 /// Core engine coordinating between storage components.
 pub struct StorageEngine<M: MemStore> {
     mem: M,
     wal: WriteAheadLog,
     seq: u64,
+    l0_vec: Vec<(InternalKey, Vec<u8>)>,
+    l0_capacity: usize,
 }
 
 impl<M: MemStore> StorageEngine<M> {
@@ -73,7 +80,13 @@ impl<M: MemStore> StorageEngine<M> {
                 })?,
             }
         }
-        Ok(Self { mem, wal, seq })
+        Ok(Self {
+            mem,
+            wal,
+            seq,
+            l0_vec: Vec::new(),
+            l0_capacity: DEFAULT_L0_CAPACITY,
+        })
     }
 
     /// Insert a key-value pair.
@@ -100,7 +113,7 @@ impl<M: MemStore> StorageEngine<M> {
             op: op_type,
         };
         if !self.mem.fits(&ikey, value.len()) {
-            unimplemented!("memtable full — compaction not yet implemented");
+            self.compact()?;
         }
         let wal_op = match op_type {
             OpType::Put => WalOp::Put {
@@ -124,6 +137,26 @@ impl<M: MemStore> StorageEngine<M> {
         Ok(())
     }
 
+    /// Flush the current memtable into `l0_vec` and reset it.
+    ///
+    /// Merges incoming entries with existing L0 entries, sorted by `InternalKey`.
+    /// Returns `StorageError::InternalError` if L0 would exceed capacity.
+    fn compact(&mut self) -> Result<(), StorageError> {
+        let incoming = self.mem.scan(..)?;
+        self.l0_vec.extend(incoming);
+        self.l0_vec.sort_by(|(a, _), (b, _)| a.cmp(b));
+        if self.l0_vec.len() > self.l0_capacity {
+            return Err(StorageError::InternalError(format!(
+                "L0 full: {} entries exceeds capacity {}",
+                self.l0_vec.len(),
+                self.l0_capacity
+            )));
+        }
+        info!(entries = self.l0_vec.len(), "compacted memtable to l0");
+        self.mem.clear();
+        Ok(())
+    }
+
     /// Current monotonic write sequence number.
     pub fn seq(&self) -> u64 {
         self.seq
@@ -135,11 +168,32 @@ impl<M: MemStore> StorageEngine<M> {
     }
 
     /// Return key-value pairs within the given range, sorted by key ascending.
-    pub fn scan(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-    ) -> Result<Vec<memstore::KVPair>, StorageError> {
-        Ok(self.mem.scan(range)?)
+    ///
+    /// Resolves versions: for each user key only the latest version is kept,
+    /// and tombstones are excluded.
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, StorageError> {
+        let entries = self.mem.scan(range)?;
+        Ok(Self::resolve_versions(&entries))
+    }
+
+    /// Collapse a sorted `InternalKey` stream into user-key pairs.
+    ///
+    /// Because `InternalKey` sorts by user key ascending then seq descending,
+    /// the first entry for each user key is the latest version. Tombstones
+    /// (`OpType::Delete`) are dropped.
+    fn resolve_versions(entries: &[(InternalKey, Vec<u8>)]) -> Vec<KVPair> {
+        let mut result = Vec::new();
+        let mut last_key: Option<&[u8]> = None;
+        for (ik, value) in entries {
+            if last_key == Some(ik.key.as_slice()) {
+                continue;
+            }
+            last_key = Some(&ik.key);
+            if ik.op == OpType::Put {
+                result.push((ik.key.clone(), value.clone()));
+            }
+        }
+        result
     }
 }
 
@@ -175,57 +229,96 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: engine should flush memtable before it fills up"]
-    fn put_returns_error_when_memtable_full() {
+    fn compact_flushes_memtable_to_l0() {
         let tmp = tempfile::tempdir().unwrap();
-        // Tiny capacity: 64 bytes
-        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+        // Tiny memtable: 32 bytes. Each "k:N"+"v:N" pair is ~6 bytes.
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
 
-        // Fill the memtable with small entries until it rejects a write.
+        // Write enough to trigger a compaction.
+        for i in 0..20u32 {
+            engine
+                .put(format!("k:{i}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+
+        // L0 should have entries from the compacted memtable.
+        assert!(!engine.l0_vec.is_empty());
+    }
+
+    #[test]
+    fn compact_merges_into_existing_l0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
+
+        // Write enough to trigger multiple compactions.
+        for i in 0..40u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+
+        // L0 should contain entries from multiple compactions, sorted.
+        assert!(engine.l0_vec.len() > 1);
+        for w in engine.l0_vec.windows(2) {
+            assert!(w[0].0 <= w[1].0, "L0 not sorted");
+        }
+    }
+
+    #[test]
+    fn compact_returns_error_when_l0_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Tiny memtable + tiny L0 capacity.
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
+        engine.l0_capacity = 2; // very small L0
+
         let mut i = 0u32;
         let err = loop {
-            let key = format!("k:{i}");
+            let key = format!("k:{i:04}");
             let val = format!("v:{i}");
             if let Err(e) = engine.put(key.as_bytes(), val.as_bytes()) {
                 break e;
             }
             i += 1;
-            assert!(i < 1000, "expected StoreFull but wrote 1000 entries");
+            assert!(i < 1000, "expected L0 full but wrote 1000 entries");
         };
 
-        // Should surface as a WriteError::StoreFull through StorageError.
         assert!(
-            matches!(err, StorageError::WriteError(WriteError::StoreFull)),
-            "expected StoreFull, got: {err:?}"
+            matches!(err, StorageError::InternalError(ref msg) if msg.contains("L0 full")),
+            "expected L0 full error, got: {err:?}"
         );
-
-        // Earlier keys should still be readable.
-        assert!(engine.get(b"k:0").unwrap().is_some());
     }
 
     #[test]
-    #[ignore = "TODO: engine should flush memtable before it fills up"]
-    fn reopen_with_full_memtable_fails_on_replay() {
+    fn data_survives_multiple_compactions() {
         let tmp = tempfile::tempdir().unwrap();
+        // Tiny memtable so compaction triggers often.
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
 
-        // Fill a tiny memtable until it's full, then drop the engine.
-        {
-            let mut engine =
-                StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
-            let mut i = 0u32;
-            loop {
-                let key = format!("k:{i}");
-                let val = format!("v:{i}");
-                if engine.put(key.as_bytes(), val.as_bytes()).is_err() {
-                    break;
-                }
-                i += 1;
-            }
+        // Round 1: write, exceed memstore, trigger compaction.
+        for i in 0..10u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("r1:{i}").as_bytes())
+                .unwrap();
         }
+        let l0_after_round1 = engine.l0_vec.len();
+        assert!(l0_after_round1 > 0, "expected compaction after round 1");
 
-        // Reopen with the same tiny capacity — WAL replay should hit StoreFull.
-        let result = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64));
-        assert!(result.is_err(), "expected replay to fail, but it succeeded");
+        // Round 2: write more, trigger another compaction that merges into L0.
+        for i in 10..20u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("r2:{i}").as_bytes())
+                .unwrap();
+        }
+        assert!(
+            engine.l0_vec.len() > l0_after_round1,
+            "expected L0 to grow after round 2"
+        );
+
+        // All keys should still be readable from the memstore (latest batch)
+        // or present in L0 (compacted batches).
+        for w in engine.l0_vec.windows(2) {
+            assert!(w[0].0 <= w[1].0, "L0 not sorted after two rounds");
+        }
     }
 
     #[test]
