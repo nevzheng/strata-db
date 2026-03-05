@@ -14,6 +14,8 @@ Where `type` is one of: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `tes
 
 Scope is optional. Description must be lowercase and imperative (e.g., "add storage trait", not "Added storage trait").
 
+Do not add `Co-Authored-By` lines to commit messages.
+
 ## Code Quality
 
 Pre-commit hooks run `cargo fmt --check` and `cargo clippy -- -D warnings`. All code must pass both before committing.
