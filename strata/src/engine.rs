@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 use std::path::Path;
 
-use crate::level::{Level, LevelConfig, Manifest, SsTableWriter};
+use crate::level::{Level, LevelConfig, Manifest, Run, SsTableWriter};
 use crate::memstore::{
     InternalKey, MemStore, OpType,
     wal::{WalOp, WriteAheadLog},
@@ -73,11 +74,30 @@ impl<M: MemStore> StorageEngine<M> {
         }
         let manifest = Manifest::new(&dir.join("MANIFEST"))?;
         let writer = SsTableWriter::new(manifest, dir.to_path_buf());
-        let levels = level_configs
-            .into_iter()
-            .enumerate()
-            .map(|(i, config)| Level::new(dir.join(format!("l{i}")), config))
-            .collect();
+
+        // Reconstruct levels from manifest entries.
+        let mut levels: Vec<Level> = level_configs.into_iter().map(Level::new).collect();
+
+        // Group manifest entries by (level, run_id), sorted by run_id within each level.
+        let mut level_runs: BTreeMap<u16, BTreeMap<u64, Vec<_>>> = BTreeMap::new();
+        for entry in writer.tables().values() {
+            level_runs
+                .entry(entry.level)
+                .or_default()
+                .entry(entry.run_id)
+                .or_default()
+                .push(entry.sst_ref.clone());
+        }
+
+        for (level_idx, runs_by_id) in level_runs {
+            if let Some(level) = levels.get_mut(level_idx as usize) {
+                for (_run_id, mut refs) in runs_by_id {
+                    refs.sort_by(|a, b| a.min_key.cmp(&b.min_key));
+                    level.runs.push(Run::from_refs(refs));
+                }
+            }
+        }
+
         Ok(Self {
             mem,
             wal,
@@ -376,21 +396,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(32)).unwrap();
         // Tiny L0: triggers inter-level compaction after 2 runs.
-        engine.levels[0] = Level::new(
-            tmp.path().join("l0"),
-            LevelConfig {
-                max_runs: 2,
-                max_run_size_bytes: 64 * 1024 * 1024,
-            },
-        );
+        engine.levels[0] = Level::new(LevelConfig {
+            max_runs: 2,
+            max_run_size_bytes: 64 * 1024 * 1024,
+        });
         // Give L1 plenty of room so it doesn't cascade further.
-        engine.levels[1] = Level::new(
-            tmp.path().join("l1"),
-            LevelConfig {
-                max_runs: 64,
-                max_run_size_bytes: 256 * 1024 * 1024,
-            },
-        );
+        engine.levels[1] = Level::new(LevelConfig {
+            max_runs: 64,
+            max_run_size_bytes: 256 * 1024 * 1024,
+        });
 
         // Write enough to trigger L0 compaction into L1.
         for i in 0..40u32 {

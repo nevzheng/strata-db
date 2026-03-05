@@ -376,3 +376,101 @@ fn get_at_across_compaction() {
         Some(b"v2".to_vec())
     );
 }
+
+/// Data compacted to SSTables survives engine reopen via manifest reconstruction.
+#[test]
+fn data_survives_reopen_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    {
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+        for i in 0..100u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+        // Verify compaction happened.
+        assert!(!engine.level_is_empty(0), "L0 should have runs");
+    }
+
+    // Reopen — levels reconstructed from manifest.
+    let engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+    assert!(
+        !engine.level_is_empty(0),
+        "L0 should be restored from manifest"
+    );
+
+    for i in 0..100u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(format!("v:{i}").into_bytes()),
+            "missing k:{i:04} after reopen"
+        );
+    }
+
+    let results = engine
+        .scan(b"k:0000".to_vec()..=b"k:0099".to_vec())
+        .unwrap();
+    assert_eq!(results.len(), 100);
+}
+
+/// Data cascaded to deeper levels survives reopen.
+#[test]
+fn data_survives_reopen_after_cascade() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    {
+        let mut engine = three_level_engine(tmp.path());
+        for i in 0..40u32 {
+            engine.put(format!("k:{i:04}").as_bytes(), b"v").unwrap();
+        }
+        assert!(!engine.level_is_empty(1), "L1 should have data");
+    }
+
+    // Reopen with same level config.
+    let engine = three_level_engine(tmp.path());
+    for i in 0..40u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(b"v".to_vec()),
+            "missing k:{i:04} after reopen"
+        );
+    }
+}
+
+/// Deletes that were compacted to SSTables persist across reopen.
+#[test]
+fn deleted_data_stays_deleted_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    {
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+        for i in 0..50u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+        // Delete even keys.
+        for i in (0..50u32).step_by(2) {
+            engine.delete(format!("k:{i:04}").as_bytes()).unwrap();
+        }
+    }
+
+    let engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+    for i in (0..50u32).step_by(2) {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            None,
+            "k:{i:04} should still be deleted after reopen"
+        );
+    }
+    for i in (1..50u32).step_by(2) {
+        assert!(
+            engine
+                .get(format!("k:{i:04}").as_bytes())
+                .unwrap()
+                .is_some(),
+            "k:{i:04} should still exist after reopen"
+        );
+    }
+}

@@ -269,7 +269,7 @@ impl Manifest {
                         run_id: *run_id,
                         sst_ref: SsTableRef {
                             id: *sst_id,
-                            path: dir.join(format!("{sst_id}.sst")),
+                            path: dir.join(format!("sst/{sst_id}.sst")),
                             min_key: min_key.clone(),
                             max_key: max_key.clone(),
                             data_size: *data_size as usize,

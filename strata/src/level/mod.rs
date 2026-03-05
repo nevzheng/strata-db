@@ -7,7 +7,6 @@ pub use sstable::{SsTable, SsTableRef, read_sstable_ref};
 pub use writer::SsTableWriter;
 
 use std::ops::{Bound, RangeBounds};
-use std::path::PathBuf;
 
 use itertools::Itertools;
 
@@ -24,15 +23,13 @@ pub struct LevelConfig {
 pub struct Level {
     pub runs: Vec<Run>,
     pub config: LevelConfig,
-    dir: PathBuf,
 }
 
 impl Level {
-    pub fn new(dir: PathBuf, config: LevelConfig) -> Self {
+    pub fn new(config: LevelConfig) -> Self {
         Self {
             runs: Vec::new(),
             config,
-            dir,
         }
     }
 
@@ -46,7 +43,7 @@ impl Level {
         level_idx: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
     ) -> Result<(), StorageError> {
-        let run = writer.write_run(&self.dir, level_idx, entries)?;
+        let run = writer.write_run(level_idx, entries)?;
         self.runs.push(run);
         Ok(())
     }
@@ -223,21 +220,18 @@ mod tests {
         SsTableWriter::new(manifest, tmp.to_path_buf())
     }
 
-    fn test_level(tmp: &std::path::Path) -> Level {
-        Level::new(
-            tmp.to_path_buf(),
-            LevelConfig {
-                max_runs: 64,
-                max_run_size_bytes: 64 * 1024 * 1024,
-            },
-        )
+    fn test_level() -> Level {
+        Level::new(LevelConfig {
+            max_runs: 64,
+            max_run_size_bytes: 64 * 1024 * 1024,
+        })
     }
 
     #[test]
     fn level_add_run_writes_to_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = test_level(tmp.path());
+        let mut level = test_level();
         level
             .add_run(
                 &mut writer,
@@ -255,7 +249,7 @@ mod tests {
     fn level_get_at_returns_latest_from_newest_run() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = test_level(tmp.path());
+        let mut level = test_level();
         level
             .add_run(&mut writer, 0, vec![put_entry(b"a", b"old", 1)])
             .unwrap();
@@ -269,7 +263,7 @@ mod tests {
     fn level_scan_returns_range() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = test_level(tmp.path());
+        let mut level = test_level();
         level
             .add_run(
                 &mut writer,
@@ -293,7 +287,7 @@ mod tests {
     fn level_scan_unbounded_returns_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = test_level(tmp.path());
+        let mut level = test_level();
         level
             .add_run(
                 &mut writer,
@@ -309,13 +303,10 @@ mod tests {
     fn level_add_run_signals_compaction_needed() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = Level::new(
-            tmp.path().to_path_buf(),
-            LevelConfig {
-                max_runs: 2,
-                max_run_size_bytes: 64 * 1024 * 1024,
-            },
-        );
+        let mut level = Level::new(LevelConfig {
+            max_runs: 2,
+            max_run_size_bytes: 64 * 1024 * 1024,
+        });
         level
             .add_run(&mut writer, 0, vec![put_entry(b"a", b"1", 1)])
             .unwrap();
@@ -335,7 +326,7 @@ mod tests {
     fn level_scan_merges_across_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let mut writer = test_writer(tmp.path());
-        let mut level = test_level(tmp.path());
+        let mut level = test_level();
         level
             .add_run(
                 &mut writer,

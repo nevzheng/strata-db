@@ -40,18 +40,18 @@ impl SsTableWriter {
 
     /// Write sorted entries as a new run of SSTable files.
     ///
-    /// Assigns globally unique IDs, writes files to `level_dir`, and
+    /// Assigns globally unique IDs, writes files to `{dir}/sst/`, and
     /// records `AddTable` ops in the pending buffer.
     /// Returns the resulting `Run`.
     pub fn write_run(
         &mut self,
-        level_dir: &Path,
         level: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
     ) -> Result<Run, StorageError> {
+        let sst_dir = self.dir.join("sst");
         let run_id = self.next_sst_id;
         let start_id = self.next_sst_id;
-        let refs = write_sstables(level_dir, start_id, usize::MAX, entries)?;
+        let refs = write_sstables(&sst_dir, start_id, usize::MAX, entries)?;
         self.next_sst_id = start_id + refs.len() as u64;
 
         for r in &refs {
@@ -91,6 +91,11 @@ impl SsTableWriter {
     /// Current next SSTable ID.
     pub fn next_sst_id(&self) -> u64 {
         self.next_sst_id
+    }
+
+    /// Active SSTable entries from the manifest.
+    pub fn tables(&self) -> &std::collections::HashMap<u64, super::ManifestEntry> {
+        self.manifest.tables()
     }
 }
 
