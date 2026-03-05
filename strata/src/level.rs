@@ -1,7 +1,7 @@
 use std::ops::{Bound, RangeBounds};
 
-use crate::StorageError;
-use crate::memstore::{InternalKey, OpType};
+use crate::memstore::{InternalKey, OpType, ReadError};
+use crate::{ReadStore, StorageError};
 
 /// Result of a point lookup in an SSTable, Run, or Level.
 pub enum Lookup<'a> {
@@ -96,6 +96,38 @@ impl Level {
 
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty()
+    }
+}
+
+impl ReadStore for Level {
+    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError> {
+        match self.lookup_at(key, max_seq) {
+            Lookup::Found(val) => Ok(Some(val.to_vec())),
+            Lookup::Deleted | Lookup::NotFound => Ok(None),
+        }
+    }
+
+    fn scan_at(
+        &self,
+        range: impl std::ops::RangeBounds<Vec<u8>>,
+        max_seq: u64,
+    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError> {
+        let raw = self.scan(range);
+        let mut results = Vec::new();
+        let mut last_key: Option<&[u8]> = None;
+        for (ik, value) in &raw {
+            if ik.seq > max_seq {
+                continue;
+            }
+            if last_key == Some(ik.key.as_slice()) {
+                continue;
+            }
+            last_key = Some(&ik.key);
+            if ik.op == OpType::Put {
+                results.push((ik.clone(), value.clone()));
+            }
+        }
+        Ok(results)
     }
 }
 

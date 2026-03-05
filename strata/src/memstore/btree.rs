@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 
+use crate::ReadStore;
+
 use super::{InternalKey, MemStore, OpType, ReadError, WriteError};
 
 const DEFAULT_CAPACITY: usize = 4 * 1024 * 1024; // 4 MB
@@ -43,24 +45,6 @@ impl MemStore for BTreeMapStore {
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ReadError> {
-        // Probe with max seq so we land just before the first entry for this user key.
-        let probe = InternalKey {
-            key: key.to_vec(),
-            seq: u64::MAX,
-            op: OpType::Put,
-        };
-        if let Some((ikey, value)) = self.store.range(probe..).next()
-            && ikey.key == key
-        {
-            return match ikey.op {
-                OpType::Put => Ok(Some(value.to_vec())),
-                OpType::Delete => Ok(None),
-            };
-        }
-        Ok(None)
-    }
-
     fn scan(
         &self,
         range: impl RangeBounds<Vec<u8>>,
@@ -100,6 +84,25 @@ impl MemStore for BTreeMapStore {
         Ok(results)
     }
 
+    fn size(&self) -> usize {
+        self.current_size
+    }
+
+    fn is_full(&self) -> bool {
+        self.current_size >= self.capacity
+    }
+
+    fn fits(&self, key: &InternalKey, value_len: usize) -> bool {
+        self.current_size + key.key.len() + value_len <= self.capacity
+    }
+
+    fn clear(&mut self) {
+        self.store.clear();
+        self.current_size = 0;
+    }
+}
+
+impl ReadStore for BTreeMapStore {
     fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError> {
         let probe = InternalKey {
             key: key.to_vec(),
@@ -155,8 +158,6 @@ impl MemStore for BTreeMapStore {
             if ikey.seq > max_seq {
                 continue;
             }
-            // InternalKey ordering: user key asc, seq desc.
-            // First entry per user key with seq <= max_seq is the latest visible version.
             if last_key == Some(ikey.key.as_slice()) {
                 continue;
             }
@@ -166,23 +167,6 @@ impl MemStore for BTreeMapStore {
             }
         }
         Ok(results)
-    }
-
-    fn size(&self) -> usize {
-        self.current_size
-    }
-
-    fn is_full(&self) -> bool {
-        self.current_size >= self.capacity
-    }
-
-    fn fits(&self, key: &InternalKey, value_len: usize) -> bool {
-        self.current_size + key.key.len() + value_len <= self.capacity
-    }
-
-    fn clear(&mut self) {
-        self.store.clear();
-        self.current_size = 0;
     }
 }
 
@@ -282,7 +266,10 @@ mod tests {
         let mut store = BTreeMapStore::new();
         put_key(&mut store, b"config:feature_flags", b"enabled", 1);
         delete_key(&mut store, b"config:feature_flags", 2);
-        assert_eq!(store.get(b"config:feature_flags").unwrap(), None);
+        assert_eq!(
+            store.get_at(b"config:feature_flags", u64::MAX).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -310,7 +297,10 @@ mod tests {
         put_key(&mut store, b"key:a", b"v1", 1);
         put_key(&mut store, b"key:a", b"v2", 2);
         put_key(&mut store, b"key:a", b"v3", 3);
-        assert_eq!(store.get(b"key:a").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(
+            store.get_at(b"key:a", u64::MAX).unwrap(),
+            Some(b"v3".to_vec())
+        );
     }
 
     #[test]

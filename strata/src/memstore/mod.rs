@@ -132,7 +132,7 @@ pub enum ReadError {
 /// # What this does
 ///
 /// - Stores key-value pairs in sorted byte order
-/// - Supports point reads, range scans, inserts, and tombstone deletes
+/// - Supports range scans, inserts, and tombstone deletes
 /// - Tracks its own size to signal when it should be flushed
 ///
 /// # What this does not do
@@ -163,20 +163,11 @@ pub trait MemStore {
     /// - `WriteError::Internal` — unexpected error
     fn put(&mut self, key: InternalKey, value: &[u8]) -> Result<(), WriteError>;
 
-    /// Retrieve the value for a given user key.
+    /// Return all entries within the given user-key range, sorted by
+    /// `InternalKey` order (user key ascending, seq descending).
     ///
-    /// Finds the entry with the highest sequence number for the user key.
-    /// Returns `None` if the key does not exist or the latest entry is a
-    /// tombstone ([`OpType::Delete`]).
-    ///
-    /// # Errors
-    /// - `ReadError::Internal` — unexpected error
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ReadError>;
-
-    /// Return entries within the given user-key range, sorted by `InternalKey` order.
-    ///
-    /// For each user key, only the latest version is returned.
-    /// Tombstoned keys are excluded.
+    /// Returns all versions of each key, including tombstones.
+    /// Version resolution is the caller's responsibility.
     ///
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
@@ -193,29 +184,6 @@ pub trait MemStore {
 
     /// Whether an entry with the given key and value size would fit.
     fn fits(&self, key: &InternalKey, value_len: usize) -> bool;
-
-    /// Retrieve the value for a given user key at a specific sequence number.
-    ///
-    /// Finds the most recent entry with `seq <= max_seq` for the user key.
-    /// Returns `None` if no such entry exists or the matching entry is a
-    /// tombstone ([`OpType::Delete`]).
-    ///
-    /// # Errors
-    /// - `ReadError::Internal` — unexpected error
-    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, ReadError>;
-
-    /// Return entries within the given user-key range where `seq <= max_seq`.
-    ///
-    /// For each user key, only the latest version with `seq <= max_seq` is returned.
-    /// Tombstoned keys are excluded.
-    ///
-    /// # Errors
-    /// - `ReadError::Internal` — unexpected error
-    fn scan_at(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-        max_seq: u64,
-    ) -> Result<Vec<(InternalKey, Vec<u8>)>, ReadError>;
 
     /// Remove all entries from the store, resetting its size to zero.
     fn clear(&mut self);

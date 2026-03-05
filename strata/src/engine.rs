@@ -195,6 +195,18 @@ impl<M: MemStore> StorageEngine<M> {
     /// Merges entries from the memtable and all levels, then resolves versions:
     /// for each user key only the latest version is kept and tombstones are excluded.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, StorageError> {
+        self.scan_at(range, u64::MAX)
+    }
+
+    /// Return key-value pairs within the given range at a specific sequence number.
+    ///
+    /// Only includes entries with `seq <= max_seq`. For each user key, only the
+    /// latest visible version is kept and tombstones are excluded.
+    pub fn scan_at(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+        max_seq: u64,
+    ) -> Result<Vec<KVPair>, StorageError> {
         let mut entries = self
             .mem
             .scan((range.start_bound().cloned(), range.end_bound().cloned()))?;
@@ -204,18 +216,22 @@ impl<M: MemStore> StorageEngine<M> {
             entries.extend(level_entries);
         }
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Ok(Self::resolve_versions(&entries))
+        Ok(Self::resolve_versions_at(&entries, max_seq))
     }
 
-    /// Collapse a sorted `InternalKey` stream into user-key pairs.
+    /// Collapse a sorted `InternalKey` stream into user-key pairs,
+    /// only considering entries with `seq <= max_seq`.
     ///
     /// Because `InternalKey` sorts by user key ascending then seq descending,
-    /// the first entry for each user key is the latest version. Tombstones
-    /// (`OpType::Delete`) are dropped.
-    fn resolve_versions(entries: &[(InternalKey, Vec<u8>)]) -> Vec<KVPair> {
+    /// the first entry for each user key with `seq <= max_seq` is the latest
+    /// visible version. Tombstones (`OpType::Delete`) are dropped.
+    fn resolve_versions_at(entries: &[(InternalKey, Vec<u8>)], max_seq: u64) -> Vec<KVPair> {
         let mut result = Vec::new();
         let mut last_key: Option<&[u8]> = None;
         for (ik, value) in entries {
+            if ik.seq > max_seq {
+                continue;
+            }
             if last_key == Some(ik.key.as_slice()) {
                 continue;
             }
