@@ -12,6 +12,12 @@ const OP_REMOVE_TABLE: u8 = 0x02;
 
 /// A manifest log entry.
 ///
+/// The manifest file is an append-only sequence of individually checksummed
+/// records. Multiple records are written as a single atomic batch (one
+/// `write_all` + `sync_data`), so either all records in a batch land on
+/// disk or none do. On replay, a truncated or corrupted trailing record
+/// is treated as an incomplete batch and discarded.
+///
 /// Wire formats (all integers big-endian):
 ///
 /// AddTable:
