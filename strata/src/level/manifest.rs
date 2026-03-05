@@ -31,7 +31,7 @@ const OP_REMOVE_TABLE: u8 = 0x02;
 /// ```text
 /// | 0x02 (1B) | level (2B) | sst_id (8B) | crc32 (4B) |
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestOp {
     AddTable {
         level: u16,
@@ -47,21 +47,8 @@ pub enum ManifestOp {
     },
 }
 
-fn write_and_hash(w: &mut impl Write, hasher: &mut Hasher, bytes: &[u8]) -> io::Result<()> {
-    hasher.update(bytes);
-    w.write_all(bytes)
-}
-
-fn read_and_hash(r: &mut impl Read, hasher: &mut Hasher, buf: &mut [u8]) -> io::Result<()> {
-    r.read_exact(buf)?;
-    hasher.update(buf);
-    Ok(())
-}
-
 impl ManifestOp {
-    pub fn encode(&self, w: &mut impl Write) -> io::Result<()> {
-        let mut hasher = Hasher::new();
-
+    fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         match self {
             ManifestOp::AddTable {
                 level,
@@ -71,105 +58,167 @@ impl ManifestOp {
                 min_key,
                 max_key,
             } => {
-                write_and_hash(w, &mut hasher, &[OP_ADD_TABLE])?;
-                write_and_hash(w, &mut hasher, &level.to_be_bytes())?;
-                write_and_hash(w, &mut hasher, &run_id.to_be_bytes())?;
-                write_and_hash(w, &mut hasher, &sst_id.to_be_bytes())?;
-                write_and_hash(w, &mut hasher, &data_size.to_be_bytes())?;
-                write_and_hash(w, &mut hasher, &(min_key.len() as u16).to_be_bytes())?;
-                write_and_hash(w, &mut hasher, min_key)?;
-                write_and_hash(w, &mut hasher, &(max_key.len() as u16).to_be_bytes())?;
-                write_and_hash(w, &mut hasher, max_key)?;
+                w.write_all(&[OP_ADD_TABLE])?;
+                w.write_all(&level.to_be_bytes())?;
+                w.write_all(&run_id.to_be_bytes())?;
+                w.write_all(&sst_id.to_be_bytes())?;
+                w.write_all(&data_size.to_be_bytes())?;
+                w.write_all(&(min_key.len() as u16).to_be_bytes())?;
+                w.write_all(min_key)?;
+                w.write_all(&(max_key.len() as u16).to_be_bytes())?;
+                w.write_all(max_key)?;
             }
             ManifestOp::RemoveTable { level, sst_id } => {
-                write_and_hash(w, &mut hasher, &[OP_REMOVE_TABLE])?;
-                write_and_hash(w, &mut hasher, &level.to_be_bytes())?;
-                write_and_hash(w, &mut hasher, &sst_id.to_be_bytes())?;
+                w.write_all(&[OP_REMOVE_TABLE])?;
+                w.write_all(&level.to_be_bytes())?;
+                w.write_all(&sst_id.to_be_bytes())?;
             }
         }
-
-        let checksum = hasher.finalize();
-        w.write_all(&checksum.to_be_bytes())?;
         Ok(())
     }
 
-    pub fn decode(r: &mut impl Read) -> io::Result<Self> {
-        let mut hasher = Hasher::new();
-
+    fn decode(r: &mut impl Read) -> io::Result<Self> {
         let mut op = [0u8; 1];
-        read_and_hash(r, &mut hasher, &mut op)?;
+        r.read_exact(&mut op)?;
 
         let mut level_buf = [0u8; 2];
-        read_and_hash(r, &mut hasher, &mut level_buf)?;
+        r.read_exact(&mut level_buf)?;
         let level = u16::from_be_bytes(level_buf);
 
-        let entry = match op[0] {
+        match op[0] {
             OP_ADD_TABLE => {
-                let mut run_id_buf = [0u8; 8];
-                read_and_hash(r, &mut hasher, &mut run_id_buf)?;
-                let run_id = u64::from_be_bytes(run_id_buf);
+                let mut buf8 = [0u8; 8];
+                r.read_exact(&mut buf8)?;
+                let run_id = u64::from_be_bytes(buf8);
 
-                let mut sst_id_buf = [0u8; 8];
-                read_and_hash(r, &mut hasher, &mut sst_id_buf)?;
-                let sst_id = u64::from_be_bytes(sst_id_buf);
+                r.read_exact(&mut buf8)?;
+                let sst_id = u64::from_be_bytes(buf8);
 
-                let mut data_size_buf = [0u8; 4];
-                read_and_hash(r, &mut hasher, &mut data_size_buf)?;
-                let data_size = u32::from_be_bytes(data_size_buf);
+                let mut buf4 = [0u8; 4];
+                r.read_exact(&mut buf4)?;
+                let data_size = u32::from_be_bytes(buf4);
 
-                let mut min_key_len_buf = [0u8; 2];
-                read_and_hash(r, &mut hasher, &mut min_key_len_buf)?;
-                let min_key_len = u16::from_be_bytes(min_key_len_buf) as usize;
-
+                let mut buf2 = [0u8; 2];
+                r.read_exact(&mut buf2)?;
+                let min_key_len = u16::from_be_bytes(buf2) as usize;
                 let mut min_key = vec![0u8; min_key_len];
-                read_and_hash(r, &mut hasher, &mut min_key)?;
+                r.read_exact(&mut min_key)?;
 
-                let mut max_key_len_buf = [0u8; 2];
-                read_and_hash(r, &mut hasher, &mut max_key_len_buf)?;
-                let max_key_len = u16::from_be_bytes(max_key_len_buf) as usize;
-
+                r.read_exact(&mut buf2)?;
+                let max_key_len = u16::from_be_bytes(buf2) as usize;
                 let mut max_key = vec![0u8; max_key_len];
-                read_and_hash(r, &mut hasher, &mut max_key)?;
+                r.read_exact(&mut max_key)?;
 
-                ManifestOp::AddTable {
+                Ok(ManifestOp::AddTable {
                     level,
                     run_id,
                     sst_id,
                     data_size,
                     min_key,
                     max_key,
-                }
+                })
             }
             OP_REMOVE_TABLE => {
-                let mut sst_id_buf = [0u8; 8];
-                read_and_hash(r, &mut hasher, &mut sst_id_buf)?;
-                let sst_id = u64::from_be_bytes(sst_id_buf);
+                let mut buf8 = [0u8; 8];
+                r.read_exact(&mut buf8)?;
+                let sst_id = u64::from_be_bytes(buf8);
 
-                ManifestOp::RemoveTable { level, sst_id }
+                Ok(ManifestOp::RemoveTable { level, sst_id })
             }
-            unknown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown manifest opcode: 0x{unknown:02x}"),
-                ));
-            }
-        };
+            unknown => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown manifest opcode: 0x{unknown:02x}"),
+            )),
+        }
+    }
+}
+
+/// A batch of manifest operations written atomically.
+///
+/// Wire format (all integers big-endian):
+/// ```text
+/// | op_count (4B) | max_seq (8B) | op₁ | op₂ | ... | opₙ | crc32 (4B) |
+/// ```
+///
+/// The CRC32 covers everything from `op_count` through the last op byte.
+/// On replay, a truncated or corrupted batch is discarded entirely.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ManifestBatch {
+    pub ops: Vec<ManifestOp>,
+    pub max_seq: u64,
+}
+
+impl ManifestBatch {
+    pub fn encode(&self, w: &mut impl Write) -> io::Result<()> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(self.ops.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.max_seq.to_be_bytes());
+        for op in &self.ops {
+            op.encode(&mut buf)?;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&buf);
+        let crc = hasher.finalize();
+
+        w.write_all(&buf)?;
+        w.write_all(&crc.to_be_bytes())?;
+        Ok(())
+    }
+
+    pub fn decode(r: &mut impl Read) -> io::Result<Self> {
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)?;
+        let op_count = u32::from_be_bytes(buf4) as usize;
+
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf8)?;
+        let max_seq = u64::from_be_bytes(buf8);
+
+        let mut hasher = Hasher::new();
+        hasher.update(&buf4);
+        hasher.update(&buf8);
+
+        let mut ops = Vec::with_capacity(op_count);
+        for _ in 0..op_count {
+            let mut op_bytes = Vec::new();
+            let op = ManifestOp::decode(&mut TeeReader::new(r, &mut op_bytes))?;
+            hasher.update(&op_bytes);
+            ops.push(op);
+        }
 
         let expected = hasher.finalize();
-        let mut checksum_buf = [0u8; 4];
-        r.read_exact(&mut checksum_buf)?;
-        let actual = u32::from_be_bytes(checksum_buf);
+        let mut crc_buf = [0u8; 4];
+        r.read_exact(&mut crc_buf)?;
+        let actual = u32::from_be_bytes(crc_buf);
 
         if expected != actual {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "manifest checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
-                ),
+                format!("batch checksum mismatch: expected {expected:#010x}, got {actual:#010x}"),
             ));
         }
 
-        Ok(entry)
+        Ok(Self { ops, max_seq })
+    }
+}
+
+/// A reader that captures all bytes read into a side buffer.
+struct TeeReader<'a, R> {
+    inner: &'a mut R,
+    capture: &'a mut Vec<u8>,
+}
+
+impl<'a, R> TeeReader<'a, R> {
+    fn new(inner: &'a mut R, capture: &'a mut Vec<u8>) -> Self {
+        Self { inner, capture }
+    }
+}
+
+impl<R: Read> Read for TeeReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.capture.extend_from_slice(&buf[..n]);
+        Ok(n)
     }
 }
 
@@ -185,6 +234,7 @@ pub struct ManifestEntry {
 pub struct Manifest {
     file: File,
     tables: HashMap<u64, ManifestEntry>,
+    max_seq: u64,
 }
 
 impl Manifest {
@@ -194,32 +244,40 @@ impl Manifest {
             fs::create_dir_all(parent)?;
         }
 
-        let tables = if path.exists() {
+        let (tables, max_seq) = if path.exists() {
             Self::replay(path)?
         } else {
-            HashMap::new()
+            (HashMap::new(), 0)
         };
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
 
-        Ok(Self { file, tables })
+        Ok(Self {
+            file,
+            tables,
+            max_seq,
+        })
     }
 
     /// Append a batch of operations atomically to the manifest log.
     ///
-    /// All ops are encoded to an in-memory buffer and written in a single
-    /// `write_all` + `sync_data` call, so either the entire batch lands on
-    /// disk or none of it does. On replay, a partially written trailing
-    /// record is detected by CRC mismatch and discarded.
-    pub fn append(&mut self, ops: &[ManifestOp], dir: &Path) -> io::Result<()> {
+    /// The batch is framed with a header (op count + max_seq) and a
+    /// trailing CRC32 covering the entire batch. Written in a single
+    /// `write_all` + `sync_data` call.
+    pub fn append(&mut self, ops: &[ManifestOp], max_seq: u64, dir: &Path) -> io::Result<()> {
+        let batch = ManifestBatch {
+            ops: ops.to_vec(),
+            max_seq,
+        };
         let mut buf = Vec::new();
-        for op in ops {
-            op.encode(&mut buf)?;
-        }
+        batch.encode(&mut buf)?;
         self.file.write_all(&buf)?;
         self.file.sync_data()?;
         for op in ops {
             self.apply(op, dir);
+        }
+        if max_seq > self.max_seq {
+            self.max_seq = max_seq;
         }
         Ok(())
     }
@@ -229,23 +287,34 @@ impl Manifest {
         &self.tables
     }
 
-    fn replay(path: &Path) -> io::Result<HashMap<u64, ManifestEntry>> {
+    /// Highest sequence number persisted across all batches.
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
+    }
+
+    fn replay(path: &Path) -> io::Result<(HashMap<u64, ManifestEntry>, u64)> {
         let mut file = File::open(path)?;
         let mut tables = HashMap::new();
+        let mut max_seq = 0u64;
         let dir = path.parent().unwrap_or(Path::new("."));
 
         loop {
-            match ManifestOp::decode(&mut file) {
-                Ok(op) => Self::apply_to(&op, dir, &mut tables),
+            match ManifestBatch::decode(&mut file) {
+                Ok(batch) => {
+                    if batch.max_seq > max_seq {
+                        max_seq = batch.max_seq;
+                    }
+                    for op in &batch.ops {
+                        Self::apply_to(op, dir, &mut tables);
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                // Treat checksum mismatch or truncated data at the tail as
-                // a partial write from a crash — discard and stop replaying.
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => break,
                 Err(e) => return Err(e),
             }
         }
 
-        Ok(tables)
+        Ok((tables, max_seq))
     }
 
     fn apply(&mut self, op: &ManifestOp, dir: &Path) {
@@ -289,59 +358,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn add_table_round_trip() {
-        let op = ManifestOp::AddTable {
-            level: 2,
-            run_id: 42,
-            sst_id: 100,
-            data_size: 4096,
-            min_key: b"aaa".to_vec(),
-            max_key: b"zzz".to_vec(),
+    fn batch_round_trip() {
+        let batch = ManifestBatch {
+            ops: vec![
+                ManifestOp::AddTable {
+                    level: 2,
+                    run_id: 42,
+                    sst_id: 100,
+                    data_size: 4096,
+                    min_key: b"aaa".to_vec(),
+                    max_key: b"zzz".to_vec(),
+                },
+                ManifestOp::RemoveTable {
+                    level: 1,
+                    sst_id: 55,
+                },
+            ],
+            max_seq: 99,
         };
         let mut buf = Vec::new();
-        op.encode(&mut buf).unwrap();
-        let decoded = ManifestOp::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(op, decoded);
+        batch.encode(&mut buf).unwrap();
+        let decoded = ManifestBatch::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(batch, decoded);
     }
 
     #[test]
-    fn remove_table_round_trip() {
-        let op = ManifestOp::RemoveTable {
-            level: 1,
-            sst_id: 55,
+    fn corrupted_batch_checksum_detected() {
+        let batch = ManifestBatch {
+            ops: vec![ManifestOp::AddTable {
+                level: 0,
+                run_id: 1,
+                sst_id: 1,
+                data_size: 100,
+                min_key: b"a".to_vec(),
+                max_key: b"z".to_vec(),
+            }],
+            max_seq: 10,
         };
         let mut buf = Vec::new();
-        op.encode(&mut buf).unwrap();
-        let decoded = ManifestOp::decode(&mut buf.as_slice()).unwrap();
-        assert_eq!(op, decoded);
-    }
+        batch.encode(&mut buf).unwrap();
 
-    #[test]
-    fn corrupted_checksum_detected() {
-        let op = ManifestOp::AddTable {
-            level: 0,
-            run_id: 1,
-            sst_id: 1,
-            data_size: 100,
-            min_key: b"a".to_vec(),
-            max_key: b"z".to_vec(),
-        };
-        let mut buf = Vec::new();
-        op.encode(&mut buf).unwrap();
+        // Corrupt a data byte.
+        buf[5] ^= 0xff;
 
-        // Corrupt the last byte (part of checksum).
-        let last = buf.len() - 1;
-        buf[last] ^= 0xff;
-
-        let err = ManifestOp::decode(&mut buf.as_slice()).unwrap_err();
+        let err = ManifestBatch::decode(&mut buf.as_slice()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("checksum mismatch"));
     }
 
     #[test]
     fn unknown_opcode_rejected() {
-        let buf = vec![0xff, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-        let err = ManifestOp::decode(&mut buf.as_slice()).unwrap_err();
+        // A batch with 1 op, max_seq=0, then an invalid opcode.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes()); // op_count
+        buf.extend_from_slice(&0u64.to_be_bytes()); // max_seq
+        buf.extend_from_slice(&[0xff]); // bad opcode
+        // Pad enough bytes so decode doesn't hit EOF before the opcode error.
+        buf.extend_from_slice(&[0u8; 20]);
+        let err = ManifestBatch::decode(&mut buf.as_slice()).unwrap_err();
         assert!(err.to_string().contains("unknown manifest opcode"));
     }
 
@@ -373,6 +447,7 @@ mod tests {
                             max_key: b"z".to_vec(),
                         },
                     ],
+                    42,
                     dir,
                 )
                 .unwrap();
@@ -382,17 +457,20 @@ mod tests {
                         level: 0,
                         sst_id: 10,
                     }],
+                    42,
                     dir,
                 )
                 .unwrap();
 
             assert_eq!(manifest.tables().len(), 1);
             assert!(manifest.tables().contains_key(&11));
+            assert_eq!(manifest.max_seq(), 42);
         }
 
         // Reopen and verify replay produces the same state.
         let manifest = Manifest::new(&manifest_path).unwrap();
         assert_eq!(manifest.tables().len(), 1);
+        assert_eq!(manifest.max_seq(), 42);
         let entry = manifest.tables().get(&11).unwrap();
         assert_eq!(entry.level, 0);
         assert_eq!(entry.run_id, 1);
@@ -408,6 +486,7 @@ mod tests {
 
         let manifest = Manifest::new(&manifest_path).unwrap();
         assert!(manifest.tables().is_empty());
+        assert_eq!(manifest.max_seq(), 0);
 
         // Reopen empty manifest.
         let manifest = Manifest::new(&manifest_path).unwrap();
@@ -435,6 +514,7 @@ mod tests {
                             min_key: vec![b'a' + level as u8],
                             max_key: vec![b'z'],
                         }],
+                        sst_id,
                         dir,
                     )
                     .unwrap();
@@ -456,6 +536,7 @@ mod tests {
                         sst_id: 101,
                     },
                 ],
+                201,
                 dir,
             )
             .unwrap();
@@ -466,14 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn truncated_trailing_record_discarded_on_replay() {
+    fn truncated_batch_discarded_on_replay() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest_path = tmp.path().join("MANIFEST");
         let dir = tmp.path();
 
         {
             let mut manifest = Manifest::new(&manifest_path).unwrap();
-            // Write a complete batch.
             manifest
                 .append(
                     &[ManifestOp::AddTable {
@@ -484,29 +564,30 @@ mod tests {
                         min_key: b"a".to_vec(),
                         max_key: b"z".to_vec(),
                     }],
+                    5,
                     dir,
                 )
                 .unwrap();
         }
 
-        // Simulate a crash by appending a partial record directly to the file.
+        // Simulate a crash by appending partial bytes.
         {
             let mut file = OpenOptions::new()
                 .append(true)
                 .open(&manifest_path)
                 .unwrap();
-            // Write a few bytes of a second record — not enough for a valid op.
-            file.write_all(&[OP_ADD_TABLE, 0x00, 0x01, 0x00]).unwrap();
+            file.write_all(&[0x00, 0x00, 0x00, 0x01, 0x00]).unwrap();
         }
 
-        // Replay should recover the first record and discard the truncated tail.
+        // Replay should recover the first batch and discard the truncated tail.
         let manifest = Manifest::new(&manifest_path).unwrap();
         assert_eq!(manifest.tables().len(), 1);
         assert!(manifest.tables().contains_key(&10));
+        assert_eq!(manifest.max_seq(), 5);
     }
 
     #[test]
-    fn corrupted_trailing_record_discarded_on_replay() {
+    fn corrupted_batch_discarded_on_replay() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest_path = tmp.path().join("MANIFEST");
         let dir = tmp.path();
@@ -523,24 +604,27 @@ mod tests {
                         min_key: b"a".to_vec(),
                         max_key: b"z".to_vec(),
                     }],
+                    5,
                     dir,
                 )
                 .unwrap();
         }
 
-        // Append a complete but corrupted second record.
+        // Append a complete but corrupted second batch.
         {
-            let op = ManifestOp::AddTable {
-                level: 0,
-                run_id: 2,
-                sst_id: 20,
-                data_size: 100,
-                min_key: b"m".to_vec(),
-                max_key: b"n".to_vec(),
+            let batch = ManifestBatch {
+                ops: vec![ManifestOp::AddTable {
+                    level: 0,
+                    run_id: 2,
+                    sst_id: 20,
+                    data_size: 100,
+                    min_key: b"m".to_vec(),
+                    max_key: b"n".to_vec(),
+                }],
+                max_seq: 10,
             };
             let mut buf = Vec::new();
-            op.encode(&mut buf).unwrap();
-            // Corrupt a data byte (not just checksum).
+            batch.encode(&mut buf).unwrap();
             buf[5] ^= 0xff;
 
             let mut file = OpenOptions::new()
@@ -550,9 +634,52 @@ mod tests {
             file.write_all(&buf).unwrap();
         }
 
-        // Replay should keep first record, discard corrupted second.
+        // Replay should keep first batch, discard corrupted second.
         let manifest = Manifest::new(&manifest_path).unwrap();
         assert_eq!(manifest.tables().len(), 1);
         assert!(manifest.tables().contains_key(&10));
+        assert_eq!(manifest.max_seq(), 5);
+    }
+
+    #[test]
+    fn max_seq_tracks_highest_across_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("MANIFEST");
+        let dir = tmp.path();
+
+        let mut manifest = Manifest::new(&manifest_path).unwrap();
+        manifest
+            .append(
+                &[ManifestOp::AddTable {
+                    level: 0,
+                    run_id: 0,
+                    sst_id: 1,
+                    data_size: 100,
+                    min_key: b"a".to_vec(),
+                    max_key: b"z".to_vec(),
+                }],
+                50,
+                dir,
+            )
+            .unwrap();
+        manifest
+            .append(
+                &[ManifestOp::AddTable {
+                    level: 0,
+                    run_id: 1,
+                    sst_id: 2,
+                    data_size: 100,
+                    min_key: b"a".to_vec(),
+                    max_key: b"z".to_vec(),
+                }],
+                100,
+                dir,
+            )
+            .unwrap();
+        assert_eq!(manifest.max_seq(), 100);
+
+        // Reopen — max_seq should survive.
+        let manifest = Manifest::new(&manifest_path).unwrap();
+        assert_eq!(manifest.max_seq(), 100);
     }
 }

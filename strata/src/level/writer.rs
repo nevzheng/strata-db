@@ -77,10 +77,10 @@ impl SsTableWriter {
     }
 
     /// Flush all accumulated ops to the manifest as a single atomic batch.
-    pub fn commit(&mut self) -> Result<(), StorageError> {
+    pub fn commit(&mut self, max_seq: u64) -> Result<(), StorageError> {
         if !self.pending_ops.is_empty() {
             let ops: Vec<_> = self.pending_ops.drain(..).collect();
-            self.manifest.append(&ops, &self.dir)?;
+            self.manifest.append(&ops, max_seq, &self.dir)?;
         }
         Ok(())
     }
@@ -98,6 +98,11 @@ impl SsTableWriter {
     /// Active SSTable entries from the manifest.
     pub fn tables(&self) -> &std::collections::HashMap<u64, super::ManifestEntry> {
         self.manifest.tables()
+    }
+
+    /// Highest sequence number persisted in the manifest.
+    pub fn max_seq(&self) -> u64 {
+        self.manifest.max_seq()
     }
 }
 

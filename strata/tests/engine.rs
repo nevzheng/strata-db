@@ -537,3 +537,35 @@ fn deleted_data_stays_deleted_after_reopen() {
         );
     }
 }
+
+/// Sequence number is recovered from manifest after compaction + WAL truncate.
+#[test]
+fn seq_recovered_from_manifest_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let seq_before_reopen;
+    {
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+        for i in 0..50u32 {
+            engine
+                .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+                .unwrap();
+        }
+        seq_before_reopen = engine.seq();
+        assert!(seq_before_reopen >= 50);
+    }
+
+    // Reopen — seq should be at least as high as before.
+    let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::with_capacity(64)).unwrap();
+    assert!(
+        engine.seq() >= seq_before_reopen,
+        "seq after reopen ({}) should be >= seq before ({})",
+        engine.seq(),
+        seq_before_reopen
+    );
+
+    // New writes should get higher seq numbers and not collide.
+    engine.put(b"new_key", b"new_val").unwrap();
+    assert!(engine.seq() > seq_before_reopen);
+    assert_eq!(engine.get(b"new_key").unwrap(), Some(b"new_val".to_vec()));
+}

@@ -77,6 +77,9 @@ impl<M: MemStore> StorageEngine<M> {
         let manifest = Manifest::new(&dir.join("MANIFEST"))?;
         let writer = SsTableWriter::new(manifest, dir.to_path_buf(), max_sst_size);
 
+        // Recover seq from whichever source has the higher value.
+        seq = seq.max(writer.max_seq());
+
         // Reconstruct levels from manifest entries.
         let mut levels: Vec<Level> = level_configs.into_iter().map(Level::new).collect();
 
@@ -167,7 +170,7 @@ impl<M: MemStore> StorageEngine<M> {
             self.writer.rollback();
             return Err(e);
         }
-        self.writer.commit()?;
+        self.writer.commit(self.seq)?;
         self.wal.truncate()?;
         info!("compacted memtable to l0");
         self.mem.clear();
