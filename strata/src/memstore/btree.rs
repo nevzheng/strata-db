@@ -61,12 +61,6 @@ impl MemStore for BTreeMapStore {
         Ok(None)
     }
 
-    fn delete(&mut self, key: InternalKey) -> Result<(), WriteError> {
-        self.current_size += key.key.len();
-        self.store.insert(key, Box::default());
-        Ok(())
-    }
-
     fn scan(
         &self,
         range: impl RangeBounds<Vec<u8>>,
@@ -211,11 +205,14 @@ mod tests {
 
     fn delete_key(store: &mut BTreeMapStore, key: &[u8], seq: u64) {
         store
-            .delete(InternalKey {
-                key: key.to_vec(),
-                seq,
-                op: OpType::Delete,
-            })
+            .put(
+                InternalKey {
+                    key: key.to_vec(),
+                    seq,
+                    op: OpType::Delete,
+                },
+                &[],
+            )
             .unwrap();
     }
 

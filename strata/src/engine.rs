@@ -37,11 +37,14 @@ impl<M: MemStore> StorageEngine<M> {
                     },
                     &value,
                 )?,
-                WalOp::Delete { seq: s, key, .. } => mem.delete(InternalKey {
-                    key,
-                    seq: s,
-                    op: OpType::Delete,
-                })?,
+                WalOp::Delete { seq: s, key, .. } => mem.put(
+                    InternalKey {
+                        key,
+                        seq: s,
+                        op: OpType::Delete,
+                    },
+                    &[],
+                )?,
             }
         }
         let levels = Self::default_levels();
@@ -93,10 +96,7 @@ impl<M: MemStore> StorageEngine<M> {
         };
         self.wal.append(&wal_op)?;
         info!("wal ok");
-        match op_type {
-            OpType::Put => self.mem.put(ikey, value)?,
-            OpType::Delete => self.mem.delete(ikey)?,
-        }
+        self.mem.put(ikey, value)?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())

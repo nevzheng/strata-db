@@ -151,9 +151,11 @@ pub enum ReadError {
 /// `scan` return owned `Vec<u8>` values. This is simple and correct
 /// but not zero-copy.
 pub trait MemStore {
-    /// Insert a key-value pair.
+    /// Insert a key-value pair or tombstone.
     ///
-    /// The [`InternalKey`] must have [`OpType::Put`].
+    /// The [`InternalKey::op`] field determines the operation type:
+    /// - [`OpType::Put`] — stores the value
+    /// - [`OpType::Delete`] — stores a tombstone (value should be empty)
     ///
     /// # Errors
     /// - `WriteError::StoreFull` — store has reached capacity
@@ -170,16 +172,6 @@ pub trait MemStore {
     /// # Errors
     /// - `ReadError::Internal` — unexpected error
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ReadError>;
-
-    /// Write a tombstone for the given key.
-    ///
-    /// The [`InternalKey`] must have [`OpType::Delete`].
-    ///
-    /// # Errors
-    /// - `WriteError::StoreFull` — tombstone requires additional storage
-    /// - `WriteError::InvalidArgument` — key rejected by implementation
-    /// - `WriteError::Internal` — unexpected error
-    fn delete(&mut self, key: InternalKey) -> Result<(), WriteError>;
 
     /// Return entries within the given user-key range, sorted by `InternalKey` order.
     ///
