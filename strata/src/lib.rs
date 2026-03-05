@@ -77,53 +77,48 @@ impl<M: MemStore> StorageEngine<M> {
     }
 
     /// Insert a key-value pair.
-    ///
-    /// Writes to the WAL first (blocking until durable), then inserts into the memstore.
     #[instrument(skip(self, key, value), fields(key_len = key.len(), value_len = value.len()))]
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        self.write(key, value, OpType::Put)
+    }
+
+    /// Delete a key (writes a tombstone).
+    #[instrument(skip(self, key), fields(key_len = key.len()))]
+    pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
+        self.write(key, &[], OpType::Delete)
+    }
+
+    /// Shared write path for puts and deletes.
+    ///
+    /// Checks capacity, writes to the WAL (blocking until durable),
+    /// then applies to the memstore.
+    fn write(&mut self, key: &[u8], value: &[u8], op_type: OpType) -> Result<(), StorageError> {
         let next_seq = self.seq + 1;
         let ikey = InternalKey {
             key: key.to_vec(),
             seq: next_seq,
-            op: OpType::Put,
+            op: op_type,
         };
         if !self.mem.fits(&ikey, value.len()) {
             unimplemented!("memtable full — compaction not yet implemented");
         }
-        let op = WalOp::Put {
-            seq: next_seq,
-            key: key.to_vec(),
-            value: value.to_vec(),
+        let wal_op = match op_type {
+            OpType::Put => WalOp::Put {
+                seq: next_seq,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            OpType::Delete => WalOp::Delete {
+                seq: next_seq,
+                key: key.to_vec(),
+            },
         };
-        self.wal.append(&op)?;
+        self.wal.append(&wal_op)?;
         info!("wal ok");
-        self.mem.put(ikey, value)?;
-        self.seq = next_seq;
-        info!(seq = self.seq, "memstore ok");
-        Ok(())
-    }
-
-    /// Delete a key.
-    ///
-    /// Writes to the WAL first (blocking until durable), then deletes from the memstore.
-    #[instrument(skip(self, key), fields(key_len = key.len()))]
-    pub fn delete(&mut self, key: &[u8]) -> Result<(), StorageError> {
-        let next_seq = self.seq + 1;
-        let ikey = InternalKey {
-            key: key.to_vec(),
-            seq: next_seq,
-            op: OpType::Delete,
-        };
-        if !self.mem.fits(&ikey, 0) {
-            unimplemented!("memtable full — compaction not yet implemented");
+        match op_type {
+            OpType::Put => self.mem.put(ikey, value)?,
+            OpType::Delete => self.mem.delete(ikey)?,
         }
-        let op = WalOp::Delete {
-            seq: next_seq,
-            key: key.to_vec(),
-        };
-        self.wal.append(&op)?;
-        info!("wal ok");
-        self.mem.delete(ikey)?;
         self.seq = next_seq;
         info!(seq = self.seq, "memstore ok");
         Ok(())
