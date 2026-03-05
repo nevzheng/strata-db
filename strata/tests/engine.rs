@@ -158,6 +158,68 @@ fn delete_shadows_compacted_data() {
     assert_eq!(results.len(), 25);
 }
 
+/// A small max_sst_size splits runs into multiple SSTable files.
+#[test]
+fn max_sst_size_splits_sstables() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Tiny max_sst_size (64 bytes) forces multiple SST files per run.
+    let mut engine = StorageEngine::with_levels(
+        tmp.path(),
+        BTreeMapStore::with_capacity(64),
+        vec![LevelConfig {
+            max_runs: 64,
+            max_run_size_bytes: usize::MAX,
+        }],
+        64,
+    )
+    .unwrap();
+
+    for i in 0..50u32 {
+        engine
+            .put(format!("k:{i:04}").as_bytes(), format!("v:{i}").as_bytes())
+            .unwrap();
+    }
+
+    // Multiple SST files should exist due to the small max_sst_size.
+    // Each entry is ~22 bytes (2 + 6 key + 8 seq + 1 op + 2 + 3 value).
+    // At 64 bytes max data per file, ~2-3 entries fit before splitting.
+    // Footer is appended after data, so file on disk is slightly larger.
+    let sst_dir = tmp.path().join("sst");
+    let mut sst_sizes: Vec<u64> = std::fs::read_dir(&sst_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.unwrap();
+            if e.path().extension().is_some_and(|ext| ext == "sst") {
+                Some(e.metadata().unwrap().len())
+            } else {
+                None
+            }
+        })
+        .collect();
+    sst_sizes.sort();
+    assert!(
+        sst_sizes.len() > 1,
+        "expected multiple SST files with small max_sst_size, got {}",
+        sst_sizes.len()
+    );
+    // Each file's data section should be at most max_sst_size (64).
+    // Total file = data + footer. Footer is ~20-30 bytes for short keys.
+    for size in &sst_sizes {
+        assert!(
+            *size <= 120,
+            "SST file too large ({size} bytes), expected data ≤64 + footer"
+        );
+    }
+
+    // All data should still be readable.
+    for i in 0..50u32 {
+        assert_eq!(
+            engine.get(format!("k:{i:04}").as_bytes()).unwrap(),
+            Some(format!("v:{i}").into_bytes()),
+        );
+    }
+}
+
 /// Helper: 3-level engine (L0: 2 runs, L1: 2 runs, L2: 1 run) with a tiny memtable.
 fn three_level_engine(dir: &std::path::Path) -> StorageEngine<BTreeMapStore> {
     StorageEngine::with_levels(
@@ -177,6 +239,7 @@ fn three_level_engine(dir: &std::path::Path) -> StorageEngine<BTreeMapStore> {
                 max_run_size_bytes: usize::MAX,
             },
         ],
+        usize::MAX,
     )
     .unwrap()
 }

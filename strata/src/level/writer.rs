@@ -18,11 +18,12 @@ pub struct SsTableWriter {
     manifest: Manifest,
     pending_ops: Vec<ManifestOp>,
     dir: PathBuf,
+    max_sst_size: usize,
 }
 
 impl SsTableWriter {
     /// Create a new writer, recovering `next_sst_id` from the manifest.
-    pub fn new(manifest: Manifest, dir: PathBuf) -> Self {
+    pub fn new(manifest: Manifest, dir: PathBuf, max_sst_size: usize) -> Self {
         let next_sst_id = manifest
             .tables()
             .keys()
@@ -35,6 +36,7 @@ impl SsTableWriter {
             manifest,
             pending_ops: Vec::new(),
             dir,
+            max_sst_size,
         }
     }
 
@@ -51,7 +53,7 @@ impl SsTableWriter {
         let sst_dir = self.dir.join("sst");
         let run_id = self.next_sst_id;
         let start_id = self.next_sst_id;
-        let refs = write_sstables(&sst_dir, start_id, usize::MAX, entries)?;
+        let refs = write_sstables(&sst_dir, start_id, self.max_sst_size, entries)?;
         self.next_sst_id = start_id + refs.len() as u64;
 
         for r in &refs {

@@ -12,6 +12,7 @@ use itertools::Itertools;
 use tracing::{info, instrument};
 
 const DEFAULT_NUM_LEVELS: usize = 7;
+const DEFAULT_MAX_SST_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 
 /// Core engine coordinating between storage components.
 pub struct StorageEngine<M: MemStore> {
@@ -39,13 +40,14 @@ impl<M: MemStore> StorageEngine<M> {
                 }
             })
             .collect();
-        Self::with_levels(dir, mem, configs)
+        Self::with_levels(dir, mem, configs, DEFAULT_MAX_SST_SIZE)
     }
 
     pub fn with_levels(
         dir: &Path,
         mut mem: M,
         level_configs: Vec<LevelConfig>,
+        max_sst_size: usize,
     ) -> Result<Self, StorageError> {
         let wal = WriteAheadLog::new(&dir.join("wal"))?;
         let mut seq = 0u64;
@@ -73,7 +75,7 @@ impl<M: MemStore> StorageEngine<M> {
             }
         }
         let manifest = Manifest::new(&dir.join("MANIFEST"))?;
-        let writer = SsTableWriter::new(manifest, dir.to_path_buf());
+        let writer = SsTableWriter::new(manifest, dir.to_path_buf(), max_sst_size);
 
         // Reconstruct levels from manifest entries.
         let mut levels: Vec<Level> = level_configs.into_iter().map(Level::new).collect();

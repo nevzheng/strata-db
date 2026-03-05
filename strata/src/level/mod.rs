@@ -217,7 +217,7 @@ mod tests {
 
     fn test_writer(tmp: &std::path::Path) -> SsTableWriter {
         let manifest = Manifest::new(&tmp.join("MANIFEST")).unwrap();
-        SsTableWriter::new(manifest, tmp.to_path_buf())
+        SsTableWriter::new(manifest, tmp.to_path_buf(), usize::MAX)
     }
 
     fn test_level() -> Level {
