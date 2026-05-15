@@ -7,7 +7,7 @@
 mod common;
 
 use serde_json::json;
-use strata_db::{CatalogError, Field, FieldType, ResourceKind, Schema};
+use strata_db::{CatalogError, Db, Field, FieldType, LevelConfig, ResourceKind, Schema};
 
 #[test]
 fn db_opens_from_empty_dir() {
@@ -116,4 +116,45 @@ fn data_survives_reopen() {
         .table("events")
         .unwrap();
     assert_eq!(table.get(b"k").unwrap(), Some(json!({"v": 1})));
+}
+
+#[test]
+fn rows_survive_forced_level_compaction() {
+    // Tiny memtable + tight L0 forces writes to flush into L0 and then
+    // cascade into L1. The public API should hide that — every row we
+    // wrote must still be readable through `table.get`.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::builder()
+        .mem_capacity(128)
+        .levels(vec![
+            LevelConfig {
+                max_runs: 2,
+                max_run_size_bytes: 64 * 1024 * 1024,
+            },
+            LevelConfig {
+                max_runs: 64,
+                max_run_size_bytes: 256 * 1024 * 1024,
+            },
+        ])
+        .open(tmp.path())
+        .unwrap();
+
+    let table = db
+        .create_project("acme")
+        .unwrap()
+        .create_dataset("metrics")
+        .unwrap()
+        .create_table("events", Schema::empty())
+        .unwrap();
+
+    for i in 0..50u32 {
+        table
+            .put(format!("k:{i:04}").as_bytes(), json!({ "i": i }))
+            .unwrap();
+    }
+
+    for i in 0..50u32 {
+        let got = table.get(format!("k:{i:04}").as_bytes()).unwrap();
+        assert_eq!(got, Some(json!({ "i": i })), "missing row {i}");
+    }
 }
