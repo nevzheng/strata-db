@@ -39,12 +39,10 @@ impl Dataset {
     }
 
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, CatalogError> {
-        let meta = Catalog::new(self.engine.clone()).create_table(
-            self.project_id,
-            self.id,
-            name,
-            schema,
-        )?;
+        let meta = Catalog::new(self.engine.clone())
+            .project(self.project_id)
+            .dataset(self.id)
+            .create_table(name, schema)?;
         Ok(Table::new(
             self.engine.clone(),
             self.project_id,
@@ -57,7 +55,9 @@ impl Dataset {
 
     pub fn table(&self, name: &str) -> Result<Table, CatalogError> {
         let meta = Catalog::new(self.engine.clone())
-            .open_table(self.project_id, self.id, name)?
+            .project(self.project_id)
+            .dataset(self.id)
+            .open_table(name)?
             .ok_or_else(|| CatalogError::NotFound {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
@@ -73,11 +73,17 @@ impl Dataset {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
-        Catalog::new(self.engine.clone()).drop_table(self.project_id, self.id, name)
+        Catalog::new(self.engine.clone())
+            .project(self.project_id)
+            .dataset(self.id)
+            .drop_table(name)
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, CatalogError> {
-        let metas = Catalog::new(self.engine.clone()).list_tables(self.project_id, self.id)?;
+        let metas = Catalog::new(self.engine.clone())
+            .project(self.project_id)
+            .dataset(self.id)
+            .list_tables()?;
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 }

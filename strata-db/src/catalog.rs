@@ -35,9 +35,10 @@ pub(crate) struct TableMeta {
     pub schema: Schema,
 }
 
+// --- Catalog (top-level) ---
+
 pub(crate) struct Catalog {
-    // Read once the catalog bodies are filled in; held now so handles can
-    // construct a Catalog on demand.
+    // Read once the catalog bodies are filled in.
     #[allow(dead_code)]
     engine: SharedEngine,
 }
@@ -46,8 +47,6 @@ impl Catalog {
     pub(crate) fn new(engine: SharedEngine) -> Self {
         Self { engine }
     }
-
-    // --- Projects ---
 
     pub(crate) fn create_project(&self, _name: &str) -> Result<ProjectMeta, CatalogError> {
         todo!()
@@ -65,74 +64,80 @@ impl Catalog {
         todo!()
     }
 
-    // --- Datasets (scoped to a project) ---
+    /// Narrow the catalog to a single project's scope for dataset operations.
+    pub(crate) fn project(&self, project_id: ProjectId) -> CatalogProject {
+        CatalogProject {
+            engine: self.engine.clone(),
+            project_id,
+        }
+    }
+}
 
-    pub(crate) fn create_dataset(
-        &self,
-        _project_id: ProjectId,
-        _name: &str,
-    ) -> Result<DatasetMeta, CatalogError> {
+// --- CatalogProject (scoped to one project) ---
+
+pub(crate) struct CatalogProject {
+    #[allow(dead_code)]
+    engine: SharedEngine,
+    #[allow(dead_code)]
+    project_id: ProjectId,
+}
+
+impl CatalogProject {
+    pub(crate) fn create_dataset(&self, _name: &str) -> Result<DatasetMeta, CatalogError> {
         todo!()
     }
 
-    pub(crate) fn open_dataset(
-        &self,
-        _project_id: ProjectId,
-        _name: &str,
-    ) -> Result<Option<DatasetMeta>, CatalogError> {
+    pub(crate) fn open_dataset(&self, _name: &str) -> Result<Option<DatasetMeta>, CatalogError> {
         todo!()
     }
 
-    pub(crate) fn drop_dataset(
-        &self,
-        _project_id: ProjectId,
-        _name: &str,
-    ) -> Result<(), CatalogError> {
+    pub(crate) fn drop_dataset(&self, _name: &str) -> Result<(), CatalogError> {
         todo!()
     }
 
-    pub(crate) fn list_datasets(
-        &self,
-        _project_id: ProjectId,
-    ) -> Result<Vec<DatasetMeta>, CatalogError> {
+    pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, CatalogError> {
         todo!()
     }
 
-    // --- Tables (scoped to a project + dataset) ---
+    /// Narrow further to a single dataset's scope for table operations.
+    pub(crate) fn dataset(&self, dataset_id: DatasetId) -> CatalogDataset {
+        CatalogDataset {
+            engine: self.engine.clone(),
+            project_id: self.project_id,
+            dataset_id,
+        }
+    }
+}
 
+// --- CatalogDataset (scoped to one project + dataset) ---
+
+pub(crate) struct CatalogDataset {
+    #[allow(dead_code)]
+    engine: SharedEngine,
+    #[allow(dead_code)]
+    project_id: ProjectId,
+    #[allow(dead_code)]
+    dataset_id: DatasetId,
+}
+
+impl CatalogDataset {
     pub(crate) fn create_table(
         &self,
-        _project_id: ProjectId,
-        _dataset_id: DatasetId,
         _name: &str,
         _schema: Schema,
     ) -> Result<TableMeta, CatalogError> {
         todo!()
     }
 
-    pub(crate) fn open_table(
-        &self,
-        _project_id: ProjectId,
-        _dataset_id: DatasetId,
-        _name: &str,
-    ) -> Result<Option<TableMeta>, CatalogError> {
+    pub(crate) fn open_table(&self, _name: &str) -> Result<Option<TableMeta>, CatalogError> {
         todo!()
     }
 
-    pub(crate) fn drop_table(
-        &self,
-        _project_id: ProjectId,
-        _dataset_id: DatasetId,
-        _name: &str,
-    ) -> Result<(), CatalogError> {
+    pub(crate) fn drop_table(&self, _name: &str) -> Result<(), CatalogError> {
         todo!()
     }
 
-    pub(crate) fn list_tables(
-        &self,
-        _project_id: ProjectId,
-        _dataset_id: DatasetId,
-    ) -> Result<Vec<TableMeta>, CatalogError> {
+    pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, CatalogError> {
         todo!()
     }
 }
