@@ -16,6 +16,8 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
+use tracing::{Instrument, error, info, info_span};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5433";
 const DEFAULT_DATA_DIR: &str = "./strata-data";
@@ -39,7 +41,7 @@ struct Processor;
 impl NoopStartupHandler for Processor {
     async fn post_startup<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         _message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
@@ -47,7 +49,7 @@ impl NoopStartupHandler for Processor {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        println!("startup complete for {}", client.socket_addr());
+        info!("startup complete");
         Ok(())
     }
 }
@@ -59,7 +61,7 @@ impl SimpleQueryHandler for Processor {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        println!("query: {query}");
+        info!(query = %query, "received query");
         Ok(vec![Response::Execution(Tag::new("OK"))])
     }
 }
@@ -80,13 +82,15 @@ impl PgWireServerHandlers for HandlerFactory {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
     let listener = TcpListener::bind(cli.listen).await?;
-    println!(
-        "strata-server listening on {} (data: {})",
-        cli.listen,
-        cli.data_dir.display()
-    );
+    info!(addr = %cli.listen, data_dir = %cli.data_dir.display(), "strata-server listening");
 
     let factory = Arc::new(HandlerFactory {
         processor: Arc::new(Processor),
@@ -95,10 +99,15 @@ async fn main() -> std::io::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let factory = factory.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_socket(socket, None, factory).await {
-                eprintln!("connection error from {peer}: {e}");
+        let span = info_span!("conn", peer = %peer);
+        tokio::spawn(
+            async move {
+                info!("accepted");
+                if let Err(e) = process_socket(socket, None, factory).await {
+                    error!(error = %e, "connection error");
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 }
