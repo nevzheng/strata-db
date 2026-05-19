@@ -1,0 +1,12 @@
+# Smoke test for the harness. The current StubDb accepts every statement and
+# returns no rows, so every line uses `statement ok`. When the real DB lands,
+# this file gets `query` blocks with expected results.
+
+statement ok
+CREATE TABLE foo (a INT, b TEXT);
+
+statement ok
+INSERT INTO foo VALUES (1, 'hello');
+
+statement ok
+SELECT * FROM foo;
