@@ -1,4 +1,5 @@
 use clap::Parser;
+use tokio_postgres::{Config, NoTls};
 
 const DEFAULT_HOST: &str = "localhost";
 const DEFAULT_PORT: u16 = 5433;
@@ -21,7 +22,22 @@ struct Cli {
     database: String,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    println!("{cli:?}");
+
+    let mut config = Config::new();
+    config
+        .host(&cli.host)
+        .port(cli.port)
+        .user(&cli.user)
+        .dbname(&cli.database);
+
+    match config.connect(NoTls).await {
+        Ok(_) => println!("connected to {}:{}", cli.host, cli.port),
+        Err(e) => {
+            eprintln!("connection failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
