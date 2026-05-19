@@ -32,13 +32,17 @@ struct Cli {
     data_dir: PathBuf,
 }
 
-/// pgwire handler stub: completes the startup handshake and acknowledges every
-/// query with an empty `OK` tag. Replace `do_query` with real parse/plan/execute
-/// against `strata-db` when that layer lands.
-struct Processor;
+/// Per-connection query worker. Stateless and shared
+/// across connections via `Arc`; per-connection state lives in pgwire's
+/// `ClientInfo` extension store when we need it.
+///
+/// Today this is a stub: completes the startup handshake and acknowledges
+/// every query with an empty `OK` tag. Replace `do_query` with real
+/// parse/plan/execute against `strata-db` when that layer lands.
+struct Backend;
 
 #[async_trait]
-impl NoopStartupHandler for Processor {
+impl NoopStartupHandler for Backend {
     async fn post_startup<C>(
         &self,
         _client: &mut C,
@@ -55,7 +59,7 @@ impl NoopStartupHandler for Processor {
 }
 
 #[async_trait]
-impl SimpleQueryHandler for Processor {
+impl SimpleQueryHandler for Backend {
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
@@ -66,17 +70,20 @@ impl SimpleQueryHandler for Processor {
     }
 }
 
-struct HandlerFactory {
-    processor: Arc<Processor>,
+/// Bundle of handlers `pgwire` asks for on each new connection. Holds the
+/// shared `Backend` and hands out clones of the same `Arc` — there is no
+/// per-connection construction.
+struct Server {
+    backend: Arc<Backend>,
 }
 
-impl PgWireServerHandlers for HandlerFactory {
+impl PgWireServerHandlers for Server {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.processor.clone()
+        self.backend.clone()
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.processor.clone()
+        self.backend.clone()
     }
 }
 
@@ -92,18 +99,18 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(cli.listen).await?;
     info!(addr = %cli.listen, data_dir = %cli.data_dir.display(), "strata-server listening");
 
-    let factory = Arc::new(HandlerFactory {
-        processor: Arc::new(Processor),
+    let server = Arc::new(Server {
+        backend: Arc::new(Backend),
     });
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let factory = factory.clone();
+        let server = server.clone();
         let span = info_span!("connection", peer = %peer);
         tokio::spawn(
             async move {
                 info!("connection received");
-                if let Err(e) = process_socket(socket, None, factory).await {
+                if let Err(e) = process_socket(socket, None, server).await {
                     error!(error = %e, "connection error");
                 }
                 info!("connection closed");
