@@ -1,10 +1,18 @@
-use clap::Parser;
-use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
+use std::borrow::Cow;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use reedline::{
+    FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal,
+    ValidationResult, Validator,
+};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
 const DEFAULT_HOST: &str = "localhost";
 const DEFAULT_PORT: u16 = 5433;
 const DEFAULT_USER: &str = "strata";
 const DEFAULT_DATABASE: &str = "strata";
+const HISTORY_CAPACITY: usize = 1000;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Interactive client for strata-server")]
@@ -21,9 +29,16 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_DATABASE)]
     database: String,
 
-    /// Run a single SQL command and exit (analogous to `psql -c`).
-    #[arg(short = 'c', long = "command")]
-    command: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Drop into an interactive SQL shell. Default when no subcommand is given.
+    Shell,
+    /// Run a single SQL command and exit.
+    Query { sql: String },
 }
 
 #[tokio::main]
@@ -51,17 +66,98 @@ async fn main() {
         }
     });
 
-    let Some(sql) = cli.command else {
-        println!("connected to {}:{}", cli.host, cli.port);
-        return;
-    };
+    match cli.command.unwrap_or(Command::Shell) {
+        Command::Shell => run_shell(&client, &cli.host, cli.port).await,
+        Command::Query { sql } => run_query(&client, &sql).await,
+    }
+}
 
-    match client.simple_query(&sql).await {
+async fn run_query(client: &Client, sql: &str) {
+    match client.simple_query(sql).await {
         Ok(messages) => print_messages(&messages),
         Err(e) => {
             eprintln!("query failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+async fn run_shell(client: &Client, host: &str, port: u16) {
+    println!("connected to {host}:{port}");
+    println!("type SQL terminated by ';'. Ctrl-D to exit.\n");
+
+    let mut editor = build_editor();
+    let prompt = StrataPrompt;
+
+    loop {
+        let signal = tokio::task::block_in_place(|| editor.read_line(&prompt));
+        match signal {
+            Ok(Signal::Success(buf)) => {
+                let sql = buf.trim().trim_end_matches(';').trim();
+                if sql.is_empty() {
+                    continue;
+                }
+                match client.simple_query(sql).await {
+                    Ok(messages) => print_messages(&messages),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlD) => break,
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("readline error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+fn build_editor() -> Reedline {
+    let mut editor = Reedline::create().with_validator(Box::new(SemicolonValidator));
+    if let Some(path) = history_path()
+        && let Ok(history) = FileBackedHistory::with_file(HISTORY_CAPACITY, path)
+    {
+        editor = editor.with_history(Box::new(history));
+    }
+    editor
+}
+
+fn history_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".strata_history"))
+}
+
+/// Treats input as incomplete until it ends with `;`. Does not yet understand
+/// `;` inside string literals or comments — paste valid SQL or be patient.
+struct SemicolonValidator;
+
+impl Validator for SemicolonValidator {
+    fn validate(&self, line: &str) -> ValidationResult {
+        if line.trim_end().ends_with(';') {
+            ValidationResult::Complete
+        } else {
+            ValidationResult::Incomplete
+        }
+    }
+}
+
+struct StrataPrompt;
+
+impl Prompt for StrataPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        "strata".into()
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        "".into()
+    }
+    fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
+        "=> ".into()
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        "-> ".into()
+    }
+    fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
+        "(search) ".into()
     }
 }
 
