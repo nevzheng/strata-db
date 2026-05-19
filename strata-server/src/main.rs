@@ -61,7 +61,7 @@ impl SimpleQueryHandler for Processor {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        info!(query = %query, "received query");
+        info!(query = %query, "received simple query");
         Ok(vec![Response::Execution(Tag::new("OK"))])
     }
 }
@@ -99,13 +99,14 @@ async fn main() -> std::io::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let factory = factory.clone();
-        let span = info_span!("conn", peer = %peer);
+        let span = info_span!("connection", peer = %peer);
         tokio::spawn(
             async move {
-                info!("accepted");
+                info!("connection received");
                 if let Err(e) = process_socket(socket, None, factory).await {
                     error!(error = %e, "connection error");
                 }
+                info!("connection closed");
             }
             .instrument(span),
         );
