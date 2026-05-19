@@ -1849,6 +1849,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "spec-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "sqllogictest",
+ "thiserror",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1926,19 +1939,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "strata-spec-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "sqllogictest",
- "thiserror",
- "tokio",
- "walkdir",
 ]
 
 [[package]]

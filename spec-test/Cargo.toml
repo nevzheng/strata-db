@@ -1,11 +1,7 @@
 [package]
-name = "strata-spec-test"
+name = "spec-test"
 version = "0.1.0"
 edition = "2024"
-
-[[bin]]
-name = "spec-test"
-path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
