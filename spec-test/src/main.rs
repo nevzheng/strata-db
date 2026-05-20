@@ -14,6 +14,9 @@ use walkdir::WalkDir;
 const SLT_EXTENSION: &str = "slt";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Per-query timeout. Defends against a server that accepts the message but
+/// never replies — without it, the harness would hang forever.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const STRATA_USER: &str = "strata";
 const STRATA_DB: &str = "strata";
 
@@ -29,6 +32,8 @@ struct Cli {
 enum StrataError {
     #[error("postgres: {0}")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("query exceeded {0:?}")]
+    Timeout(Duration),
 }
 
 /// Client side of one connection to a running strata-server.
@@ -60,7 +65,9 @@ impl AsyncDB for StrataDb {
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        let messages = self.client.simple_query(sql).await?;
+        let messages = tokio::time::timeout(QUERY_TIMEOUT, self.client.simple_query(sql))
+            .await
+            .map_err(|_| StrataError::Timeout(QUERY_TIMEOUT))??;
 
         let mut types: Vec<DefaultColumnType> = Vec::new();
         let mut rows: Vec<Vec<String>> = Vec::new();

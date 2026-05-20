@@ -9,9 +9,9 @@ use futures::Sink;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{Response, Tag};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
@@ -32,13 +32,14 @@ struct Cli {
     data_dir: PathBuf,
 }
 
-/// Per-connection query worker. Stateless and shared
-/// across connections via `Arc`; per-connection state lives in pgwire's
-/// `ClientInfo` extension store when we need it.
+/// Per-connection query worker. Stateless and shared across connections via
+/// `Arc`; per-connection state lives in pgwire's `ClientInfo` extension store
+/// when we need it.
 ///
-/// Today this is a stub: completes the startup handshake and acknowledges
-/// every query with an empty `OK` tag. Replace `do_query` with real
-/// parse/plan/execute against `strata-db` when that layer lands.
+/// Today this is a stub: handles `SELECT 1` with a hardcoded `(1)` row so
+/// spec tests can verify the full row-flow path, and returns `OK` for every
+/// other statement. Replace `do_query` with real parse/plan/execute against
+/// `strata-db` when that layer lands.
 struct Backend;
 
 #[async_trait]
@@ -66,8 +67,33 @@ impl SimpleQueryHandler for Backend {
         C::PortalStore: PortalStore,
     {
         info!(query = %query, "received simple query");
+
+        let normalized = query.trim().trim_end_matches(';').trim();
+        if normalized.eq_ignore_ascii_case("SELECT 1") {
+            return Ok(vec![Response::Query(select_one_response()?)]);
+        }
         Ok(vec![Response::Execution(Tag::new("OK"))])
     }
+}
+
+/// Hardcoded response for the literal query `SELECT 1` — one int column named
+/// `?column?` (matching Postgres' default) with a single row of value `1`.
+/// Lets spec tests verify the full row-flow path before we have an executor.
+fn select_one_response() -> PgWireResult<QueryResponse> {
+    let schema = Arc::new(vec![FieldInfo::new(
+        "?column?".into(),
+        None,
+        None,
+        Type::INT4,
+        FieldFormat::Text,
+    )]);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    encoder.encode_field(&Some(1i32))?;
+    let row = encoder.take_row();
+    Ok(QueryResponse::new(
+        schema,
+        futures::stream::iter(vec![Ok(row)]),
+    ))
 }
 
 /// Bundle of handlers `pgwire` asks for on each new connection. Holds the
