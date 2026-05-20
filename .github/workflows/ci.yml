@@ -48,4 +48,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
+      - run: cargo build -p strata-server
       - run: cargo run -p spec-test -- spec-test/spec
