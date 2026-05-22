@@ -16,7 +16,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:5433";
@@ -67,6 +67,11 @@ impl SimpleQueryHandler for Backend {
         C::PortalStore: PortalStore,
     {
         info!(query = %query, "received simple query");
+
+        match strata_db::sql::parse(query) {
+            Ok(statements) => info!(?statements, "parsed ast"),
+            Err(e) => warn!(error = %e, "parse failed"),
+        }
 
         let normalized = query.trim().trim_end_matches(';').trim();
         if normalized.eq_ignore_ascii_case("SELECT 1") {

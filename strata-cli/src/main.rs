@@ -73,6 +73,10 @@ async fn main() {
 }
 
 async fn run_query(client: &Client, sql: &str) {
+    if let Err(e) = strata_db::sql::parse(sql) {
+        eprintln!("syntax error: {e}");
+        std::process::exit(1);
+    }
     match client.simple_query(sql).await {
         Ok(messages) => print_messages(&messages),
         Err(e) => {
@@ -95,6 +99,10 @@ async fn run_shell(client: &Client, host: &str, port: u16) {
             Ok(Signal::Success(buf)) => {
                 let sql = buf.trim().trim_end_matches(';').trim();
                 if sql.is_empty() {
+                    continue;
+                }
+                if let Err(e) = strata_db::sql::parse(sql) {
+                    eprintln!("syntax error: {e}");
                     continue;
                 }
                 match client.simple_query(sql).await {

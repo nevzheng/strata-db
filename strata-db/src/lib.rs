@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod query;
+pub mod sql;
 pub mod storage;
 
 pub use catalog::consts;
