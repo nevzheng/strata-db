@@ -8,9 +8,9 @@
 use crate::catalog::tables::Table;
 use crate::storage::types::{Tuple, Value};
 
+use super::Query;
 use super::QueryContext;
 use super::QueryError;
-use super::data::Query;
 use super::executor::{ExecuteResult, Executor, RowResult, RowStream};
 use super::expression::Expr;
 use super::physical_plan::{PhysicalPlan, PlanNode};
@@ -39,21 +39,27 @@ fn run<'ctx>(
     ctx: &'ctx mut QueryContext<'_>,
 ) -> Result<ExecuteResult<'ctx>, QueryError> {
     match plan.root {
-        PlanNode::Insert { table, input } => {
-            let count = run_insert(&table, *input, ctx)?;
-            Ok(ExecuteResult::Affected(count))
-        }
-        PlanNode::Delete { table, input } => {
-            let count = run_delete(&table, *input, ctx)?;
-            Ok(ExecuteResult::Affected(count))
-        }
+        PlanNode::Insert { table, input } => Ok(ExecuteResult::Affected(
+            InsertSink {
+                table,
+                input: *input,
+            }
+            .run(ctx)?,
+        )),
+        PlanNode::Delete { table, input } => Ok(ExecuteResult::Affected(
+            DeleteSink {
+                table,
+                input: *input,
+            }
+            .run(ctx)?,
+        )),
         read_node => Ok(ExecuteResult::Rows(build(read_node, &*ctx)?)),
     }
 }
 
 fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<'ctx>, QueryError> {
     match node {
-        PlanNode::SeqScan { table } => Ok(RowStream::new(ctx.scan(&table))),
+        PlanNode::SeqScan { table } => Ok(RowStream::new(ctx.table(&table).scan())),
         PlanNode::Filter { input, predicate } => Ok(RowStream::new(Filter {
             input: build(*input, ctx)?,
             predicate,
@@ -75,39 +81,59 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
     }
 }
 
-fn run_insert(
-    table: &Table,
-    input: PlanNode,
-    ctx: &mut QueryContext<'_>,
-) -> Result<u64, QueryError> {
-    let tuples = drain(input, &*ctx)?;
-    let mut count = 0;
-    for tuple in &tuples {
-        ctx.put(table, tuple)?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn run_delete(
-    table: &Table,
-    input: PlanNode,
-    ctx: &mut QueryContext<'_>,
-) -> Result<u64, QueryError> {
-    let tuples = drain(input, &*ctx)?;
-    let mut count = 0;
-    for tuple in &tuples {
-        let key = tuple.values.first().ok_or_else(|| {
-            QueryError::Internal("delete source has no primary-key column".into())
-        })?;
-        ctx.delete(table, key)?;
-        count += 1;
-    }
-    Ok(count)
-}
-
 fn drain(input: PlanNode, ctx: &QueryContext<'_>) -> Result<Vec<Tuple>, QueryError> {
     build(input, ctx)?.collect()
+}
+
+// --- sinks: drain input, then apply writes ---------------------------------
+
+/// Plan-level operation that consumes rows and returns a count.
+///
+/// Sinks have a different shape from read operators: they need
+/// `&mut QueryContext` (so they can't sit inside a pull iterator
+/// chain), they eagerly drain their input before writing, and they
+/// produce a `u64` row count rather than a row stream.
+trait SinkOperator {
+    fn run(self, ctx: &mut QueryContext<'_>) -> Result<u64, QueryError>;
+}
+
+struct InsertSink {
+    table: Table,
+    input: PlanNode,
+}
+
+impl SinkOperator for InsertSink {
+    fn run(self, ctx: &mut QueryContext<'_>) -> Result<u64, QueryError> {
+        let tuples = drain(self.input, &*ctx)?;
+        let mut writer = ctx.table_mut(&self.table);
+        let mut count = 0;
+        for tuple in &tuples {
+            writer.put(tuple)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+struct DeleteSink {
+    table: Table,
+    input: PlanNode,
+}
+
+impl SinkOperator for DeleteSink {
+    fn run(self, ctx: &mut QueryContext<'_>) -> Result<u64, QueryError> {
+        let tuples = drain(self.input, &*ctx)?;
+        let mut writer = ctx.table_mut(&self.table);
+        let mut count = 0;
+        for tuple in &tuples {
+            let key = tuple.values.first().ok_or_else(|| {
+                QueryError::Internal("delete source has no primary-key column".into())
+            })?;
+            writer.delete(key)?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 // --- operators -------------------------------------------------------------

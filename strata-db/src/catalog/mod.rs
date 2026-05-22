@@ -27,6 +27,9 @@ pub mod project;
 pub mod schema;
 pub mod tables;
 
+use strata_store::StorageEngine;
+use strata_store::memstore::BTreeMapStore;
+
 use crate::catalog::consts::{
     CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, SYSTEM_PROJECT_ID, TABLES_TABLE_ID,
     system_table_schema,
@@ -34,6 +37,7 @@ use crate::catalog::consts::{
 use crate::catalog::db::SharedEngine;
 use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId};
 use crate::catalog::schema::Schema;
+use crate::catalog::tables::Table;
 use crate::query::QueryError;
 use crate::storage::row::{RowKey, next_after_prefix};
 use crate::storage::types::{Tuple, Value};
@@ -191,6 +195,142 @@ fn list_metas<T: serde::de::DeserializeOwned>(
             tuple_to_meta(tuple)
         })
         .collect()
+}
+
+// --- Read-side API ---------------------------------------------------------
+//
+// These functions take a borrowed `StorageEngine` so they can be called
+// from a context that already holds the storage lock (e.g. the binder
+// running inside a `QueryContext`). They sit alongside the lock-acquiring
+// `Catalog` API below, which wraps these same lookups in a fresh lock.
+
+pub(crate) fn get_project(
+    engine: &StorageEngine<BTreeMapStore>,
+    name: &str,
+) -> Result<Option<ProjectMeta>, QueryError> {
+    lookup_meta(engine, PROJECTS_TABLE_ID, name.as_bytes())
+}
+
+pub(crate) fn get_dataset(
+    engine: &StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    name: &str,
+) -> Result<Option<DatasetMeta>, QueryError> {
+    let mut key = project_id.as_bytes().to_vec();
+    key.extend_from_slice(name.as_bytes());
+    lookup_meta(engine, DATASETS_TABLE_ID, &key)
+}
+
+pub(crate) fn get_table(
+    engine: &StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    name: &str,
+) -> Result<Option<TableMeta>, QueryError> {
+    let mut key = project_id.as_bytes().to_vec();
+    key.extend_from_slice(dataset_id.as_bytes());
+    key.extend_from_slice(name.as_bytes());
+    lookup_meta(engine, TABLES_TABLE_ID, &key)
+}
+
+/// Resolve a three-part `project.dataset.table` name to a `Table`
+/// handle. Errors with `CatalogError::NotFound` at the first missing
+/// segment.
+pub(crate) fn resolve_table(
+    engine: &StorageEngine<BTreeMapStore>,
+    project: &str,
+    dataset: &str,
+    table: &str,
+) -> Result<Table, QueryError> {
+    let project_meta = get_project(engine, project)?.ok_or_else(|| CatalogError::NotFound {
+        kind: ResourceKind::Project,
+        name: project.to_string(),
+    })?;
+    let dataset_meta =
+        get_dataset(engine, project_meta.id, dataset)?.ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Dataset,
+            name: dataset.to_string(),
+        })?;
+    let table_meta =
+        get_table(engine, project_meta.id, dataset_meta.id, table)?.ok_or_else(|| {
+            CatalogError::NotFound {
+                kind: ResourceKind::Table,
+                name: table.to_string(),
+            }
+        })?;
+    Ok(Table::new(
+        project_meta.id,
+        dataset_meta.id,
+        table_meta.id,
+        table_meta.name,
+        table_meta.schema,
+    ))
+}
+
+fn lookup_meta<T: serde::de::DeserializeOwned>(
+    engine: &StorageEngine<BTreeMapStore>,
+    table_id: TableId,
+    user_key: &[u8],
+) -> Result<Option<T>, QueryError> {
+    let raw = engine.get(&row_key(table_id, user_key))?;
+    match raw {
+        None => Ok(None),
+        Some(bytes) => {
+            let tuple = system_table_schema().decode(&bytes)?;
+            Ok(Some(tuple_to_meta(tuple)?))
+        }
+    }
+}
+
+/// Read-side catalog handle: a thin wrapper around an engine borrow
+/// that surfaces the catalog operations as methods. Returned by
+/// [`crate::QueryContext::catalog`].
+///
+/// Conceptually this is just "specific reads against the meta tables"
+/// — if those reads ever express cleanly through normal SQL, this
+/// type disappears.
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogReader<'a> {
+    engine: &'a StorageEngine<BTreeMapStore>,
+}
+
+// Most of CatalogReader's CRUD-shaped reads are scaffolding for upcoming
+// DDL / system-introspection paths — only `resolve_table` is hit today.
+#[allow(dead_code)]
+impl<'a> CatalogReader<'a> {
+    pub(crate) fn new(engine: &'a StorageEngine<BTreeMapStore>) -> Self {
+        Self { engine }
+    }
+
+    pub(crate) fn get_project(&self, name: &str) -> Result<Option<ProjectMeta>, QueryError> {
+        get_project(self.engine, name)
+    }
+
+    pub(crate) fn get_dataset(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+    ) -> Result<Option<DatasetMeta>, QueryError> {
+        get_dataset(self.engine, project_id, name)
+    }
+
+    pub(crate) fn get_table(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: &str,
+    ) -> Result<Option<TableMeta>, QueryError> {
+        get_table(self.engine, project_id, dataset_id, name)
+    }
+
+    pub(crate) fn resolve_table(
+        &self,
+        project: &str,
+        dataset: &str,
+        table: &str,
+    ) -> Result<Table, QueryError> {
+        resolve_table(self.engine, project, dataset, table)
+    }
 }
 
 // --- Catalog (top-level) ---

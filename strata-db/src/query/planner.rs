@@ -3,9 +3,11 @@
 //! [`Planner::plan`] takes a [`Query`] and returns it populated with
 //! the physical execution plan.
 
+mod binder;
+
 use super::QueryContext;
 use super::QueryError;
-use super::data::{Query, QueryStage};
+use super::{Query, QueryStage};
 
 pub struct Planner;
 
@@ -29,12 +31,8 @@ impl Query {
         Ok(self)
     }
 
-    fn bind(&mut self, _ctx: &mut QueryContext<'_>) -> Result<&mut Self, QueryError> {
-        if self.logical_plan.is_some() {
-            return Ok(self);
-        }
-        self.expect_stage(QueryStage::Parsed)?;
-        self.stage = QueryStage::Bound;
+    fn bind(&mut self, ctx: &mut QueryContext<'_>) -> Result<&mut Self, QueryError> {
+        binder::Binder::new(&*ctx).run(self)?;
         Ok(self)
     }
 

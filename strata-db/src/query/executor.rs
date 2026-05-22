@@ -3,9 +3,9 @@
 
 use crate::storage::types::Tuple;
 
+use super::Query;
 use super::QueryContext;
 use super::QueryError;
-use super::data::Query;
 
 /// One row produced by an executor, or the error that prevented it.
 pub type RowResult = Result<Tuple, QueryError>;

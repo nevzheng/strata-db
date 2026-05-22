@@ -5,11 +5,11 @@
 
 mod common;
 
-use strata_db::query::data::{Query, QueryStage};
 use strata_db::query::executor::{ExecuteResult, Executor, RowStream};
 use strata_db::query::expression::{BinaryOperator, Expr};
 use strata_db::query::physical_plan::{PhysicalPlan, PlanNode};
 use strata_db::query::volcano::Volcano;
+use strata_db::query::{Query, QueryStage};
 use strata_db::{Field, LogicalType, Schema, Table, Tuple, Value};
 
 fn build_events_table(db: &strata_db::Db) -> Table {
@@ -25,14 +25,13 @@ fn build_events_table(db: &strata_db::Db) -> Table {
     let table = dataset.create_table("events", schema).unwrap();
 
     let mut ctx = db.query_context();
+    let mut writer = ctx.table_mut(&table);
     for (id, name) in [(1i32, "alpha"), (2, "bravo"), (3, "charlie"), (4, "delta")] {
-        ctx.put(
-            &table,
-            &Tuple {
+        writer
+            .put(&Tuple {
                 values: vec![Value::Int32(id), Value::Text(name.to_string())],
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
     }
     table
 }

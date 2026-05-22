@@ -13,7 +13,6 @@
 //! projections.
 
 pub mod context;
-pub mod data;
 pub mod executor;
 pub mod expression;
 pub mod logical_plan;
@@ -22,7 +21,6 @@ pub mod planner;
 pub mod volcano;
 
 pub use context::QueryContext;
-pub use data::{Query, QueryStage};
 pub use executor::{ExecuteResult, Executor, RowResult, RowStream};
 pub use expression::{BinaryOperator, Expr};
 pub use logical_plan::{LogicalNode, LogicalPlan};
@@ -31,8 +29,43 @@ pub use planner::Planner;
 pub use volcano::Volcano;
 
 use crate::catalog::CatalogError;
-use crate::sql::ParserError;
+use crate::sql::{ParserError, Statement};
 use crate::storage::codec::DecodeError;
+
+/// Where a [`Query`] is in the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum QueryStage {
+    #[default]
+    Created,
+    Parsed,
+    Bound,
+    Optimized,
+    Lowered,
+}
+
+/// The unit of work that flows through the planner, optimizer, and
+/// executor. Plain data, JSON-serializable so it can be persisted in
+/// the `_queries` system table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Query {
+    pub sql: String,
+    pub stage: QueryStage,
+    pub ast: Option<Vec<Statement>>,
+    pub logical_plan: Option<Vec<LogicalPlan>>,
+    pub physical_plan: Option<PhysicalPlan>,
+}
+
+impl Query {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            stage: QueryStage::Created,
+            ast: None,
+            logical_plan: None,
+            physical_plan: None,
+        }
+    }
+}
 
 /// Either side of the codec boundary: our binary codec (tuple/value
 /// encoding) or the serde-JSON path used by catalog metadata blobs.
@@ -76,11 +109,21 @@ pub enum QueryError {
     /// Failure to parse SQL text into an AST. A user error, not an
     /// invariant violation — surface it back to the client verbatim.
     Parse(ParserError),
+    /// SQL feature the engine doesn't implement yet. Distinct from
+    /// `Internal` (bugs) and `Parse` (syntax) — the query is valid SQL,
+    /// we just haven't built that path.
+    Unsupported(String),
     /// Invariant violation that the binder or planner should have
     /// caught — out-of-bounds column refs, type mismatches in already-
     /// type-checked expressions, schema-shape mismatches, and the like.
     /// If this fires, it's a bug above us.
     Internal(String),
+}
+
+impl QueryError {
+    pub fn unsupported(what: impl Into<String>) -> Self {
+        Self::Unsupported(what.into())
+    }
 }
 
 impl From<CatalogError> for QueryError {
@@ -126,6 +169,7 @@ impl std::fmt::Display for QueryError {
             QueryError::Storage(e) => write!(f, "storage: {e}"),
             QueryError::Codec(e) => write!(f, "codec: {e}"),
             QueryError::Parse(e) => write!(f, "parse: {e}"),
+            QueryError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             QueryError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
