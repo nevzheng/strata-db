@@ -22,17 +22,9 @@
 //! compression and block compression (future SSTable work) will
 //! amortize the on-disk cost.
 //!
-//! # Range scans
-//!
-//! Every row in one table shares the same 48-byte prefix. To list all
-//! rows in a table, compute that prefix with [`RowKey::table_prefix`]
-//! and scan `[prefix .. next_after_prefix(prefix))`.
-//!
-//! [`crate::TypedStore::scan`] returns a `Vec<KVPair>`. The underlying
-//! engine cursor borrows from the `MutexGuard` acquired to read it, and
-//! that guard is released at the end of the lock-acquisition
-//! expression — so rows are drained into a `Vec` before the cursor
-//! escapes the lock's scope.
+//! Every row in one table shares the same 48-byte prefix; the table
+//! API ([`crate::storage::table_api`]) builds range scans on top of
+//! [`RowKey::table_prefix`].
 
 use uuid::Uuid;
 
@@ -82,8 +74,7 @@ impl RowKey {
     }
 
     /// Build the 48-byte key prefix shared by every row in one table.
-    ///
-    /// Pair with [`next_after_prefix`] to range-scan one table.
+    /// Used by the table API to bound scans to a single table.
     pub fn table_prefix(
         project_id: ProjectId,
         dataset_id: DatasetId,
@@ -126,26 +117,6 @@ impl RowKey {
     }
 }
 
-/// Given a key prefix, return the smallest key that is strictly greater
-/// than every key starting with that prefix.
-///
-/// Used to build a half-open range for prefix scans:
-/// `engine.scan(prefix..next_after_prefix(&prefix).unwrap_or(...))`.
-///
-/// Returns `None` if `prefix` is all `0xff` bytes (no greater key
-/// exists; the caller should use an unbounded upper end instead).
-pub fn next_after_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    for i in (0..out.len()).rev() {
-        if out[i] < 0xff {
-            out[i] += 1;
-            out.truncate(i + 1);
-            return Some(out);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,25 +139,5 @@ mod tests {
     fn decode_rejects_short_input() {
         let short = vec![0u8; PREFIX_BYTES - 1];
         assert!(RowKey::decode(&short).is_err());
-    }
-
-    #[test]
-    fn next_after_prefix_increments_last_byte() {
-        assert_eq!(next_after_prefix(&[1, 2, 3]), Some(vec![1, 2, 4]));
-    }
-
-    #[test]
-    fn next_after_prefix_carries_through_trailing_ffs() {
-        assert_eq!(next_after_prefix(&[1, 0xff, 0xff]), Some(vec![2]));
-    }
-
-    #[test]
-    fn next_after_prefix_all_ffs_returns_none() {
-        assert!(next_after_prefix(&[0xff, 0xff]).is_none());
-    }
-
-    #[test]
-    fn next_after_prefix_empty_returns_none() {
-        assert!(next_after_prefix(&[]).is_none());
     }
 }

@@ -39,7 +39,8 @@ use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
-use crate::storage::row::{RowKey, next_after_prefix};
+use crate::storage::row::RowKey;
+use crate::storage::table_api::{ScanOptions, TableReader};
 use crate::storage::types::{Tuple, Value};
 
 #[derive(Debug, Clone, Copy)]
@@ -169,31 +170,39 @@ fn delete_meta(
     Ok(())
 }
 
+/// Build a `Table` descriptor for one of our system tables. Lets the
+/// catalog reuse the regular Table API instead of hand-rolling row
+/// keys against the engine.
+fn system_table(table_id: TableId, name: &'static str) -> Table {
+    Table::new(
+        SYSTEM_PROJECT_ID,
+        CATALOG_DATASET_ID,
+        table_id,
+        name.to_string(),
+        system_table_schema(),
+    )
+}
+
+fn projects_meta_table() -> Table {
+    system_table(PROJECTS_TABLE_ID, "_projects")
+}
+
+fn datasets_meta_table() -> Table {
+    system_table(DATASETS_TABLE_ID, "_datasets")
+}
+
+fn tables_meta_table() -> Table {
+    system_table(TABLES_TABLE_ID, "_tables")
+}
+
 fn list_metas<T: serde::de::DeserializeOwned>(
-    engine: &SharedEngine,
-    table_id: TableId,
+    engine: &StorageEngine<BTreeMapStore>,
+    system_table: Table,
     user_key_prefix: &[u8],
 ) -> Result<Vec<T>, QueryError> {
-    let mut prefix = RowKey::table_prefix(SYSTEM_PROJECT_ID, CATALOG_DATASET_ID, table_id);
-    prefix.extend_from_slice(user_key_prefix);
-
-    // Engine cursor borrows from the lock guard; drain before its scope ends.
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let engine = engine.lock().unwrap();
-        let iter = match next_after_prefix(&prefix) {
-            Some(end) => engine.scan(prefix..end),
-            None => engine.scan(prefix..),
-        };
-        iter.collect::<Result<_, _>>()?
-    };
-
-    let schema = system_table_schema();
-    entries
-        .into_iter()
-        .map(|(_, v)| {
-            let tuple = schema.decode(&v)?;
-            tuple_to_meta(tuple)
-        })
+    TableReader::new(engine, &system_table)
+        .scan(ScanOptions::new().prefix(user_key_prefix))
+        .map(|row| row.and_then(tuple_to_meta))
         .collect()
 }
 
@@ -376,7 +385,8 @@ impl Catalog {
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
-        list_metas(&self.engine, PROJECTS_TABLE_ID, &[])
+        let engine = self.engine.lock().unwrap();
+        list_metas(&engine, projects_meta_table(), &[])
     }
 
     /// Narrow the catalog to a single project's scope for dataset operations.
@@ -434,7 +444,8 @@ impl CatalogProject {
     }
 
     pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, QueryError> {
-        list_metas(&self.engine, DATASETS_TABLE_ID, self.project_id.as_bytes())
+        let engine = self.engine.lock().unwrap();
+        list_metas(&engine, datasets_meta_table(), self.project_id.as_bytes())
     }
 
     /// Narrow further to a single dataset's scope for table operations.
@@ -502,6 +513,7 @@ impl CatalogDataset {
     }
 
     pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, QueryError> {
-        list_metas(&self.engine, TABLES_TABLE_ID, &self.scope_prefix())
+        let engine = self.engine.lock().unwrap();
+        list_metas(&engine, tables_meta_table(), &self.scope_prefix())
     }
 }

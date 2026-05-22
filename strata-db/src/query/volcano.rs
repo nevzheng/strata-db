@@ -6,6 +6,7 @@
 //! vectorized and JIT backends will live alongside.
 
 use crate::catalog::tables::Table;
+use crate::storage::table_api::ScanOptions;
 use crate::storage::types::{Tuple, Value};
 
 use super::Query;
@@ -59,7 +60,9 @@ fn run<'ctx>(
 
 fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<'ctx>, QueryError> {
     match node {
-        PlanNode::SeqScan { table } => Ok(RowStream::new(ctx.table(&table).scan())),
+        PlanNode::SeqScan { table } => {
+            Ok(RowStream::new(ctx.table(&table).scan(ScanOptions::new())))
+        }
         PlanNode::Filter { input, predicate } => Ok(RowStream::new(Filter {
             input: build(*input, ctx)?,
             predicate,
