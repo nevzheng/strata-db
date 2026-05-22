@@ -35,7 +35,7 @@ pub enum LogicalType {
 /// A single runtime datum carrying both its type tag and the data.
 /// `Null` is in-band; nullability is a property of the column, not the
 /// value, but at runtime a null cell still needs a representation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -49,7 +49,7 @@ pub enum Value {
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is
 /// held by the caller (table, operator, etc.) — the tuple itself does
 /// not carry its schema.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tuple {
     pub values: Vec<Value>,
 }

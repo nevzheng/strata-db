@@ -1,24 +1,29 @@
 //! Query processing: planning and execution.
 //!
 //! A query passes through this module in stages: parse → bind → logical
-//! plan → optimize → physical plan → execute. Today only the physical
-//! plan and the (forthcoming) execution backends live here; a parser,
-//! binder, and logical planner will land alongside.
+//! plan → optimize → physical plan → execute. Today the logical and
+//! physical plans live here along with the execution backend; a parser
+//! and binder will land alongside.
 //!
-//! Two trees show up at this level. [`PhysicalPlan`] / [`PlanNode`]
-//! describe dataflow over rows — scans, filters, joins. [`Expr`]
+//! Two trees show up at this level. [`LogicalPlan`] / [`LogicalNode`]
+//! and [`PhysicalPlan`] / [`PlanNode`] describe dataflow over rows —
+//! the logical tree says *what*, the physical tree says *how*. [`Expr`]
 //! describes per-row computation — column refs, comparisons, boolean
 //! combinators — and lives inside plan nodes that need predicates or
 //! projections.
 
 pub mod context;
 pub mod expression;
+pub mod logical_plan;
 pub mod physical_plan;
+pub mod planner;
 pub mod volcano;
 
 pub use context::QueryContext;
 pub use expression::{BinaryOperator, Expr};
+pub use logical_plan::{LogicalNode, LogicalPlan};
 pub use physical_plan::{PhysicalPlan, PlanNode};
+pub use planner::{Query, Stage, plan};
 
 use crate::catalog::CatalogError;
 use crate::storage::codec::DecodeError;
