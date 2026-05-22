@@ -1,5 +1,5 @@
-use strata::memstore::BTreeMapStore;
-use strata::{LevelConfig, StorageEngine};
+use strata_store::memstore::BTreeMapStore;
+use strata_store::{LevelConfig, StorageEngine};
 
 #[test]
 fn put_get_delete_round_trip() {
@@ -73,9 +73,9 @@ fn scan_merges_across_compactions() {
 
     // Should have exactly n unique keys, sorted.
     assert_eq!(results.len(), n);
-    for i in 0..n {
-        assert_eq!(results[i].0, format!("k:{i:06}").into_bytes());
-        assert_eq!(results[i].1, format!("v:{i}").into_bytes());
+    for (i, (k, v)) in results.iter().enumerate().take(n) {
+        assert_eq!(*k, format!("k:{i:06}").into_bytes());
+        assert_eq!(*v, format!("v:{i}").into_bytes());
     }
 }
 

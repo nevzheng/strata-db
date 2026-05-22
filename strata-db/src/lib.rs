@@ -16,4 +16,4 @@ pub use query::{
 pub use storage::codec::{Codec, DecodeError};
 pub use storage::row::{EncodingError, RowKey, next_after_prefix};
 pub use storage::types::{Field, FieldName, LogicalType, Tuple, Value};
-pub use strata::LevelConfig;
+pub use strata_store::LevelConfig;

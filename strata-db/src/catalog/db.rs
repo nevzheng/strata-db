@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use strata::memstore::BTreeMapStore;
-use strata::{LevelConfig, StorageEngine};
+use strata_store::memstore::BTreeMapStore;
+use strata_store::{LevelConfig, StorageEngine};
 
 use crate::catalog::project::Project;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};

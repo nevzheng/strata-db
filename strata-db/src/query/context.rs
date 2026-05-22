@@ -9,8 +9,8 @@
 
 use std::sync::MutexGuard;
 
-use strata::StorageEngine;
-use strata::memstore::BTreeMapStore;
+use strata_store::StorageEngine;
+use strata_store::memstore::BTreeMapStore;
 
 use crate::catalog::tables::Table;
 use crate::storage::row::{RowKey, next_after_prefix};
