@@ -66,8 +66,9 @@ fn scan_merges_across_compactions() {
             .unwrap();
     }
 
-    let results = engine
+    let results: Vec<_> = engine
         .scan(b"k:000000".to_vec()..=b"k:999999".to_vec())
+        .collect::<Result<_, _>>()
         .unwrap();
 
     // Should have exactly n unique keys, sorted.
@@ -103,8 +104,9 @@ fn version_resolution_across_l0_runs() {
     }
 
     // Scan should also resolve to latest versions only.
-    let results = engine
+    let results: Vec<_> = engine
         .scan(b"k:0000".to_vec()..=b"k:0049".to_vec())
+        .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(results.len(), 50);
     for (_, val) in &results {
@@ -152,8 +154,9 @@ fn delete_shadows_compacted_data() {
     }
 
     // Scan should only return the surviving keys.
-    let results = engine
+    let results: Vec<_> = engine
         .scan(b"k:0000".to_vec()..=b"k:0049".to_vec())
+        .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(results.len(), 25);
 }
@@ -408,8 +411,9 @@ fn data_survives_reopen_after_compaction() {
         );
     }
 
-    let results = engine
+    let results: Vec<_> = engine
         .scan(b"k:0000".to_vec()..=b"k:0099".to_vec())
+        .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(results.len(), 100);
 }

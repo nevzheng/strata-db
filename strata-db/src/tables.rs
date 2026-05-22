@@ -123,11 +123,17 @@ impl TypedStore for Table {
         let table_prefix_len = prefix.len();
         prefix.extend_from_slice(user_key_prefix);
 
-        let entries = match next_after_prefix(&prefix) {
-            Some(end) => self.engine.lock().unwrap().scan(prefix..end),
-            None => self.engine.lock().unwrap().scan(prefix..),
-        }
-        .map_err(|e| CatalogError::InternalError(e.to_string()))?;
+        // Engine cursor borrows from the guard; drain into a Vec before
+        // the guard scope ends.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = {
+            let engine = self.engine.lock().unwrap();
+            let iter = match next_after_prefix(&prefix) {
+                Some(end) => engine.scan(prefix..end),
+                None => engine.scan(prefix..),
+            };
+            iter.collect::<Result<_, _>>()
+                .map_err(|e| CatalogError::InternalError(e.to_string()))?
+        };
 
         entries
             .into_iter()
