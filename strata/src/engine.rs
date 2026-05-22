@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 use std::path::Path;
 
+use crate::iterator::{MergeIterator, ScanIterator};
 use crate::level::{Level, LevelConfig, Manifest, Run, SsTableWriter};
 use crate::memstore::{
-    InternalKey, MemStore, OpType,
+    InternalKey, MemStore, OpType, ReadError,
     wal::{WalOp, WriteAheadLog},
 };
 use crate::{KVPair, ReadStore, StorageError};
@@ -12,6 +13,12 @@ use itertools::Itertools;
 use tracing::{info, instrument};
 
 const DEFAULT_NUM_LEVELS: usize = 7;
+
+/// A boxed iterator over raw entries from one storage source (memtable
+/// or level) at a fixed `max_seq`. Same item type as the underlying
+/// `ReadStore::scan_at`, just type-erased so we can collect several
+/// sources of different concrete iterator types into one `Vec`.
+type RawSource<'a> = Box<dyn Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + 'a>;
 
 /// Core engine coordinating between storage components.
 pub struct StorageEngine<M: MemStore> {
@@ -268,62 +275,86 @@ impl<M: MemStore> StorageEngine<M> {
         Ok(None)
     }
 
-    /// Return key-value pairs within the given range, sorted by key ascending.
-    ///
-    /// Merges entries from the memtable and all levels, then resolves versions:
-    /// for each user key only the latest version is kept and tombstones are excluded.
-    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> Result<Vec<KVPair>, StorageError> {
+    /// Scan the range, yielding the latest visible version of each
+    /// user key in ascending order. Tombstones are skipped.
+    pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> ScanIterator<'_> {
         self.scan_at(range, u64::MAX)
     }
 
-    /// Return key-value pairs within the given range at a specific sequence number.
-    ///
-    /// Only includes entries with `seq <= max_seq`. For each user key, only the
-    /// latest visible version is kept and tombstones are excluded.
-    pub fn scan_at(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-        max_seq: u64,
-    ) -> Result<Vec<KVPair>, StorageError> {
-        let mut entries: Vec<_> = self
-            .mem
-            .scan_at(
-                (range.start_bound().cloned(), range.end_bound().cloned()),
-                max_seq,
-            )
-            .collect::<Result<_, _>>()?;
-        for level in &self.levels {
-            let level_entries: Vec<_> = level
-                .scan_at(
-                    (range.start_bound().cloned(), range.end_bound().cloned()),
-                    max_seq,
-                )
-                .collect::<Result<_, _>>()?;
-            entries.extend(level_entries);
-        }
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        Ok(Self::resolve_versions(&entries))
-    }
+    /// Scan the range as of `max_seq`: only entries with `seq <= max_seq`
+    /// are visible. For each user key the latest such version is emitted
+    /// and tombstones are skipped.
+    pub fn scan_at(&self, range: impl RangeBounds<Vec<u8>>, max_seq: u64) -> ScanIterator<'_> {
+        let start = range.start_bound().cloned();
+        let end = range.end_bound().cloned();
 
-    /// Collapse a sorted `InternalKey` stream into user-key pairs.
-    ///
-    /// Entries must already be filtered to `seq <= max_seq`.
-    /// Because `InternalKey` sorts by user key ascending then seq descending,
-    /// the first entry for each user key is the latest visible version.
-    /// Tombstones (`OpType::Delete`) are dropped.
-    fn resolve_versions(entries: &[(InternalKey, Vec<u8>)]) -> Vec<KVPair> {
-        let mut result = Vec::new();
-        let mut last_key: Option<&[u8]> = None;
-        for (ik, value) in entries {
-            if last_key == Some(ik.key.as_slice()) {
-                continue;
-            }
-            last_key = Some(&ik.key);
-            if ik.op == OpType::Put {
-                result.push((ik.key.clone(), value.clone()));
+        // Each source is already sorted by InternalKey, so merging produces
+        // a globally sorted stream without an intermediate Vec.
+        let mut sources: Vec<RawSource<'_>> = Vec::with_capacity(1 + self.levels.len());
+        sources.push(Box::new(
+            self.mem.scan_at((start.clone(), end.clone()), max_seq),
+        ));
+        for level in &self.levels {
+            sources.push(Box::new(
+                level.scan_at((start.clone(), end.clone()), max_seq),
+            ));
+        }
+
+        let merged = MergeIterator::new(sources, |a, b| match (a, b) {
+            (Ok((ka, _)), Ok((kb, _))) => ka.cmp(kb),
+            // Surface errors before any further data is consumed.
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+        });
+
+        ScanIterator::new(VersionResolver::new(merged))
+    }
+}
+
+/// Collapses a sorted internal-entry stream into user-key `KVPair`s.
+/// Requires the input to be ordered by user key ascending, seq
+/// descending — so the first occurrence of each user key is the
+/// latest version. Tombstones are dropped.
+struct VersionResolver<I> {
+    inner: I,
+    last_key: Option<Vec<u8>>,
+}
+
+impl<I> VersionResolver<I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            last_key: None,
+        }
+    }
+}
+
+impl<I> Iterator for VersionResolver<I>
+where
+    I: Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>>,
+{
+    type Item = Result<KVPair, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Err(e) => return Some(Err(e.into())),
+                Ok((ik, value)) => {
+                    if self.last_key.as_deref() == Some(ik.key.as_slice()) {
+                        continue;
+                    }
+                    self.last_key = Some(ik.key.clone());
+                    if ik.op == OpType::Delete {
+                        // Set last_key before continuing so older versions of
+                        // this tombstoned key are also skipped on subsequent
+                        // pulls — order matters here.
+                        continue;
+                    }
+                    return Some(Ok((ik.key, value)));
+                }
             }
         }
-        result
     }
 }
 
@@ -353,7 +384,10 @@ mod tests {
         engine.put(b"key:a", b"1").unwrap();
         engine.put(b"key:b", b"2").unwrap();
 
-        let results = engine.scan(b"key:a".to_vec()..=b"key:c".to_vec()).unwrap();
+        let results: Vec<KVPair> = engine
+            .scan(b"key:a".to_vec()..=b"key:c".to_vec())
+            .collect::<Result<_, _>>()
+            .unwrap();
         let keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(keys, vec![&b"key:a"[..], &b"key:b"[..], &b"key:c"[..]]);
     }

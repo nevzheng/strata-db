@@ -1,8 +1,10 @@
 pub mod engine;
+pub mod iterator;
 pub mod level;
 pub mod memstore;
 
 pub use engine::StorageEngine;
+pub use iterator::{MergeIterator, ScanIterator};
 pub use level::LevelConfig;
 
 use std::ops::RangeBounds;

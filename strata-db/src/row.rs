@@ -28,11 +28,11 @@
 //! rows in a table, compute that prefix with [`RowKey::table_prefix`]
 //! and scan `[prefix .. next_after_prefix(prefix))`.
 //!
-//! Today this materializes the full range into a `Vec<KVPair>` because
-//! [`strata::StorageEngine::scan`] returns a `Vec`. Fine for catalog
-//! lookups (small, bounded); inefficient for user-table scans across
-//! many rows. Future work in `strata` is to return an iterator so
-//! callers stream rows lazily — no signature change needed here.
+//! [`crate::TypedStore::scan`] returns a `Vec<KVPair>`. The underlying
+//! engine cursor borrows from the `MutexGuard` acquired to read it, and
+//! that guard is released at the end of the lock-acquisition
+//! expression — so rows are drained into a `Vec` before the cursor
+//! escapes the lock's scope.
 
 use uuid::Uuid;
 

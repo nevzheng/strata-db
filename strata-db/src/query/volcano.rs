@@ -68,12 +68,9 @@ fn build(node: PlanNode) -> Result<Box<dyn Operator>, QueryError> {
 
 // ----- Operators -----------------------------------------------------------
 
-/// Sequential scan: read every tuple from a base table.
-///
-/// Today this is not actually streaming — [`TypedStore::scan`] returns
-/// a fully materialized `Vec`. The operator just hands those tuples
-/// back one by one. A streaming scan is a future change to the storage
-/// layer.
+/// Sequential scan over a base table. Iterates a `Vec` of pre-decoded
+/// tuples — `TypedStore::scan` collects rows under the engine's lock
+/// before this operator sees them.
 struct SeqScan {
     rows: std::vec::IntoIter<(Vec<u8>, Tuple)>,
 }
