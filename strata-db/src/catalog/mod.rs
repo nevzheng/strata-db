@@ -39,8 +39,7 @@ use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
-use crate::storage::row::RowKey;
-use crate::storage::table_api::{ScanOptions, TableReader};
+use crate::storage::table_api::{ScanOptions, TableReader, TableWriter};
 use crate::storage::types::{Tuple, Value};
 
 #[derive(Debug, Clone, Copy)]
@@ -88,86 +87,51 @@ pub(crate) struct QueryMeta {
 
 // --- System-table helpers ---
 //
-// Catalog rows live in reserved system tables under
-// `(SYSTEM_PROJECT_ID, CATALOG_DATASET_ID, <table_id>)`. Each helper
-// constructs the row key for the addressed catalog row and goes
-// straight to the engine — there's no `Table` handle in the picture
-// because the catalog needs raw byte-key addressing (composite project
-// + name keys) that the PK-derived [`crate::QueryContext`] API doesn't
-// expose. Eventually this collapses into plan-based catalog ops once
-// `Insert`/`Delete` operators and proper PK schemas exist.
+// Catalog rows are stored in reserved system tables under
+// `(SYSTEM_PROJECT_ID, CATALOG_DATASET_ID, <table_id>)`. Schema is
+// `(pk: Bytes, meta: Json)` — the PK is the composite natural key for
+// the row (project name, `(project_id, dataset_name)`, etc.), encoded
+// raw into the storage user_key so prefix scans line up. Reads and
+// writes flow through `storage::table_api`.
 
-fn meta_to_tuple<T: serde::Serialize>(meta: &T) -> Result<Tuple, QueryError> {
-    let json = serde_json::to_value(meta)?;
+fn meta_to_tuple<T: serde::Serialize>(user_key: &[u8], meta: &T) -> Result<Tuple, QueryError> {
     Ok(Tuple {
-        values: vec![Value::Json(json)],
+        values: vec![
+            Value::Bytes(user_key.to_vec()),
+            Value::Json(serde_json::to_value(meta)?),
+        ],
     })
 }
 
 fn tuple_to_meta<T: serde::de::DeserializeOwned>(tuple: Tuple) -> Result<T, QueryError> {
-    let json = match tuple.values.into_iter().next() {
+    // Schema is (pk: Bytes, meta: Json) — skip the PK column.
+    let json = match tuple.values.into_iter().nth(1) {
         Some(Value::Json(j)) => j,
         _ => {
-            // Schema invariant: every catalog row is one Json column.
-            // Reaching here would mean a stored row doesn't match the
-            // declared system-table schema — treat as a decode failure.
             return Err(QueryError::Codec(crate::query::CodecError::Serde(
-                serde::de::Error::custom("expected Json value in catalog row"),
+                serde::de::Error::custom("expected Json meta column in catalog row"),
             )));
         }
     };
     Ok(serde_json::from_value(json)?)
 }
 
-fn row_key(table_id: TableId, user_key: &[u8]) -> Vec<u8> {
-    RowKey::new(
-        SYSTEM_PROJECT_ID,
-        CATALOG_DATASET_ID,
-        table_id,
-        user_key.to_vec(),
-    )
-    .encode()
-}
-
-fn put_meta<T: serde::Serialize>(
-    engine: &SharedEngine,
-    table_id: TableId,
+fn write_meta<T: serde::Serialize>(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    system_table: &Table,
     user_key: &[u8],
     meta: &T,
 ) -> Result<(), QueryError> {
-    let value_bytes = system_table_schema().encode(&meta_to_tuple(meta)?);
-    engine
-        .lock()
-        .unwrap()
-        .put(&row_key(table_id, user_key), &value_bytes)?;
-    Ok(())
+    let tuple = meta_to_tuple(user_key, meta)?;
+    TableWriter::new(engine, system_table).put(&tuple)
 }
 
-fn get_meta<T: serde::de::DeserializeOwned>(
-    engine: &SharedEngine,
-    table_id: TableId,
-    user_key: &[u8],
-) -> Result<Option<T>, QueryError> {
-    let raw = engine.lock().unwrap().get(&row_key(table_id, user_key))?;
-    match raw {
-        None => Ok(None),
-        Some(bytes) => {
-            let tuple = system_table_schema().decode(&bytes)?;
-            Ok(Some(tuple_to_meta(tuple)?))
-        }
-    }
-}
-
-fn delete_meta(
-    engine: &SharedEngine,
-    table_id: TableId,
+fn remove_meta(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    system_table: &Table,
     user_key: &[u8],
 ) -> Result<(), QueryError> {
-    engine
-        .lock()
-        .unwrap()
-        .delete(&row_key(table_id, user_key))?;
-    Ok(())
+    TableWriter::new(engine, system_table).delete(&Value::Bytes(user_key.to_vec()))
 }
 
 /// Build a `Table` descriptor for one of our system tables. Lets the
@@ -217,7 +181,7 @@ pub(crate) fn get_project(
     engine: &StorageEngine<BTreeMapStore>,
     name: &str,
 ) -> Result<Option<ProjectMeta>, QueryError> {
-    lookup_meta(engine, PROJECTS_TABLE_ID, name.as_bytes())
+    lookup_meta(engine, &projects_meta_table(), name.as_bytes())
 }
 
 pub(crate) fn get_dataset(
@@ -227,7 +191,7 @@ pub(crate) fn get_dataset(
 ) -> Result<Option<DatasetMeta>, QueryError> {
     let mut key = project_id.as_bytes().to_vec();
     key.extend_from_slice(name.as_bytes());
-    lookup_meta(engine, DATASETS_TABLE_ID, &key)
+    lookup_meta(engine, &datasets_meta_table(), &key)
 }
 
 pub(crate) fn get_table(
@@ -239,7 +203,7 @@ pub(crate) fn get_table(
     let mut key = project_id.as_bytes().to_vec();
     key.extend_from_slice(dataset_id.as_bytes());
     key.extend_from_slice(name.as_bytes());
-    lookup_meta(engine, TABLES_TABLE_ID, &key)
+    lookup_meta(engine, &tables_meta_table(), &key)
 }
 
 /// Resolve a three-part `project.dataset.table` name to a `Table`
@@ -278,16 +242,12 @@ pub(crate) fn resolve_table(
 
 fn lookup_meta<T: serde::de::DeserializeOwned>(
     engine: &StorageEngine<BTreeMapStore>,
-    table_id: TableId,
+    system_table: &Table,
     user_key: &[u8],
 ) -> Result<Option<T>, QueryError> {
-    let raw = engine.get(&row_key(table_id, user_key))?;
-    match raw {
+    match TableReader::new(engine, system_table).get(&Value::Bytes(user_key.to_vec()))? {
         None => Ok(None),
-        Some(bytes) => {
-            let tuple = system_table_schema().decode(&bytes)?;
-            Ok(Some(tuple_to_meta(tuple)?))
-        }
+        Some(tuple) => Ok(Some(tuple_to_meta(tuple)?)),
     }
 }
 
@@ -354,7 +314,8 @@ impl Catalog {
     }
 
     pub(crate) fn create_project(&self, name: &str) -> Result<ProjectMeta, QueryError> {
-        if self.open_project(name)?.is_some() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_project(&engine, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Project,
                 name: name.to_string(),
@@ -365,23 +326,25 @@ impl Catalog {
             id: ProjectId::new(),
             name: name.to_string(),
         };
-        put_meta(&self.engine, PROJECTS_TABLE_ID, name.as_bytes(), &meta)?;
+        write_meta(&mut engine, &projects_meta_table(), name.as_bytes(), &meta)?;
         Ok(meta)
     }
 
     pub(crate) fn open_project(&self, name: &str) -> Result<Option<ProjectMeta>, QueryError> {
-        get_meta(&self.engine, PROJECTS_TABLE_ID, name.as_bytes())
+        let engine = self.engine.lock().unwrap();
+        get_project(&engine, name)
     }
 
     pub(crate) fn drop_project(&self, name: &str) -> Result<(), QueryError> {
-        if self.open_project(name)?.is_none() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_project(&engine, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Project,
                 name: name.to_string(),
             }
             .into());
         }
-        delete_meta(&self.engine, PROJECTS_TABLE_ID, name.as_bytes())
+        remove_meta(&mut engine, &projects_meta_table(), name.as_bytes())
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
@@ -413,7 +376,8 @@ impl CatalogProject {
     }
 
     pub(crate) fn create_dataset(&self, name: &str) -> Result<DatasetMeta, QueryError> {
-        if self.open_dataset(name)?.is_some() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_dataset(&engine, self.project_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Dataset,
                 name: name.to_string(),
@@ -424,23 +388,30 @@ impl CatalogProject {
             id: DatasetId::new(),
             name: name.to_string(),
         };
-        put_meta(&self.engine, DATASETS_TABLE_ID, &self.user_key(name), &meta)?;
+        write_meta(
+            &mut engine,
+            &datasets_meta_table(),
+            &self.user_key(name),
+            &meta,
+        )?;
         Ok(meta)
     }
 
     pub(crate) fn open_dataset(&self, name: &str) -> Result<Option<DatasetMeta>, QueryError> {
-        get_meta(&self.engine, DATASETS_TABLE_ID, &self.user_key(name))
+        let engine = self.engine.lock().unwrap();
+        get_dataset(&engine, self.project_id, name)
     }
 
     pub(crate) fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
-        if self.open_dataset(name)?.is_none() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_dataset(&engine, self.project_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Dataset,
                 name: name.to_string(),
             }
             .into());
         }
-        delete_meta(&self.engine, DATASETS_TABLE_ID, &self.user_key(name))
+        remove_meta(&mut engine, &datasets_meta_table(), &self.user_key(name))
     }
 
     pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, QueryError> {
@@ -481,7 +452,8 @@ impl CatalogDataset {
     }
 
     pub(crate) fn create_table(&self, name: &str, schema: Schema) -> Result<TableMeta, QueryError> {
-        if self.open_table(name)?.is_some() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_table(&engine, self.project_id, self.dataset_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
@@ -493,23 +465,30 @@ impl CatalogDataset {
             name: name.to_string(),
             schema,
         };
-        put_meta(&self.engine, TABLES_TABLE_ID, &self.user_key(name), &meta)?;
+        write_meta(
+            &mut engine,
+            &tables_meta_table(),
+            &self.user_key(name),
+            &meta,
+        )?;
         Ok(meta)
     }
 
     pub(crate) fn open_table(&self, name: &str) -> Result<Option<TableMeta>, QueryError> {
-        get_meta(&self.engine, TABLES_TABLE_ID, &self.user_key(name))
+        let engine = self.engine.lock().unwrap();
+        get_table(&engine, self.project_id, self.dataset_id, name)
     }
 
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        if self.open_table(name)?.is_none() {
+        let mut engine = self.engine.lock().unwrap();
+        if get_table(&engine, self.project_id, self.dataset_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
             }
             .into());
         }
-        delete_meta(&self.engine, TABLES_TABLE_ID, &self.user_key(name))
+        remove_meta(&mut engine, &tables_meta_table(), &self.user_key(name))
     }
 
     pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, QueryError> {

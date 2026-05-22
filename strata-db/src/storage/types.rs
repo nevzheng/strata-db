@@ -7,20 +7,27 @@
 //!
 //! Supported types (v1):
 //!
-//! | Logical    | Backing Rust | Notes                                  |
-//! |------------|--------------|----------------------------------------|
-//! | `Bool`     | `bool`       | 1 byte on the wire                     |
-//! | `Int16`    | `i16`        | signed; SQL `SMALLINT`                 |
-//! | `Int32`    | `i32`        | signed; SQL `INT` / `INTEGER`          |
-//! | `Int64`    | `i64`        | signed; SQL `BIGINT`                   |
-//! | `Text`     | `String`     | UTF-8, length-prefixed; SQL `TEXT`     |
-//! | `Json`     | `serde_json` | arbitrary JSON blob, serde-encoded     |
+//! | Logical | Backing Rust | SQL              |
+//! |---------|--------------|------------------|
+//! | `Bool`  | `bool`       | `BOOLEAN`        |
+//! | `Int16` | `i16`        | `SMALLINT`       |
+//! | `Int32` | `i32`        | `INT` / `INTEGER`|
+//! | `Int64` | `i64`        | `BIGINT`         |
+//! | `Text`  | `String`     | `TEXT`           |
+//! | `Bytes` | `Vec<u8>`    | `BYTEA`          |
+//! | `Json`  | `serde_json` | `JSON` / `JSONB` |
 //!
-//! `Json` is the escape hatch for data that doesn't fit a primitive
-//! (today: catalog metadata blobs). Unsigned integers, floating-point,
-//! decimals, timestamps, and composite types (arrays, structs) are
-//! intentionally out of scope for v1 — add a variant + a `Codec` impl
-//! when the need is real.
+//! Each value has two byte encodings, dispatched on `Value` and backed
+//! by the two codec traits in [`crate::storage::codec`]:
+//!
+//! - **As a column value** ([`Value::encode`](crate::storage::codec)
+//!   via `ValueCodec`): variable-length types (`Text`, `Bytes`, `Json`)
+//!   carry a `u32` length prefix so the schema can decode columns
+//!   positionally.
+//! - **As a storage user-key** ([`Value::encode_key`](crate::storage::codec)
+//!   via `KeyCodec`): no length prefix — raw bytes — so the engine's
+//!   lex sort matches content sort. Required for prefix and range scans
+//!   to behave.
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum LogicalType {
@@ -29,6 +36,7 @@ pub enum LogicalType {
     Int32,
     Int64,
     Text,
+    Bytes,
     Json,
 }
 
@@ -43,6 +51,7 @@ pub enum Value {
     Int32(i32),
     Int64(i64),
     Text(String),
+    Bytes(Vec<u8>),
     Json(serde_json::Value),
 }
 

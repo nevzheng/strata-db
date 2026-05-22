@@ -30,7 +30,7 @@ pub use volcano::Volcano;
 
 use crate::catalog::CatalogError;
 use crate::sql::{ParserError, Statement};
-use crate::storage::codec::DecodeError;
+use crate::storage::codec::{DecodeError, KeyEncodeError};
 
 /// Where a [`Query`] is in the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -159,6 +159,16 @@ impl From<serde_json::Error> for QueryError {
 impl From<ParserError> for QueryError {
     fn from(e: ParserError) -> Self {
         QueryError::Parse(e)
+    }
+}
+
+impl From<KeyEncodeError> for QueryError {
+    fn from(e: KeyEncodeError) -> Self {
+        match e {
+            KeyEncodeError::NullKey => {
+                QueryError::Internal("primary key cannot be null".into())
+            }
+        }
     }
 }
 

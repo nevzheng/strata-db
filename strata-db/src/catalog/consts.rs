@@ -55,11 +55,16 @@ use crate::catalog::schema::Schema;
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
 use crate::storage::types::{Field, LogicalType};
 
-/// Schema for every system table: a single `Json` column holding the
-/// serialized metadata blob.
+/// Schema for every system table: a `Bytes` PK column carrying the
+/// composite natural key (project name, `(project_id, dataset_name)`,
+/// etc.) plus a `Json` blob with the serialized metadata. With this
+/// shape catalog reads and writes flow through the regular table API.
 pub(crate) fn system_table_schema() -> Schema {
     Schema {
-        fields: vec![Field::new("meta", LogicalType::Json)],
+        fields: vec![
+            Field::new("pk", LogicalType::Bytes),
+            Field::new("meta", LogicalType::Json),
+        ],
     }
 }
 

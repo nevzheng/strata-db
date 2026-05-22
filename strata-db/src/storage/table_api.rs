@@ -109,7 +109,9 @@ impl<'engine> TableReader<'engine> {
     }
 
     pub fn get(&self, key: &Value) -> Result<Option<Tuple>, QueryError> {
-        let row_key = self.row_key(&encode_key(key)?);
+        let mut user_key = Vec::new();
+        key.encode_key(&mut user_key)?;
+        let row_key = self.row_key(&user_key);
         match self.engine.get(&row_key)? {
             None => Ok(None),
             Some(bytes) => Ok(Some(self.schema.decode(&bytes)?)),
@@ -195,14 +197,21 @@ impl<'engine> TableWriter<'engine> {
     /// Insert `tuple`. The storage key is derived from the tuple's
     /// first column (PK-by-convention).
     pub fn put(&mut self, tuple: &Tuple) -> Result<(), QueryError> {
-        let row_key = self.row_key(&primary_key_bytes(tuple)?);
+        if tuple.values.is_empty() {
+            return Err(QueryError::Internal("cannot insert empty tuple".into()));
+        }
+        let mut user_key = Vec::new();
+        tuple.values[0].encode_key(&mut user_key)?;
+        let row_key = self.row_key(&user_key);
         let value_bytes = self.schema.encode(tuple);
         self.engine.put(&row_key, &value_bytes)?;
         Ok(())
     }
 
     pub fn delete(&mut self, key: &Value) -> Result<(), QueryError> {
-        let row_key = self.row_key(&encode_key(key)?);
+        let mut user_key = Vec::new();
+        key.encode_key(&mut user_key)?;
+        let row_key = self.row_key(&user_key);
         self.engine.delete(&row_key)?;
         Ok(())
     }
@@ -216,23 +225,6 @@ impl<'engine> TableWriter<'engine> {
         )
         .encode()
     }
-}
-
-fn primary_key_bytes(tuple: &Tuple) -> Result<Vec<u8>, QueryError> {
-    let pk = tuple
-        .values
-        .first()
-        .ok_or_else(|| QueryError::Internal("tuple has no columns to use as primary key".into()))?;
-    encode_key(pk)
-}
-
-fn encode_key(value: &Value) -> Result<Vec<u8>, QueryError> {
-    if matches!(value, Value::Null) {
-        return Err(QueryError::Internal("primary key cannot be null".into()));
-    }
-    let mut buf = Vec::with_capacity(value.encoded_size());
-    value.encode(&mut buf);
-    Ok(buf)
 }
 
 #[cfg(test)]
