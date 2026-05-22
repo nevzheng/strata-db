@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod codec;
 pub mod consts;
 pub mod dataset;
 pub mod db;
@@ -7,13 +8,16 @@ pub mod project;
 pub mod row;
 pub mod schema;
 pub mod tables;
+pub mod types;
 
 pub use catalog::{CatalogError, ResourceKind};
+pub use codec::{Codec, DecodeError};
 pub use dataset::Dataset;
 pub use db::{Db, DbBuilder};
 pub use ids::{DatasetId, ProjectId, TableId};
 pub use project::Project;
 pub use row::{EncodingError, RowKey, next_after_prefix};
-pub use schema::{Field, FieldType, Schema};
+pub use schema::Schema;
 pub use strata::LevelConfig;
-pub use tables::Table;
+pub use tables::{Table, TypedStore};
+pub use types::{Field, FieldName, LogicalType, Tuple, Value};
