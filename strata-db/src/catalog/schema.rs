@@ -1,5 +1,5 @@
-use crate::codec::DecodeError;
-use crate::types::{Field, Tuple, Value};
+use crate::storage::codec::DecodeError;
+use crate::storage::types::{Field, Tuple, Value};
 
 /// Table schema — an ordered list of fields.
 ///
@@ -94,7 +94,7 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Field, LogicalType, Value};
+    use crate::storage::types::{Field, LogicalType, Value};
 
     fn schema(fields: Vec<Field>) -> Schema {
         Schema { fields }

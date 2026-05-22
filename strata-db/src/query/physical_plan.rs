@@ -9,7 +9,8 @@
 //! engine, JIT codegen) consumes it and produces tuples; the plan does
 //! no work itself.
 
-use crate::tables::Table;
+use crate::catalog::tables::Table;
+use crate::storage::types::Tuple;
 
 use super::expression::Expr;
 
@@ -45,4 +46,14 @@ pub enum PlanNode {
     },
     /// Yield at most `count` rows from `input`, then stop.
     Limit { input: Box<PlanNode>, count: usize },
+    /// Yield each tuple in `rows` then stop. Source node for things
+    /// like `INSERT INTO t VALUES (..)`.
+    Values { rows: Vec<Tuple> },
+    /// Sink: drain `input` and write each tuple to `table`. Only valid
+    /// at the top of a plan — write operators are executed through
+    /// [`crate::query::volcano::execute`], not the pull-iterator chain.
+    Insert { table: Table, input: Box<PlanNode> },
+    /// Sink: drain `input` and delete each tuple by its primary-key
+    /// column (column 0). Same top-of-plan constraint as `Insert`.
+    Delete { table: Table, input: Box<PlanNode> },
 }

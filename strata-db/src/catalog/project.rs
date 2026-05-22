@@ -1,7 +1,8 @@
+use crate::catalog::dataset::Dataset;
+use crate::catalog::db::SharedEngine;
+use crate::catalog::ids::ProjectId;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
-use crate::dataset::Dataset;
-use crate::db::SharedEngine;
-use crate::ids::ProjectId;
+use crate::query::QueryError;
 
 pub struct Project {
     engine: SharedEngine,
@@ -22,7 +23,7 @@ impl Project {
         &self.name
     }
 
-    pub fn create_dataset(&self, name: &str) -> Result<Dataset, CatalogError> {
+    pub fn create_dataset(&self, name: &str) -> Result<Dataset, QueryError> {
         let meta = Catalog::new(self.engine.clone())
             .project(self.id)
             .create_dataset(name)?;
@@ -34,7 +35,7 @@ impl Project {
         ))
     }
 
-    pub fn dataset(&self, name: &str) -> Result<Dataset, CatalogError> {
+    pub fn dataset(&self, name: &str) -> Result<Dataset, QueryError> {
         let meta = Catalog::new(self.engine.clone())
             .project(self.id)
             .open_dataset(name)?
@@ -50,13 +51,13 @@ impl Project {
         ))
     }
 
-    pub fn drop_dataset(&self, name: &str) -> Result<(), CatalogError> {
+    pub fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
         Catalog::new(self.engine.clone())
             .project(self.id)
             .drop_dataset(name)
     }
 
-    pub fn list_datasets(&self) -> Result<Vec<String>, CatalogError> {
+    pub fn list_datasets(&self) -> Result<Vec<String>, QueryError> {
         let metas = Catalog::new(self.engine.clone())
             .project(self.id)
             .list_datasets()?;

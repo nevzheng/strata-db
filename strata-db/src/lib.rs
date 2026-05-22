@@ -1,25 +1,19 @@
 pub mod catalog;
-pub mod codec;
-pub mod consts;
-pub mod dataset;
-pub mod db;
-pub mod ids;
-pub mod project;
 pub mod query;
-pub mod row;
-pub mod schema;
-pub mod tables;
-pub mod types;
+pub mod storage;
 
+pub use catalog::consts;
+pub use catalog::dataset::Dataset;
+pub use catalog::db::{Db, DbBuilder};
+pub use catalog::ids::{DatasetId, ProjectId, TableId};
+pub use catalog::project::Project;
+pub use catalog::schema::Schema;
+pub use catalog::tables::Table;
 pub use catalog::{CatalogError, ResourceKind};
-pub use codec::{Codec, DecodeError};
-pub use dataset::Dataset;
-pub use db::{Db, DbBuilder};
-pub use ids::{DatasetId, ProjectId, TableId};
-pub use project::Project;
-pub use query::{BinaryOperator, Expr, PhysicalPlan, PlanNode, QueryError};
-pub use row::{EncodingError, RowKey, next_after_prefix};
-pub use schema::Schema;
+pub use query::{
+    BinaryOperator, CodecError, Expr, PhysicalPlan, PlanNode, QueryContext, QueryError,
+};
+pub use storage::codec::{Codec, DecodeError};
+pub use storage::row::{EncodingError, RowKey, next_after_prefix};
+pub use storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 pub use strata::LevelConfig;
-pub use tables::{Table, TypedStore};
-pub use types::{Field, FieldName, LogicalType, Tuple, Value};

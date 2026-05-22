@@ -8,11 +8,12 @@ mod common;
 use strata_db::query::expression::{BinaryOperator, Expr};
 use strata_db::query::physical_plan::{PhysicalPlan, PlanNode};
 use strata_db::query::volcano::{Executor, NextRow, Operator};
-use strata_db::{Field, LogicalType, Schema, Table, Tuple, TypedStore, Value};
+use strata_db::{Field, LogicalType, Schema, Table, Tuple, Value};
 
 fn build_events_table(db: &strata_db::Db) -> Table {
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
+    // Column 0 (`id`) is the primary key by convention.
     let schema = Schema {
         fields: vec![
             Field::new("id", LogicalType::Int32),
@@ -21,27 +22,21 @@ fn build_events_table(db: &strata_db::Db) -> Table {
     };
     let table = dataset.create_table("events", schema).unwrap();
 
-    let rows = [
-        (b"a" as &[u8], 1i32, "alpha"),
-        (b"b", 2, "bravo"),
-        (b"c", 3, "charlie"),
-        (b"d", 4, "delta"),
-    ];
-    for (key, id, name) in rows {
-        table
-            .put(
-                key,
-                &Tuple {
-                    values: vec![Value::Int32(id), Value::Text(name.to_string())],
-                },
-            )
-            .unwrap();
+    let mut ctx = db.query_context();
+    for (id, name) in [(1i32, "alpha"), (2, "bravo"), (3, "charlie"), (4, "delta")] {
+        ctx.put(
+            &table,
+            &Tuple {
+                values: vec![Value::Int32(id), Value::Text(name.to_string())],
+            },
+        )
+        .unwrap();
     }
     table
 }
 
 /// Pull every row from an executor until it signals Done.
-fn drain(mut exec: Executor) -> Vec<Tuple> {
+fn drain(mut exec: Executor<'_>) -> Vec<Tuple> {
     let mut out = vec![];
     loop {
         match exec.next().unwrap() {
@@ -57,7 +52,8 @@ fn seq_scan_yields_every_row() {
     let table = build_events_table(&db);
 
     let plan = PhysicalPlan::new(PlanNode::SeqScan { table });
-    let rows = drain(Executor::new(plan).unwrap());
+    let ctx = db.query_context();
+    let rows = drain(Executor::new(plan, &ctx).unwrap());
 
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].values[0], Value::Int32(1));
@@ -74,7 +70,8 @@ fn filter_drops_non_matching_rows() {
         input: Box::new(PlanNode::SeqScan { table }),
         predicate: Expr::binary(BinaryOperator::Gt, Expr::column(0), Expr::lit(2i32)),
     });
-    let rows = drain(Executor::new(plan).unwrap());
+    let ctx = db.query_context();
+    let rows = drain(Executor::new(plan, &ctx).unwrap());
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values[0], Value::Int32(3));
@@ -91,7 +88,8 @@ fn project_picks_columns() {
         input: Box::new(PlanNode::SeqScan { table }),
         expressions: vec![Expr::column(1)],
     });
-    let rows = drain(Executor::new(plan).unwrap());
+    let ctx = db.query_context();
+    let rows = drain(Executor::new(plan, &ctx).unwrap());
 
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].values.len(), 1);
@@ -107,7 +105,8 @@ fn limit_caps_output() {
         input: Box::new(PlanNode::SeqScan { table }),
         count: 2,
     });
-    let rows = drain(Executor::new(plan).unwrap());
+    let ctx = db.query_context();
+    let rows = drain(Executor::new(plan, &ctx).unwrap());
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values[0], Value::Int32(1));
@@ -130,7 +129,8 @@ fn filter_then_project_then_limit_composes() {
         }),
         count: 2,
     });
-    let rows = drain(Executor::new(plan).unwrap());
+    let ctx = db.query_context();
+    let rows = drain(Executor::new(plan, &ctx).unwrap());
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values[0], Value::Text("bravo".into()));

@@ -17,7 +17,7 @@
 //! Decoding takes `&mut &[u8]` and advances it past the bytes consumed;
 //! short buffers surface as [`DecodeError::UnexpectedEof`].
 
-use crate::types::{LogicalType, Value};
+use crate::storage::types::{LogicalType, Value};
 
 #[derive(Debug)]
 pub enum DecodeError {

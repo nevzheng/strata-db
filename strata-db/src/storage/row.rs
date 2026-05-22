@@ -36,7 +36,7 @@
 
 use uuid::Uuid;
 
-use crate::ids::{DatasetId, ProjectId, TableId};
+use crate::catalog::ids::{DatasetId, ProjectId, TableId};
 
 const ID_BYTES: usize = 16;
 const PREFIX_BYTES: usize = ID_BYTES * 3;
