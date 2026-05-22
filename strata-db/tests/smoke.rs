@@ -1,13 +1,11 @@
 //! End-to-end smoke tests for the public `strata-db` API.
-//!
-//! Most tests here are `#[ignore]`'d until the catalog bodies are filled in.
-//! They double as targets for the implementation work — unignore each one
-//! when its code path stops panicking with `todo!()`.
 
 mod common;
 
-use serde_json::json;
-use strata_db::{CatalogError, Db, Field, FieldType, LevelConfig, ResourceKind, Schema};
+use strata_db::{
+    CatalogError, Db, Field, LevelConfig, LogicalType, ResourceKind, Schema, Tuple, TypedStore,
+    Value,
+};
 
 #[test]
 fn db_opens_from_empty_dir() {
@@ -28,7 +26,9 @@ fn create_dataset_and_table() {
     let (_tmp, db) = common::temp_db();
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
-    let schema = Schema::new(vec![Field::new("count", FieldType::Integer)]);
+    let schema = Schema {
+        fields: vec![Field::new("count", LogicalType::Int64)],
+    };
     let table = dataset.create_table("events", schema).unwrap();
     assert_eq!(table.name(), "events");
     assert_eq!(table.schema().fields.len(), 1);
@@ -39,11 +39,17 @@ fn put_and_get_row() {
     let (_tmp, db) = common::temp_db();
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
-    let table = dataset.create_table("events", Schema::empty()).unwrap();
+    let schema = Schema {
+        fields: vec![Field::new("v", LogicalType::Int64)],
+    };
+    let table = dataset.create_table("events", schema).unwrap();
 
-    table.put(b"k", json!({"v": 1})).unwrap();
+    let row = Tuple {
+        values: vec![Value::Int64(1)],
+    };
+    table.put(b"k", &row).unwrap();
     let got = table.get(b"k").unwrap();
-    assert_eq!(got, Some(json!({"v": 1})));
+    assert_eq!(got, Some(row));
 }
 
 #[test]
@@ -51,9 +57,19 @@ fn delete_removes_row() {
     let (_tmp, db) = common::temp_db();
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
-    let table = dataset.create_table("events", Schema::empty()).unwrap();
+    let schema = Schema {
+        fields: vec![Field::new("v", LogicalType::Int64)],
+    };
+    let table = dataset.create_table("events", schema).unwrap();
 
-    table.put(b"k", json!({"v": 1})).unwrap();
+    table
+        .put(
+            b"k",
+            &Tuple {
+                values: vec![Value::Int64(1)],
+            },
+        )
+        .unwrap();
     table.delete(b"k").unwrap();
     assert_eq!(table.get(b"k").unwrap(), None);
 }
@@ -103,8 +119,18 @@ fn data_survives_reopen() {
         let db = strata_db::Db::open(tmp.path()).unwrap();
         let project = db.create_project("acme").unwrap();
         let dataset = project.create_dataset("metrics").unwrap();
-        let table = dataset.create_table("events", Schema::empty()).unwrap();
-        table.put(b"k", json!({"v": 1})).unwrap();
+        let schema = Schema {
+            fields: vec![Field::new("v", LogicalType::Int64)],
+        };
+        let table = dataset.create_table("events", schema).unwrap();
+        table
+            .put(
+                b"k",
+                &Tuple {
+                    values: vec![Value::Int64(1)],
+                },
+            )
+            .unwrap();
     }
 
     let db = strata_db::Db::open(tmp.path()).unwrap();
@@ -115,7 +141,59 @@ fn data_survives_reopen() {
         .unwrap()
         .table("events")
         .unwrap();
-    assert_eq!(table.get(b"k").unwrap(), Some(json!({"v": 1})));
+    assert_eq!(
+        table.get(b"k").unwrap(),
+        Some(Tuple {
+            values: vec![Value::Int64(1)]
+        })
+    );
+}
+
+#[test]
+fn table_scan_returns_decoded_tuples() {
+    let (_tmp, db) = common::temp_db();
+    let project = db.create_project("acme").unwrap();
+    let dataset = project.create_dataset("metrics").unwrap();
+    let schema = Schema {
+        fields: vec![Field::new("v", LogicalType::Int64)],
+    };
+    let table = dataset.create_table("events", schema).unwrap();
+
+    for (k, v) in [("a:1", 1i64), ("a:2", 2), ("b:1", 3)] {
+        table
+            .put(
+                k.as_bytes(),
+                &Tuple {
+                    values: vec![Value::Int64(v)],
+                },
+            )
+            .unwrap();
+    }
+
+    // Empty prefix → every row, with the table prefix stripped from each key.
+    let mut all = table.scan(&[]).unwrap();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].0, b"a:1");
+    assert_eq!(
+        all[0].1,
+        Tuple {
+            values: vec![Value::Int64(1)]
+        }
+    );
+    assert_eq!(all[1].0, b"a:2");
+    assert_eq!(all[2].0, b"b:1");
+
+    // Prefix filter narrows the scan.
+    let a_rows = table.scan(b"a:").unwrap();
+    assert_eq!(a_rows.len(), 2);
+    for (k, _) in &a_rows {
+        assert!(k.starts_with(b"a:"));
+    }
+
+    // Prefix matching nothing returns an empty result.
+    let none = table.scan(b"z:").unwrap();
+    assert!(none.is_empty());
 }
 
 #[test]
@@ -139,22 +217,36 @@ fn rows_survive_forced_level_compaction() {
         .open(tmp.path())
         .unwrap();
 
+    let schema = Schema {
+        fields: vec![Field::new("i", LogicalType::Int64)],
+    };
     let table = db
         .create_project("acme")
         .unwrap()
         .create_dataset("metrics")
         .unwrap()
-        .create_table("events", Schema::empty())
+        .create_table("events", schema)
         .unwrap();
 
-    for i in 0..50u32 {
+    for i in 0..50i64 {
         table
-            .put(format!("k:{i:04}").as_bytes(), json!({ "i": i }))
+            .put(
+                format!("k:{i:04}").as_bytes(),
+                &Tuple {
+                    values: vec![Value::Int64(i)],
+                },
+            )
             .unwrap();
     }
 
-    for i in 0..50u32 {
+    for i in 0..50i64 {
         let got = table.get(format!("k:{i:04}").as_bytes()).unwrap();
-        assert_eq!(got, Some(json!({ "i": i })), "missing row {i}");
+        assert_eq!(
+            got,
+            Some(Tuple {
+                values: vec![Value::Int64(i)]
+            }),
+            "missing row {i}"
+        );
     }
 }

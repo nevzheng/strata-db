@@ -51,17 +51,19 @@ use uuid::uuid;
 
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
 use crate::ids::{DatasetId, ProjectId, TableId};
-use crate::schema::{Field, FieldType, Schema};
+use crate::schema::Schema;
+use crate::types::{Field, LogicalType};
 
-/// Schema used by all system tables for now: `{ name: String, uuid: String }`.
-/// Each system table will eventually get its own distinct schema (e.g.
-/// `_projects` should carry full `ProjectMeta` columns), but a single
-/// shared shape keeps the bootstrap simple while the surface is in flux.
-fn system_table_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("name", FieldType::String),
-        Field::new("uuid", FieldType::String),
-    ])
+/// Schema for every system table: a single `Json` column holding the
+/// serialized metadata blob.
+///
+/// This is the real on-disk shape — the catalog's `put_meta` /
+/// `get_meta` helpers encode and decode rows through this schema, just
+/// like user tables. "System tables are tables" is now literally true.
+pub(crate) fn system_table_schema() -> Schema {
+    Schema {
+        fields: vec![Field::new("meta", LogicalType::Json)],
+    }
 }
 
 // --- System project ---

@@ -4,6 +4,12 @@
 //! reserved system tables (`_system._catalog.{_projects,_datasets,_tables}`).
 //! Bootstrap relies on the constants in [`crate::consts`].
 //!
+//! Catalog rows ride the exact same pipeline as user data: the metadata
+//! blob becomes a `Tuple` with one `Value::Json` field, then
+//! [`Table::put`] / [`Table::get`] / [`Table::scan`] handle encoding
+//! through the system-table schema. There's no longer a separate
+//! "engine.put with raw bytes" path for system tables.
+//!
 //! ## Known gaps (intentional, scaffolded)
 //!
 //! - **No cascade on drop.** Dropping a project leaves its dataset and
@@ -15,12 +21,15 @@
 //!   current single-threaded use; engine-level CAS would close the gap.
 
 use crate::consts::{
-    CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, SYSTEM_PROJECT_ID, TABLES_TABLE_ID,
+    CATALOG_DATASET_ID, DATASETS_TABLE_ID, DATASETS_TABLE_NAME, PROJECTS_TABLE_ID,
+    PROJECTS_TABLE_NAME, SYSTEM_PROJECT_ID, TABLES_TABLE_ID, TABLES_TABLE_NAME,
+    system_table_schema,
 };
 use crate::db::SharedEngine;
 use crate::ids::{DatasetId, ProjectId, TableId};
-use crate::row::{RowKey, next_after_prefix};
 use crate::schema::Schema;
+use crate::tables::{Table, TypedStore};
+use crate::types::{Tuple, Value};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceKind {
@@ -57,100 +66,88 @@ pub(crate) struct TableMeta {
 
 // --- System-table helpers ---
 //
-// Every catalog op against a system table goes through one of these. They
-// centralize RowKey construction, JSON serialization, and the engine call
-// so the public methods stay small.
+// Thin wrappers around `Table`. Every helper builds a fresh `Table`
+// handle for the relevant system table and routes the call through it.
+// The typed-meta ↔ Tuple conversion lives in `meta_to_tuple` /
+// `tuple_to_meta` and is the only thing the catalog adds on top of the
+// generic table API.
+
+fn system_table(engine: &SharedEngine, id: TableId, name: &str) -> Table {
+    Table::new(
+        engine.clone(),
+        SYSTEM_PROJECT_ID,
+        CATALOG_DATASET_ID,
+        id,
+        name.to_string(),
+        system_table_schema(),
+    )
+}
+
+fn meta_to_tuple<T: serde::Serialize>(meta: &T) -> Result<Tuple, CatalogError> {
+    let json =
+        serde_json::to_value(meta).map_err(|e| CatalogError::InternalError(e.to_string()))?;
+    Ok(Tuple {
+        values: vec![Value::Json(json)],
+    })
+}
+
+fn tuple_to_meta<T: serde::de::DeserializeOwned>(tuple: Tuple) -> Result<T, CatalogError> {
+    let json = match tuple.values.into_iter().next() {
+        Some(Value::Json(j)) => j,
+        _ => {
+            return Err(CatalogError::InternalError(
+                "expected Json value in catalog row".into(),
+            ));
+        }
+    };
+    serde_json::from_value(json).map_err(|e| CatalogError::InternalError(e.to_string()))
+}
 
 fn put_meta<T: serde::Serialize>(
     engine: &SharedEngine,
-    system_table: TableId,
-    user_key: Vec<u8>,
+    table_id: TableId,
+    table_name: &str,
+    user_key: &[u8],
     meta: &T,
 ) -> Result<(), CatalogError> {
-    let row_key = RowKey::new(
-        SYSTEM_PROJECT_ID,
-        CATALOG_DATASET_ID,
-        system_table,
-        user_key,
-    );
-    let value = serde_json::to_vec(meta).map_err(|e| CatalogError::InternalError(e.to_string()))?;
-    engine
-        .lock()
-        .unwrap()
-        .put(&row_key.encode(), &value)
-        .map_err(|e| CatalogError::InternalError(e.to_string()))?;
-    Ok(())
+    let table = system_table(engine, table_id, table_name);
+    table.put(user_key, &meta_to_tuple(meta)?)
 }
 
 fn get_meta<T: serde::de::DeserializeOwned>(
     engine: &SharedEngine,
-    system_table: TableId,
-    user_key: Vec<u8>,
+    table_id: TableId,
+    table_name: &str,
+    user_key: &[u8],
 ) -> Result<Option<T>, CatalogError> {
-    let row_key = RowKey::new(
-        SYSTEM_PROJECT_ID,
-        CATALOG_DATASET_ID,
-        system_table,
-        user_key,
-    );
-    let raw = engine
-        .lock()
-        .unwrap()
-        .get(&row_key.encode())
-        .map_err(|e| CatalogError::InternalError(e.to_string()))?;
-    match raw {
+    let table = system_table(engine, table_id, table_name);
+    match table.get(user_key)? {
         None => Ok(None),
-        Some(bytes) => {
-            let meta = serde_json::from_slice(&bytes)
-                .map_err(|e| CatalogError::InternalError(e.to_string()))?;
-            Ok(Some(meta))
-        }
+        Some(tuple) => Ok(Some(tuple_to_meta(tuple)?)),
     }
 }
 
 fn delete_meta(
     engine: &SharedEngine,
-    system_table: TableId,
-    user_key: Vec<u8>,
+    table_id: TableId,
+    table_name: &str,
+    user_key: &[u8],
 ) -> Result<(), CatalogError> {
-    let row_key = RowKey::new(
-        SYSTEM_PROJECT_ID,
-        CATALOG_DATASET_ID,
-        system_table,
-        user_key,
-    );
-    engine
-        .lock()
-        .unwrap()
-        .delete(&row_key.encode())
-        .map_err(|e| CatalogError::InternalError(e.to_string()))?;
-    Ok(())
+    let table = system_table(engine, table_id, table_name);
+    table.delete(user_key)
 }
 
-/// Scan every row whose key starts with the given user-key prefix in a
-/// system table, decoding values as `T`.
-///
-/// NOTE: scan currently returns a fully-materialized Vec. Fine for the
-/// catalog (small, bounded). User-table scans will want an iterator once
-/// `strata::StorageEngine` supports streaming results.
 fn list_metas<T: serde::de::DeserializeOwned>(
     engine: &SharedEngine,
-    system_table: TableId,
+    table_id: TableId,
+    table_name: &str,
     user_key_prefix: &[u8],
 ) -> Result<Vec<T>, CatalogError> {
-    let mut prefix = RowKey::table_prefix(SYSTEM_PROJECT_ID, CATALOG_DATASET_ID, system_table);
-    prefix.extend_from_slice(user_key_prefix);
-    let entries = match next_after_prefix(&prefix) {
-        Some(end) => engine.lock().unwrap().scan(prefix..end),
-        None => engine.lock().unwrap().scan(prefix..),
-    }
-    .map_err(|e| CatalogError::InternalError(e.to_string()))?;
-
+    let table = system_table(engine, table_id, table_name);
+    let entries = table.scan(user_key_prefix)?;
     entries
         .into_iter()
-        .map(|(_, v)| {
-            serde_json::from_slice::<T>(&v).map_err(|e| CatalogError::InternalError(e.to_string()))
-        })
+        .map(|(_, tuple)| tuple_to_meta(tuple))
         .collect()
 }
 
@@ -179,14 +176,20 @@ impl Catalog {
         put_meta(
             &self.engine,
             PROJECTS_TABLE_ID,
-            name.as_bytes().to_vec(),
+            PROJECTS_TABLE_NAME,
+            name.as_bytes(),
             &meta,
         )?;
         Ok(meta)
     }
 
     pub(crate) fn open_project(&self, name: &str) -> Result<Option<ProjectMeta>, CatalogError> {
-        get_meta(&self.engine, PROJECTS_TABLE_ID, name.as_bytes().to_vec())
+        get_meta(
+            &self.engine,
+            PROJECTS_TABLE_ID,
+            PROJECTS_TABLE_NAME,
+            name.as_bytes(),
+        )
     }
 
     pub(crate) fn drop_project(&self, name: &str) -> Result<(), CatalogError> {
@@ -196,11 +199,16 @@ impl Catalog {
                 name: name.to_string(),
             });
         }
-        delete_meta(&self.engine, PROJECTS_TABLE_ID, name.as_bytes().to_vec())
+        delete_meta(
+            &self.engine,
+            PROJECTS_TABLE_ID,
+            PROJECTS_TABLE_NAME,
+            name.as_bytes(),
+        )
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, CatalogError> {
-        list_metas(&self.engine, PROJECTS_TABLE_ID, &[])
+        list_metas(&self.engine, PROJECTS_TABLE_ID, PROJECTS_TABLE_NAME, &[])
     }
 
     /// Narrow the catalog to a single project's scope for dataset operations.
@@ -237,12 +245,23 @@ impl CatalogProject {
             id: DatasetId::new(),
             name: name.to_string(),
         };
-        put_meta(&self.engine, DATASETS_TABLE_ID, self.user_key(name), &meta)?;
+        put_meta(
+            &self.engine,
+            DATASETS_TABLE_ID,
+            DATASETS_TABLE_NAME,
+            &self.user_key(name),
+            &meta,
+        )?;
         Ok(meta)
     }
 
     pub(crate) fn open_dataset(&self, name: &str) -> Result<Option<DatasetMeta>, CatalogError> {
-        get_meta(&self.engine, DATASETS_TABLE_ID, self.user_key(name))
+        get_meta(
+            &self.engine,
+            DATASETS_TABLE_ID,
+            DATASETS_TABLE_NAME,
+            &self.user_key(name),
+        )
     }
 
     pub(crate) fn drop_dataset(&self, name: &str) -> Result<(), CatalogError> {
@@ -252,11 +271,21 @@ impl CatalogProject {
                 name: name.to_string(),
             });
         }
-        delete_meta(&self.engine, DATASETS_TABLE_ID, self.user_key(name))
+        delete_meta(
+            &self.engine,
+            DATASETS_TABLE_ID,
+            DATASETS_TABLE_NAME,
+            &self.user_key(name),
+        )
     }
 
     pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, CatalogError> {
-        list_metas(&self.engine, DATASETS_TABLE_ID, self.project_id.as_bytes())
+        list_metas(
+            &self.engine,
+            DATASETS_TABLE_ID,
+            DATASETS_TABLE_NAME,
+            self.project_id.as_bytes(),
+        )
     }
 
     /// Narrow further to a single dataset's scope for table operations.
@@ -307,12 +336,23 @@ impl CatalogDataset {
             name: name.to_string(),
             schema,
         };
-        put_meta(&self.engine, TABLES_TABLE_ID, self.user_key(name), &meta)?;
+        put_meta(
+            &self.engine,
+            TABLES_TABLE_ID,
+            TABLES_TABLE_NAME,
+            &self.user_key(name),
+            &meta,
+        )?;
         Ok(meta)
     }
 
     pub(crate) fn open_table(&self, name: &str) -> Result<Option<TableMeta>, CatalogError> {
-        get_meta(&self.engine, TABLES_TABLE_ID, self.user_key(name))
+        get_meta(
+            &self.engine,
+            TABLES_TABLE_ID,
+            TABLES_TABLE_NAME,
+            &self.user_key(name),
+        )
     }
 
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
@@ -322,10 +362,20 @@ impl CatalogDataset {
                 name: name.to_string(),
             });
         }
-        delete_meta(&self.engine, TABLES_TABLE_ID, self.user_key(name))
+        delete_meta(
+            &self.engine,
+            TABLES_TABLE_ID,
+            TABLES_TABLE_NAME,
+            &self.user_key(name),
+        )
     }
 
     pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, CatalogError> {
-        list_metas(&self.engine, TABLES_TABLE_ID, &self.scope_prefix())
+        list_metas(
+            &self.engine,
+            TABLES_TABLE_ID,
+            TABLES_TABLE_NAME,
+            &self.scope_prefix(),
+        )
     }
 }
