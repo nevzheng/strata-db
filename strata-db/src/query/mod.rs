@@ -59,7 +59,7 @@ pub enum QueryError {
     /// Genuine catalog-domain errors: name lookups, duplicate creation.
     Catalog(CatalogError),
     /// Anything bubbling up from the storage engine.
-    Storage(strata::StorageError),
+    Storage(strata_store::StorageError),
     /// Tuple/value codec or catalog-metadata serde failures.
     Codec(CodecError),
     /// Invariant violation that the binder or planner should have
@@ -75,8 +75,8 @@ impl From<CatalogError> for QueryError {
     }
 }
 
-impl From<strata::StorageError> for QueryError {
-    fn from(e: strata::StorageError) -> Self {
+impl From<strata_store::StorageError> for QueryError {
+    fn from(e: strata_store::StorageError) -> Self {
         QueryError::Storage(e)
     }
 }
