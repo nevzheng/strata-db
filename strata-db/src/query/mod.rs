@@ -13,6 +13,8 @@
 //! projections.
 
 pub mod context;
+pub mod data;
+pub mod executor;
 pub mod expression;
 pub mod logical_plan;
 pub mod physical_plan;
@@ -20,12 +22,16 @@ pub mod planner;
 pub mod volcano;
 
 pub use context::QueryContext;
+pub use data::{Query, QueryStage};
+pub use executor::{ExecuteResult, Executor, RowResult, RowStream};
 pub use expression::{BinaryOperator, Expr};
 pub use logical_plan::{LogicalNode, LogicalPlan};
 pub use physical_plan::{PhysicalPlan, PlanNode};
-pub use planner::{Query, Stage, plan};
+pub use planner::Planner;
+pub use volcano::Volcano;
 
 use crate::catalog::CatalogError;
+use crate::sql::ParserError;
 use crate::storage::codec::DecodeError;
 
 /// Either side of the codec boundary: our binary codec (tuple/value
@@ -67,6 +73,9 @@ pub enum QueryError {
     Storage(strata_store::StorageError),
     /// Tuple/value codec or catalog-metadata serde failures.
     Codec(CodecError),
+    /// Failure to parse SQL text into an AST. A user error, not an
+    /// invariant violation — surface it back to the client verbatim.
+    Parse(ParserError),
     /// Invariant violation that the binder or planner should have
     /// caught — out-of-bounds column refs, type mismatches in already-
     /// type-checked expressions, schema-shape mismatches, and the like.
@@ -104,12 +113,19 @@ impl From<serde_json::Error> for QueryError {
     }
 }
 
+impl From<ParserError> for QueryError {
+    fn from(e: ParserError) -> Self {
+        QueryError::Parse(e)
+    }
+}
+
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryError::Catalog(e) => write!(f, "catalog: {e:?}"),
             QueryError::Storage(e) => write!(f, "storage: {e}"),
             QueryError::Codec(e) => write!(f, "codec: {e}"),
+            QueryError::Parse(e) => write!(f, "parse: {e}"),
             QueryError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }

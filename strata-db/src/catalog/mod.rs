@@ -70,14 +70,10 @@ pub(crate) struct TableMeta {
     pub schema: Schema,
 }
 
-/// One row per query executed within a project. The shape of `info` is
-/// deliberately freeform JSON for now — the planner will land first,
-/// then we'll decide what's worth promoting to typed columns
-/// (SQL text, timings, status, error, …).
-///
-/// Scaffolding: defined so the `_queries` system table is reserved
-/// alongside its meta shape. Read/write helpers land when the planner
-/// starts recording into it.
+/// One row per query executed within a project. `info` is freeform
+/// JSON until we know what's worth promoting to typed columns.
+/// Scaffolding — read/write helpers land when the planner records
+/// into it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct QueryMeta {
