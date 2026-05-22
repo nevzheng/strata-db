@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 reedline = "0.47"
+strata-db = { path = "../strata-db" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
