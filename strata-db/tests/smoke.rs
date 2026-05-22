@@ -3,7 +3,7 @@
 mod common;
 
 use strata_db::{
-    CatalogError, Db, Field, LevelConfig, LogicalType, ResourceKind, Schema, Tuple, TypedStore,
+    CatalogError, Db, Field, LevelConfig, LogicalType, QueryError, ResourceKind, Schema, Tuple,
     Value,
 };
 
@@ -39,16 +39,21 @@ fn put_and_get_row() {
     let (_tmp, db) = common::temp_db();
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
+    // Column 0 is the PK by convention.
     let schema = Schema {
-        fields: vec![Field::new("v", LogicalType::Int64)],
+        fields: vec![
+            Field::new("id", LogicalType::Text),
+            Field::new("v", LogicalType::Int64),
+        ],
     };
     let table = dataset.create_table("events", schema).unwrap();
 
     let row = Tuple {
-        values: vec![Value::Int64(1)],
+        values: vec![Value::Text("k".into()), Value::Int64(1)],
     };
-    table.put(b"k", &row).unwrap();
-    let got = table.get(b"k").unwrap();
+    let mut ctx = db.query_context();
+    ctx.put(&table, &row).unwrap();
+    let got = ctx.get(&table, &Value::Text("k".into())).unwrap();
     assert_eq!(got, Some(row));
 }
 
@@ -58,20 +63,23 @@ fn delete_removes_row() {
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
     let schema = Schema {
-        fields: vec![Field::new("v", LogicalType::Int64)],
+        fields: vec![
+            Field::new("id", LogicalType::Text),
+            Field::new("v", LogicalType::Int64),
+        ],
     };
     let table = dataset.create_table("events", schema).unwrap();
 
-    table
-        .put(
-            b"k",
-            &Tuple {
-                values: vec![Value::Int64(1)],
-            },
-        )
-        .unwrap();
-    table.delete(b"k").unwrap();
-    assert_eq!(table.get(b"k").unwrap(), None);
+    let mut ctx = db.query_context();
+    ctx.put(
+        &table,
+        &Tuple {
+            values: vec![Value::Text("k".into()), Value::Int64(1)],
+        },
+    )
+    .unwrap();
+    ctx.delete(&table, &Value::Text("k".into())).unwrap();
+    assert_eq!(ctx.get(&table, &Value::Text("k".into())).unwrap(), None);
 }
 
 #[test]
@@ -81,10 +89,10 @@ fn create_project_twice_is_already_exists() {
     let result = db.create_project("acme");
     assert!(matches!(
         result,
-        Err(CatalogError::AlreadyExists {
+        Err(QueryError::Catalog(CatalogError::AlreadyExists {
             kind: ResourceKind::Project,
             ..
-        })
+        }))
     ));
 }
 
@@ -94,10 +102,10 @@ fn drop_missing_project_is_not_found() {
     let result = db.drop_project("nope");
     assert!(matches!(
         result,
-        Err(CatalogError::NotFound {
+        Err(QueryError::Catalog(CatalogError::NotFound {
             kind: ResourceKind::Project,
             ..
-        })
+        }))
     ));
 }
 
@@ -120,17 +128,21 @@ fn data_survives_reopen() {
         let project = db.create_project("acme").unwrap();
         let dataset = project.create_dataset("metrics").unwrap();
         let schema = Schema {
-            fields: vec![Field::new("v", LogicalType::Int64)],
+            fields: vec![
+                Field::new("id", LogicalType::Text),
+                Field::new("v", LogicalType::Int64),
+            ],
         };
         let table = dataset.create_table("events", schema).unwrap();
-        table
-            .put(
-                b"k",
-                &Tuple {
-                    values: vec![Value::Int64(1)],
-                },
-            )
-            .unwrap();
+
+        let mut ctx = db.query_context();
+        ctx.put(
+            &table,
+            &Tuple {
+                values: vec![Value::Text("k".into()), Value::Int64(1)],
+            },
+        )
+        .unwrap();
     }
 
     let db = strata_db::Db::open(tmp.path()).unwrap();
@@ -141,66 +153,58 @@ fn data_survives_reopen() {
         .unwrap()
         .table("events")
         .unwrap();
+    let ctx = db.query_context();
     assert_eq!(
-        table.get(b"k").unwrap(),
+        ctx.get(&table, &Value::Text("k".into())).unwrap(),
         Some(Tuple {
-            values: vec![Value::Int64(1)]
+            values: vec![Value::Text("k".into()), Value::Int64(1)]
         })
     );
 }
 
 #[test]
-fn table_scan_returns_decoded_tuples() {
+fn scan_returns_inserted_rows() {
     let (_tmp, db) = common::temp_db();
     let project = db.create_project("acme").unwrap();
     let dataset = project.create_dataset("metrics").unwrap();
     let schema = Schema {
-        fields: vec![Field::new("v", LogicalType::Int64)],
+        fields: vec![
+            Field::new("id", LogicalType::Text),
+            Field::new("v", LogicalType::Int64),
+        ],
     };
     let table = dataset.create_table("events", schema).unwrap();
 
+    let mut ctx = db.query_context();
     for (k, v) in [("a:1", 1i64), ("a:2", 2), ("b:1", 3)] {
-        table
-            .put(
-                k.as_bytes(),
-                &Tuple {
-                    values: vec![Value::Int64(v)],
-                },
-            )
-            .unwrap();
+        ctx.put(
+            &table,
+            &Tuple {
+                values: vec![Value::Text(k.into()), Value::Int64(v)],
+            },
+        )
+        .unwrap();
     }
+    drop(ctx);
 
-    // Empty prefix → every row, with the table prefix stripped from each key.
-    let mut all = table.scan(&[]).unwrap();
-    all.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(all.len(), 3);
-    assert_eq!(all[0].0, b"a:1");
-    assert_eq!(
-        all[0].1,
-        Tuple {
-            values: vec![Value::Int64(1)]
-        }
-    );
-    assert_eq!(all[1].0, b"a:2");
-    assert_eq!(all[2].0, b"b:1");
-
-    // Prefix filter narrows the scan.
-    let a_rows = table.scan(b"a:").unwrap();
-    assert_eq!(a_rows.len(), 2);
-    for (k, _) in &a_rows {
-        assert!(k.starts_with(b"a:"));
-    }
-
-    // Prefix matching nothing returns an empty result.
-    let none = table.scan(b"z:").unwrap();
-    assert!(none.is_empty());
+    let ctx = db.query_context();
+    let mut tuples: Vec<Tuple> = ctx.scan(&table).collect::<Result<_, _>>().unwrap();
+    tuples.sort_by(|a, b| match (&a.values[0], &b.values[0]) {
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    assert_eq!(tuples.len(), 3);
+    assert_eq!(tuples[0].values[0], Value::Text("a:1".into()));
+    assert_eq!(tuples[0].values[1], Value::Int64(1));
+    assert_eq!(tuples[1].values[0], Value::Text("a:2".into()));
+    assert_eq!(tuples[2].values[0], Value::Text("b:1".into()));
 }
 
 #[test]
 fn rows_survive_forced_level_compaction() {
     // Tiny memtable + tight L0 forces writes to flush into L0 and then
     // cascade into L1. The public API should hide that — every row we
-    // wrote must still be readable through `table.get`.
+    // wrote must still be readable through `ctx.get`.
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::builder()
         .mem_capacity(128)
@@ -218,7 +222,10 @@ fn rows_survive_forced_level_compaction() {
         .unwrap();
 
     let schema = Schema {
-        fields: vec![Field::new("i", LogicalType::Int64)],
+        fields: vec![
+            Field::new("id", LogicalType::Text),
+            Field::new("i", LogicalType::Int64),
+        ],
     };
     let table = db
         .create_project("acme")
@@ -228,23 +235,25 @@ fn rows_survive_forced_level_compaction() {
         .create_table("events", schema)
         .unwrap();
 
+    let mut ctx = db.query_context();
     for i in 0..50i64 {
-        table
-            .put(
-                format!("k:{i:04}").as_bytes(),
-                &Tuple {
-                    values: vec![Value::Int64(i)],
-                },
-            )
-            .unwrap();
+        ctx.put(
+            &table,
+            &Tuple {
+                values: vec![Value::Text(format!("k:{i:04}")), Value::Int64(i)],
+            },
+        )
+        .unwrap();
     }
+    drop(ctx);
 
+    let ctx = db.query_context();
     for i in 0..50i64 {
-        let got = table.get(format!("k:{i:04}").as_bytes()).unwrap();
+        let got = ctx.get(&table, &Value::Text(format!("k:{i:04}"))).unwrap();
         assert_eq!(
             got,
             Some(Tuple {
-                values: vec![Value::Int64(i)]
+                values: vec![Value::Text(format!("k:{i:04}")), Value::Int64(i)]
             }),
             "missing row {i}"
         );

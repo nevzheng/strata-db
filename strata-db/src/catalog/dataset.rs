@@ -1,8 +1,9 @@
+use crate::catalog::db::SharedEngine;
+use crate::catalog::ids::{DatasetId, ProjectId};
+use crate::catalog::schema::Schema;
+use crate::catalog::tables::Table;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
-use crate::db::SharedEngine;
-use crate::ids::{DatasetId, ProjectId};
-use crate::schema::Schema;
-use crate::tables::Table;
+use crate::query::QueryError;
 
 pub struct Dataset {
     engine: SharedEngine,
@@ -38,13 +39,12 @@ impl Dataset {
         self.project_id
     }
 
-    pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, CatalogError> {
+    pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, QueryError> {
         let meta = Catalog::new(self.engine.clone())
             .project(self.project_id)
             .dataset(self.id)
             .create_table(name, schema)?;
         Ok(Table::new(
-            self.engine.clone(),
             self.project_id,
             self.id,
             meta.id,
@@ -53,7 +53,7 @@ impl Dataset {
         ))
     }
 
-    pub fn table(&self, name: &str) -> Result<Table, CatalogError> {
+    pub fn table(&self, name: &str) -> Result<Table, QueryError> {
         let meta = Catalog::new(self.engine.clone())
             .project(self.project_id)
             .dataset(self.id)
@@ -63,7 +63,6 @@ impl Dataset {
                 name: name.to_string(),
             })?;
         Ok(Table::new(
-            self.engine.clone(),
             self.project_id,
             self.id,
             meta.id,
@@ -72,14 +71,14 @@ impl Dataset {
         ))
     }
 
-    pub fn drop_table(&self, name: &str) -> Result<(), CatalogError> {
+    pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
         Catalog::new(self.engine.clone())
             .project(self.project_id)
             .dataset(self.id)
             .drop_table(name)
     }
 
-    pub fn list_tables(&self) -> Result<Vec<String>, CatalogError> {
+    pub fn list_tables(&self) -> Result<Vec<String>, QueryError> {
         let metas = Catalog::new(self.engine.clone())
             .project(self.project_id)
             .dataset(self.id)

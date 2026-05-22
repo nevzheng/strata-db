@@ -9,7 +9,7 @@
 //! pretty-printer can render them, a future JIT can walk the tree to
 //! emit code. Closures would be opaque to all of that.
 
-use crate::types::{Tuple, Value};
+use crate::storage::types::{Tuple, Value};
 
 use super::QueryError;
 
@@ -79,26 +79,24 @@ impl Expr {
     /// `AND` / `OR` short-circuit on `false` / `true` even with the
     /// other side `NULL`; otherwise they return `NULL`.
     ///
-    /// Type mismatches return [`QueryError::Type`] rather than
+    /// Type mismatches return [`QueryError::Internal`] rather than
     /// silently coercing — coercions can be added later when there's a
     /// type-checker to drive them.
     pub fn eval(&self, tuple: &Tuple) -> Result<Value, QueryError> {
         match self {
-            Expr::Column { index } => {
-                tuple
-                    .values
-                    .get(*index)
-                    .cloned()
-                    .ok_or(QueryError::ColumnIndex {
-                        index: *index,
-                        arity: tuple.values.len(),
-                    })
-            }
+            Expr::Column { index } => tuple.values.get(*index).cloned().ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "column index {index} out of bounds (arity {})",
+                    tuple.values.len()
+                ))
+            }),
             Expr::Literal { value } => Ok(value.clone()),
             Expr::Not { input } => match input.eval(tuple)? {
                 Value::Null => Ok(Value::Null),
                 Value::Bool(b) => Ok(Value::Bool(!b)),
-                other => Err(QueryError::Type(format!("NOT expects Bool, got {other:?}"))),
+                other => Err(QueryError::Internal(format!(
+                    "NOT expects Bool, got {other:?}"
+                ))),
             },
             Expr::Binary { op, lhs, rhs } => {
                 let l = lhs.eval(tuple)?;
@@ -136,13 +134,13 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
         GtEq => Ok(Value::Bool(cmp_values(&lhs, &rhs)?.is_ge())),
         And => match (lhs, rhs) {
             (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
-            (l, r) => Err(QueryError::Type(format!(
+            (l, r) => Err(QueryError::Internal(format!(
                 "AND expects Bool, got {l:?} / {r:?}"
             ))),
         },
         Or => match (lhs, rhs) {
             (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
-            (l, r) => Err(QueryError::Type(format!(
+            (l, r) => Err(QueryError::Internal(format!(
                 "OR expects Bool, got {l:?} / {r:?}"
             ))),
         },
@@ -159,7 +157,9 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
         (Value::Int32(a), Value::Int32(b)) => Ok(a.cmp(b)),
         (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        (l, r) => Err(QueryError::Type(format!("cannot compare {l:?} and {r:?}"))),
+        (l, r) => Err(QueryError::Internal(format!(
+            "cannot compare {l:?} and {r:?}"
+        ))),
     }
 }
 
@@ -237,16 +237,16 @@ mod tests {
     #[test]
     fn eval_type_mismatch_is_error() {
         let expr = Expr::binary(BinaryOperator::Lt, Expr::lit(true), Expr::lit(1i32));
-        assert!(matches!(expr.eval(&t(vec![])), Err(QueryError::Type(_))));
+        assert!(matches!(
+            expr.eval(&t(vec![])),
+            Err(QueryError::Internal(_))
+        ));
     }
 
     #[test]
     fn eval_column_index_out_of_bounds_is_error() {
         let tuple = t(vec![Value::Int32(0)]);
         let res = Expr::column(5).eval(&tuple);
-        assert!(matches!(
-            res,
-            Err(QueryError::ColumnIndex { index: 5, arity: 1 })
-        ));
+        assert!(matches!(res, Err(QueryError::Internal(_))));
     }
 }

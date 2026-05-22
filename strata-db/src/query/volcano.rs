@@ -10,10 +10,11 @@
 //! and a JIT backend (the whole pipeline becomes one compiled
 //! function) live elsewhere when they exist.
 
-use crate::tables::{Table, TypedStore};
-use crate::types::{Tuple, Value};
+use crate::catalog::tables::Table;
+use crate::storage::types::{Tuple, Value};
 
 use super::QueryError;
+use super::context::QueryContext;
 use super::expression::Expr;
 use super::physical_plan::{PhysicalPlan, PlanNode};
 
@@ -34,60 +35,145 @@ pub trait Operator {
 }
 
 /// Drives a [`PhysicalPlan`] to completion, one row at a time.
-pub struct Executor {
-    root: Box<dyn Operator>,
+pub struct Executor<'ctx> {
+    root: Box<dyn Operator + 'ctx>,
 }
 
-impl Executor {
-    pub fn new(plan: PhysicalPlan) -> Result<Self, QueryError> {
+impl<'ctx> Executor<'ctx> {
+    pub fn new(plan: PhysicalPlan, ctx: &'ctx QueryContext<'_>) -> Result<Self, QueryError> {
         Ok(Self {
-            root: build(plan.root)?,
+            root: build(plan.root, ctx)?,
         })
     }
 }
 
-impl Operator for Executor {
+impl Operator for Executor<'_> {
     fn next(&mut self) -> Result<NextRow, QueryError> {
         self.root.next()
     }
 }
 
 /// Recursively turn a plan tree into an operator tree.
-fn build(node: PlanNode) -> Result<Box<dyn Operator>, QueryError> {
+fn build<'ctx>(
+    node: PlanNode,
+    ctx: &'ctx QueryContext<'_>,
+) -> Result<Box<dyn Operator + 'ctx>, QueryError> {
     match node {
-        PlanNode::SeqScan { table } => Ok(Box::new(SeqScan::open(table)?)),
+        PlanNode::SeqScan { table } => Ok(Box::new(SeqScan::open(table, ctx)?)),
         PlanNode::Filter { input, predicate } => {
-            Ok(Box::new(Filter::new(build(*input)?, predicate)))
+            Ok(Box::new(Filter::new(build(*input, ctx)?, predicate)))
         }
         PlanNode::Project { input, expressions } => {
-            Ok(Box::new(Project::new(build(*input)?, expressions)))
+            Ok(Box::new(Project::new(build(*input, ctx)?, expressions)))
         }
-        PlanNode::Limit { input, count } => Ok(Box::new(Limit::new(build(*input)?, count))),
+        PlanNode::Limit { input, count } => Ok(Box::new(Limit::new(build(*input, ctx)?, count))),
+        PlanNode::Values { rows } => Ok(Box::new(Values {
+            rows: rows.into_iter(),
+        })),
+        // Write operators are executed via `execute()`; they're not
+        // valid as inner nodes because each write needs `&mut ctx`
+        // while the pull iterator chain only has `&ctx`.
+        PlanNode::Insert { .. } | PlanNode::Delete { .. } => Err(QueryError::Internal(
+            "Insert/Delete may only appear at the top of a plan; use volcano::execute".into(),
+        )),
     }
+}
+
+/// Outcome of running a plan: either a streaming row source (read
+/// queries) or a count of rows affected (writes).
+pub enum ExecuteResult<'ctx> {
+    Rows(Executor<'ctx>),
+    Affected(u64),
+}
+
+/// Run `plan` against `ctx`. Reads return a streaming [`Executor`];
+/// writes (`Insert`, `Delete`) drain their input first, then apply the
+/// writes — that decouples the read borrow from the write borrow of
+/// `ctx` and matches the usual snapshot semantics of `INSERT ... SELECT`.
+pub fn execute<'ctx>(
+    plan: PhysicalPlan,
+    ctx: &'ctx mut QueryContext<'_>,
+) -> Result<ExecuteResult<'ctx>, QueryError> {
+    match plan.root {
+        PlanNode::Insert { table, input } => {
+            let count = run_insert(&table, *input, ctx)?;
+            Ok(ExecuteResult::Affected(count))
+        }
+        PlanNode::Delete { table, input } => {
+            let count = run_delete(&table, *input, ctx)?;
+            Ok(ExecuteResult::Affected(count))
+        }
+        read_node => {
+            let exec = Executor::new(PhysicalPlan::new(read_node), &*ctx)?;
+            Ok(ExecuteResult::Rows(exec))
+        }
+    }
+}
+
+fn drain(input: PlanNode, ctx: &QueryContext<'_>) -> Result<Vec<Tuple>, QueryError> {
+    let mut exec = Executor::new(PhysicalPlan::new(input), ctx)?;
+    let mut out = Vec::new();
+    loop {
+        match exec.next()? {
+            NextRow::Row(t) => out.push(t),
+            NextRow::Done => return Ok(out),
+        }
+    }
+}
+
+fn run_insert(
+    table: &Table,
+    input: PlanNode,
+    ctx: &mut QueryContext<'_>,
+) -> Result<u64, QueryError> {
+    let tuples = drain(input, &*ctx)?;
+    let mut count = 0;
+    for tuple in &tuples {
+        ctx.put(table, tuple)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn run_delete(
+    table: &Table,
+    input: PlanNode,
+    ctx: &mut QueryContext<'_>,
+) -> Result<u64, QueryError> {
+    let tuples = drain(input, &*ctx)?;
+    let mut count = 0;
+    for tuple in &tuples {
+        let key = tuple.values.first().ok_or_else(|| {
+            QueryError::Internal("delete source has no primary-key column".into())
+        })?;
+        ctx.delete(table, key)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 // ----- Operators -----------------------------------------------------------
 
-/// Sequential scan over a base table. Iterates a `Vec` of pre-decoded
-/// tuples — `TypedStore::scan` collects rows under the engine's lock
-/// before this operator sees them.
-struct SeqScan {
-    rows: std::vec::IntoIter<(Vec<u8>, Tuple)>,
+/// Sequential scan over a base table. Pulls one decoded `Tuple` per
+/// `next()` straight from the engine cursor held in the query context
+/// — no intermediate buffering.
+struct SeqScan<'ctx> {
+    rows: Box<dyn Iterator<Item = Result<Tuple, QueryError>> + 'ctx>,
 }
 
-impl SeqScan {
-    fn open(table: Table) -> Result<Self, QueryError> {
-        let rows = table.scan(&[])?;
+impl<'ctx> SeqScan<'ctx> {
+    fn open(table: Table, ctx: &'ctx QueryContext<'_>) -> Result<Self, QueryError> {
         Ok(Self {
-            rows: rows.into_iter(),
+            rows: Box::new(ctx.scan(&table)),
         })
     }
 }
 
-impl Operator for SeqScan {
+impl Operator for SeqScan<'_> {
     fn next(&mut self) -> Result<NextRow, QueryError> {
         match self.rows.next() {
-            Some((_, tuple)) => Ok(NextRow::Row(tuple)),
+            Some(Ok(tuple)) => Ok(NextRow::Row(tuple)),
+            Some(Err(e)) => Err(e),
             None => Ok(NextRow::Done),
         }
     }
@@ -95,18 +181,18 @@ impl Operator for SeqScan {
 
 /// Filter: drop rows where the predicate isn't `Bool(true)`. A `NULL`
 /// predicate drops the row (matches SQL `WHERE`).
-struct Filter {
-    input: Box<dyn Operator>,
+struct Filter<'ctx> {
+    input: Box<dyn Operator + 'ctx>,
     predicate: Expr,
 }
 
-impl Filter {
-    fn new(input: Box<dyn Operator>, predicate: Expr) -> Self {
+impl<'ctx> Filter<'ctx> {
+    fn new(input: Box<dyn Operator + 'ctx>, predicate: Expr) -> Self {
         Self { input, predicate }
     }
 }
 
-impl Operator for Filter {
+impl Operator for Filter<'_> {
     fn next(&mut self) -> Result<NextRow, QueryError> {
         loop {
             match self.input.next()? {
@@ -123,18 +209,18 @@ impl Operator for Filter {
 
 /// Project: compute a new tuple per input row from a list of
 /// expressions. Output arity equals `expressions.len()`.
-struct Project {
-    input: Box<dyn Operator>,
+struct Project<'ctx> {
+    input: Box<dyn Operator + 'ctx>,
     expressions: Vec<Expr>,
 }
 
-impl Project {
-    fn new(input: Box<dyn Operator>, expressions: Vec<Expr>) -> Self {
+impl<'ctx> Project<'ctx> {
+    fn new(input: Box<dyn Operator + 'ctx>, expressions: Vec<Expr>) -> Self {
         Self { input, expressions }
     }
 }
 
-impl Operator for Project {
+impl Operator for Project<'_> {
     fn next(&mut self) -> Result<NextRow, QueryError> {
         match self.input.next()? {
             NextRow::Done => Ok(NextRow::Done),
@@ -149,14 +235,29 @@ impl Operator for Project {
     }
 }
 
+/// Values: yield each row from a pre-built `Vec`, then stop. Leaf
+/// operator — typically used as the source side of `Insert`.
+struct Values {
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+impl Operator for Values {
+    fn next(&mut self) -> Result<NextRow, QueryError> {
+        match self.rows.next() {
+            Some(t) => Ok(NextRow::Row(t)),
+            None => Ok(NextRow::Done),
+        }
+    }
+}
+
 /// Limit: yield at most `remaining` rows from the input, then stop.
-struct Limit {
-    input: Box<dyn Operator>,
+struct Limit<'ctx> {
+    input: Box<dyn Operator + 'ctx>,
     remaining: usize,
 }
 
-impl Limit {
-    fn new(input: Box<dyn Operator>, count: usize) -> Self {
+impl<'ctx> Limit<'ctx> {
+    fn new(input: Box<dyn Operator + 'ctx>, count: usize) -> Self {
         Self {
             input,
             remaining: count,
@@ -164,7 +265,7 @@ impl Limit {
     }
 }
 
-impl Operator for Limit {
+impl Operator for Limit<'_> {
     fn next(&mut self) -> Result<NextRow, QueryError> {
         if self.remaining == 0 {
             return Ok(NextRow::Done);

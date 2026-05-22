@@ -49,10 +49,10 @@
 
 use uuid::uuid;
 
+use crate::catalog::ids::{DatasetId, ProjectId, TableId};
+use crate::catalog::schema::Schema;
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
-use crate::ids::{DatasetId, ProjectId, TableId};
-use crate::schema::Schema;
-use crate::types::{Field, LogicalType};
+use crate::storage::types::{Field, LogicalType};
 
 /// Schema for every system table: a single `Json` column holding the
 /// serialized metadata blob.
