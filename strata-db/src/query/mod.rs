@@ -18,6 +18,7 @@ pub mod expression;
 pub mod logical_plan;
 pub mod physical_plan;
 pub mod planner;
+pub mod stages;
 pub mod volcano;
 
 pub use context::QueryContext;
@@ -29,40 +30,35 @@ pub use planner::Planner;
 pub use volcano::Volcano;
 
 use crate::catalog::CatalogError;
-use crate::sql::{ParserError, Statement};
+use crate::sql::ParserError;
 use crate::storage::codec::{DecodeError, KeyEncodeError};
 
-/// Where a [`Query`] is in the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+/// Where a [`Query`] is in the pipeline. Each variant carries the
+/// per-stage payload, so a stage and its data can't disagree — a
+/// [`QueryStage::Parsed`] always has an AST, etc.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum QueryStage {
-    #[default]
-    Created,
-    Parsed,
-    Bound,
-    Optimized,
-    Lowered,
+    Raw(stages::RawQuery),
+    Parsed(stages::ParsedQuery),
+    Analyzed(stages::AnalyzedQuery),
+    Logical(stages::LogicalQuery),
+    Physical(stages::PhysicalQuery),
 }
 
 /// The unit of work that flows through the planner, optimizer, and
-/// executor. Plain data, JSON-serializable so it can be persisted in
-/// the `_queries` system table.
+/// executor. The [`QueryStage`] carries pipeline-stage data; everything
+/// else on this struct is side-band — metadata, statistics, status
+/// fields will land here as they're needed. Plain data,
+/// JSON-serializable for the `_queries` system table.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Query {
-    pub sql: String,
     pub stage: QueryStage,
-    pub ast: Option<Vec<Statement>>,
-    pub logical_plan: Option<Vec<LogicalPlan>>,
-    pub physical_plan: Option<PhysicalPlan>,
 }
 
 impl Query {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
-            sql: sql.into(),
-            stage: QueryStage::Created,
-            ast: None,
-            logical_plan: None,
-            physical_plan: None,
+            stage: QueryStage::Raw(stages::RawQuery { sql: sql.into() }),
         }
     }
 }
@@ -165,9 +161,7 @@ impl From<ParserError> for QueryError {
 impl From<KeyEncodeError> for QueryError {
     fn from(e: KeyEncodeError) -> Self {
         match e {
-            KeyEncodeError::NullKey => {
-                QueryError::Internal("primary key cannot be null".into())
-            }
+            KeyEncodeError::NullKey => QueryError::Internal("primary key cannot be null".into()),
         }
     }
 }

@@ -1,67 +1,49 @@
-//! The planner.
+//! The planner — drives SQL through a typed pass pipeline.
 //!
-//! [`Planner::plan`] takes a [`Query`] and returns it populated with
-//! the physical execution plan.
+//! [`Planner::plan`] takes SQL text and returns a [`PhysicalQuery`] via
+//! `parse → analyze → build_logical → optimize_logical → lower → optimize_physical`.
+//! The `analyze` slot is an umbrella over the analysis substages —
+//! today just [`binder::Bind`], folded together under
+//! [`pass::Analyze`]. Construct via [`Planner::builder`].
+
+pub mod builder;
+pub mod pass;
+pub mod rule;
 
 mod binder;
+mod lower;
 
 use super::QueryContext;
 use super::QueryError;
-use super::{Query, QueryStage};
+use super::stages::{AnalyzedQuery, LogicalQuery, ParsedQuery, PhysicalQuery, RawQuery};
 
-pub struct Planner;
+pub use builder::{BuildError, PlannerBuilder};
 
-impl Planner {
-    pub fn plan(&self, mut query: Query, ctx: &mut QueryContext<'_>) -> Result<Query, QueryError> {
-        query.parse()?.bind(ctx)?.optimize()?.lower()?;
-        Ok(query)
-    }
+use pass::{OptimizeLogical, OptimizePhysical, Pass};
+
+pub struct Planner {
+    parse: Box<dyn Pass<Input = RawQuery, Output = ParsedQuery>>,
+    analyze: Box<dyn Pass<Input = ParsedQuery, Output = AnalyzedQuery>>,
+    build_logical: Box<dyn Pass<Input = AnalyzedQuery, Output = LogicalQuery>>,
+    optimize_logical: OptimizeLogical,
+    lower: Box<dyn Pass<Input = LogicalQuery, Output = PhysicalQuery>>,
+    optimize_physical: OptimizePhysical,
 }
 
-// Per-phase methods are private to this module — `Planner::plan` is the
-// only entry point. Tests inside this file still see them via `use super::*`.
-impl Query {
-    fn parse(&mut self) -> Result<&mut Self, QueryError> {
-        if self.ast.is_some() {
-            return Ok(self);
-        }
-        self.expect_stage(QueryStage::Created)?;
-        self.ast = Some(crate::sql::parse(&self.sql)?);
-        self.stage = QueryStage::Parsed;
-        Ok(self)
+impl Planner {
+    pub fn builder() -> PlannerBuilder {
+        PlannerBuilder::default()
     }
 
-    fn bind(&mut self, ctx: &mut QueryContext<'_>) -> Result<&mut Self, QueryError> {
-        binder::Binder::new(&*ctx).run(self)?;
-        Ok(self)
-    }
-
-    fn optimize(&mut self) -> Result<&mut Self, QueryError> {
-        if self.stage == QueryStage::Optimized || self.stage == QueryStage::Lowered {
-            return Ok(self);
-        }
-        self.expect_stage(QueryStage::Bound)?;
-        self.stage = QueryStage::Optimized;
-        Ok(self)
-    }
-
-    fn lower(&mut self) -> Result<&mut Self, QueryError> {
-        if self.physical_plan.is_some() {
-            return Ok(self);
-        }
-        self.expect_stage(QueryStage::Optimized)?;
-        self.stage = QueryStage::Lowered;
-        Ok(self)
-    }
-
-    fn expect_stage(&self, expected: QueryStage) -> Result<(), QueryError> {
-        if self.stage == expected {
-            Ok(())
-        } else {
-            Err(QueryError::Internal(format!(
-                "planner phase called in wrong order: expected stage {:?}, got {:?}",
-                expected, self.stage
-            )))
-        }
+    pub fn plan(&self, sql: &str, ctx: &QueryContext<'_>) -> Result<PhysicalQuery, QueryError> {
+        let q = RawQuery {
+            sql: sql.to_string(),
+        };
+        let q = self.parse.run(q, ctx)?;
+        let q = self.analyze.run(q, ctx)?;
+        let q = self.build_logical.run(q, ctx)?;
+        let q = self.optimize_logical.run(q, ctx)?;
+        let q = self.lower.run(q, ctx)?;
+        self.optimize_physical.run(q, ctx)
     }
 }

@@ -3,9 +3,9 @@
 
 use crate::storage::types::Tuple;
 
-use super::Query;
 use super::QueryContext;
 use super::QueryError;
+use super::physical_plan::PhysicalPlan;
 
 /// One row produced by an executor, or the error that prevented it.
 pub type RowResult = Result<Tuple, QueryError>;
@@ -41,7 +41,7 @@ pub enum ExecuteResult<'ctx> {
 pub trait Executor {
     fn execute<'ctx>(
         &self,
-        query: Query,
+        plan: PhysicalPlan,
         ctx: &'ctx mut QueryContext<'_>,
     ) -> Result<ExecuteResult<'ctx>, QueryError>;
 }

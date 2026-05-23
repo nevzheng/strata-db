@@ -1,8 +1,14 @@
-//! AST → logical plans.
+//! Bind substage + the AST walk that later phases reuse.
 //!
-//! Each sqlparser AST type implements [`Bind`] with its corresponding
-//! output. [`Binder`] carries shared state (catalog access, scope
-//! stack) and drives the bind phase on a [`Query`].
+//! Two things live here:
+//! - [`BindNode`], a trait implemented by each sqlparser AST type so it
+//!   produces its logical-plan fragment, with [`Binder`] carrying the
+//!   shared catalog handle and scope stack.
+//! - [`Bind`], one substage of analysis, run from
+//!   [`Analyze`](super::pass::Analyze). Today it forwards [`ParsedQuery`]
+//!   into [`AnalyzedQuery`] unchanged; name and type resolution will
+//!   land here. The AST → [`LogicalPlan`] walk above is consumed by
+//!   [`BuildLogical`](super::pass::BuildLogical) downstream.
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, Expr as AstExpr, GroupByExpr, Ident, Query as AstQuery,
@@ -11,11 +17,13 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::schema::Schema;
+use crate::query::stages::{AnalyzedQuery, ParsedQuery};
 use crate::storage::types::{Tuple, Value};
 
 use super::super::expression::{BinaryOperator, Expr};
 use super::super::logical_plan::{LogicalNode, LogicalPlan};
-use super::super::{Query, QueryContext, QueryError, QueryStage};
+use super::super::{QueryContext, QueryError};
+use super::pass::Pass;
 
 pub(super) struct Binder<'a, 'db> {
     ctx: &'a QueryContext<'db>,
@@ -37,22 +45,6 @@ impl<'a, 'db> Binder<'a, 'db> {
         }
     }
 
-    pub(super) fn run(&mut self, query: &mut Query) -> Result<(), QueryError> {
-        if query.logical_plan.is_some() {
-            return Ok(());
-        }
-        if query.stage != QueryStage::Parsed {
-            return Err(QueryError::Internal(format!(
-                "bind requires parsed query, got stage {:?}",
-                query.stage
-            )));
-        }
-        let plans = Bind::bind(&*query, self)?;
-        query.logical_plan = Some(plans);
-        query.stage = QueryStage::Bound;
-        Ok(())
-    }
-
     fn push_scope(&mut self, schema: Schema) {
         self.scopes.push(schema);
     }
@@ -65,34 +57,19 @@ impl<'a, 'db> Binder<'a, 'db> {
         self.scopes.last()
     }
 
-    fn ctx(&self) -> &QueryContext<'db> {
+    pub(super) fn ctx(&self) -> &QueryContext<'db> {
         self.ctx
     }
 }
 
-pub(super) trait Bind {
+pub(super) trait BindNode {
     type Output;
     fn bind(&self, binder: &mut Binder) -> Result<Self::Output, QueryError>;
 }
 
-// --- Query: iterate statements --------------------------------------------
-
-impl Bind for Query {
-    type Output = Vec<LogicalPlan>;
-
-    fn bind(&self, binder: &mut Binder) -> Result<Vec<LogicalPlan>, QueryError> {
-        self.ast
-            .as_ref()
-            .ok_or_else(|| QueryError::Internal("bind: ast missing".into()))?
-            .iter()
-            .map(|stmt| stmt.bind(binder))
-            .collect()
-    }
-}
-
 // --- Statement dispatch ----------------------------------------------------
 
-impl Bind for Statement {
+impl BindNode for Statement {
     type Output = LogicalPlan;
 
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
@@ -105,7 +82,7 @@ impl Bind for Statement {
 
 // --- Query → SetExpr → Select ----------------------------------------------
 
-impl Bind for AstQuery {
+impl BindNode for AstQuery {
     type Output = LogicalPlan;
 
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
@@ -121,7 +98,7 @@ impl Bind for AstQuery {
 
 // --- SELECT body: FROM + WHERE + projection --------------------------------
 
-impl Bind for Select {
+impl BindNode for Select {
     type Output = LogicalNode;
 
     fn bind(&self, binder: &mut Binder) -> Result<LogicalNode, QueryError> {
@@ -184,7 +161,7 @@ impl Bind for Select {
 
 // --- FROM relation (produces a source + the schema it exposes) -------------
 
-impl Bind for TableWithJoins {
+impl BindNode for TableWithJoins {
     type Output = (LogicalNode, Schema);
 
     fn bind(&self, binder: &mut Binder) -> Result<(LogicalNode, Schema), QueryError> {
@@ -223,7 +200,7 @@ impl Bind for TableWithJoins {
 
 // --- One projection item — may expand (wildcard → many) --------------------
 
-impl Bind for SelectItem {
+impl BindNode for SelectItem {
     type Output = Vec<Expr>;
 
     fn bind(&self, binder: &mut Binder) -> Result<Vec<Expr>, QueryError> {
@@ -245,7 +222,7 @@ impl Bind for SelectItem {
 
 // --- Scalar expression -----------------------------------------------------
 
-impl Bind for AstExpr {
+impl BindNode for AstExpr {
     type Output = Expr;
 
     fn bind(&self, binder: &mut Binder) -> Result<Expr, QueryError> {
@@ -309,4 +286,34 @@ fn bind_binary_op(op: &AstBinaryOperator) -> Result<BinaryOperator, QueryError> 
         AstBinaryOperator::Or => BinaryOperator::Or,
         other => return Err(QueryError::unsupported(format!("binary op: {other:?}"))),
     })
+}
+
+// --- Analysis Pass ---------------------------------------------------------
+
+/// Analysis substage in the planner pipeline. Forwards the parsed AST
+/// into [`AnalyzedQuery`] for now; name/type resolution will land here
+/// once we grow an annotated AST.
+pub(super) struct Bind;
+
+impl Pass for Bind {
+    type Input = ParsedQuery;
+    type Output = AnalyzedQuery;
+
+    fn name(&self) -> &'static str {
+        "bind"
+    }
+
+    fn run(&self, input: ParsedQuery, ctx: &QueryContext<'_>) -> Result<AnalyzedQuery, QueryError> {
+        let mut binder = Binder::new(ctx);
+        let logical: Vec<LogicalPlan> = input
+            .ast
+            .iter()
+            .map(|stmt| stmt.bind(&mut binder))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AnalyzedQuery {
+            sql: input.sql,
+            ast: input.ast,
+            logical,
+        })
+    }
 }

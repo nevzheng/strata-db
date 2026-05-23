@@ -1,18 +1,65 @@
-# Smoke specs. The server currently handles `SELECT 1` specifically and
-# returns OK for everything else — the executor isn't built yet. This file
-# exercises the wire path end-to-end: DDL/DML acknowledgements, a real row
-# coming back from a query, and a tear-down statement.
+# Server tests covering what the planner supports today.
+#
+# Today: literal SELECTs, comparison/logical expressions, and error
+# paths through parse / analysis / lowering. Real table queries arrive
+# once CREATE TABLE / INSERT / DROP land in the planner — those
+# statements currently surface as `statement error`.
 
-statement ok
-CREATE TABLE foo (a INT);
+# Literal SELECTs ------------------------------------------------------
 
-statement ok
-INSERT INTO foo VALUES (1);
-
-query I
+query T
 SELECT 1
 ----
 1
 
-statement ok
-DROP TABLE foo;
+query T
+SELECT 'hello'
+----
+hello
+
+query T
+SELECT true
+----
+t
+
+query T
+SELECT false
+----
+f
+
+# Boolean expressions --------------------------------------------------
+
+query T
+SELECT 1 = 1
+----
+t
+
+query T
+SELECT 1 < 2 AND 2 < 3
+----
+t
+
+query T
+SELECT NOT (1 = 2)
+----
+t
+
+# Error paths ----------------------------------------------------------
+
+# Catalog miss — table doesn't exist.
+statement error
+SELECT * FROM acme.metrics.events
+
+# Planner doesn't handle DISTINCT yet.
+statement error
+SELECT DISTINCT 1
+
+# DDL/DML aren't through the planner yet — they error today.
+statement error
+CREATE TABLE foo (a INT)
+
+statement error
+INSERT INTO foo VALUES (1)
+
+statement error
+DROP TABLE foo

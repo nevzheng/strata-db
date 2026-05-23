@@ -9,7 +9,6 @@ use crate::catalog::tables::Table;
 use crate::storage::table_api::ScanOptions;
 use crate::storage::types::{Tuple, Value};
 
-use super::Query;
 use super::QueryContext;
 use super::QueryError;
 use super::executor::{ExecuteResult, Executor, RowResult, RowStream};
@@ -21,14 +20,9 @@ pub struct Volcano;
 impl Executor for Volcano {
     fn execute<'ctx>(
         &self,
-        query: Query,
+        plan: PhysicalPlan,
         ctx: &'ctx mut QueryContext<'_>,
     ) -> Result<ExecuteResult<'ctx>, QueryError> {
-        let plan = query.physical_plan.ok_or_else(|| {
-            QueryError::Internal(
-                "execute: query has no physical_plan (call Query::plan first)".into(),
-            )
-        })?;
         run(plan, ctx)
     }
 }
