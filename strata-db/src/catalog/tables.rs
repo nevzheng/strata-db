@@ -6,6 +6,7 @@
 use crate::catalog::ids::{DatasetId, ProjectId, TableId};
 use crate::catalog::schema::Schema;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     project_id: ProjectId,
     dataset_id: DatasetId,

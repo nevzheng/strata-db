@@ -14,7 +14,7 @@ pub use catalog::{CatalogError, ResourceKind};
 pub use query::{
     BinaryOperator, CodecError, Expr, PhysicalPlan, PlanNode, QueryContext, QueryError,
 };
-pub use storage::codec::{Codec, DecodeError};
-pub use storage::row::{EncodingError, RowKey, next_after_prefix};
+pub use storage::codec::{DecodeError, KeyCodec, ValueCodec};
+pub use storage::row::{EncodingError, RowKey};
 pub use storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 pub use strata_store::LevelConfig;

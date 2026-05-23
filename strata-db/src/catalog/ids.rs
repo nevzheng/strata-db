@@ -47,3 +47,4 @@ macro_rules! id_newtype {
 id_newtype!(ProjectId);
 id_newtype!(DatasetId);
 id_newtype!(TableId);
+id_newtype!(QueryId);

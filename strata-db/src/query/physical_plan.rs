@@ -16,6 +16,7 @@ use super::expression::Expr;
 
 /// A physical plan: the root of an operator tree, plus future
 /// plan-level metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhysicalPlan {
     pub root: PlanNode,
 }
@@ -29,6 +30,7 @@ impl PhysicalPlan {
 /// One node of a physical plan tree. Each variant is a concrete
 /// operator with the algorithm baked in (e.g. `SeqScan` versus a
 /// hypothetical `IndexScan`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PlanNode {
     /// Read every tuple from a base table.
     SeqScan { table: Table },

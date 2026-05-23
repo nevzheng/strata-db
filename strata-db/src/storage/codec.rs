@@ -1,23 +1,47 @@
 //! Wire encoding for primitive logical types.
 //!
-//! The [`Codec`] trait is implemented once per primitive Rust type that
-//! backs a [`LogicalType`] variant (`bool`, `i16`, `i32`, `i64`,
-//! `String`). [`Value::encode`] / [`Value::decode`] dispatch to the
-//! matching impl via a single `match`, so adding a new logical type
-//! means: extend the enums, add one `impl Codec`, extend the match.
+//! Two codecs sit side by side, one per role:
+//!
+//! - [`ValueCodec`] — the in-row column encoding. Variable-length types
+//!   carry a `u32` length prefix so [`crate::catalog::schema::Schema`]
+//!   can decode columns positionally.
+//! - [`KeyCodec`] — the storage user-key encoding. Variable-length types
+//!   emit raw bytes with **no** length prefix, so the engine's lex
+//!   byte-sort matches the value's content sort. Required for prefix /
+//!   range scans to behave.
+//!
+//! Both traits are implemented once per primitive Rust type that backs a
+//! [`LogicalType`] variant. [`Value::encode`] / [`Value::decode`] /
+//! [`Value::encode_key`] dispatch to the matching impl via a single
+//! `match`, so adding a new logical type means: extend the enums, add
+//! the two `impl` blocks, extend the matches.
 //!
 //! Conventions:
 //!
-//! - Integers: little-endian, fixed width.
-//! - Bool: one byte, `0x00` / `0x01`. Other bytes are a decode error.
-//! - Text: `u32` little-endian length prefix, then UTF-8 bytes.
-//! - `Value::Null` is **not** encoded here — nulls are recorded in the
-//!   schema-level null bitmap by [`crate::schema::Schema::encode`].
+//! - Integers: little-endian, fixed width. Same bytes in both codecs.
+//! - Bool: one byte, `0x00` / `0x01`. Same in both codecs.
+//! - Text / Bytes / Json: length-prefixed by `ValueCodec`, raw by
+//!   `KeyCodec`.
+//! - `Value::Null` is **not** encoded by either codec — nulls are
+//!   recorded in the schema-level null bitmap by
+//!   [`crate::catalog::schema::Schema::encode`], and they cannot be used
+//!   as keys.
 //!
 //! Decoding takes `&mut &[u8]` and advances it past the bytes consumed;
-//! short buffers surface as [`DecodeError::UnexpectedEof`].
+//! short buffers surface as [`DecodeError::UnexpectedEof`]. `KeyCodec`
+//! is encode-only — single-column variable-length keys can't be
+//! decoded unambiguously without an end marker; composite-key decoding
+//! will land alongside composite keys.
 
 use crate::storage::types::{LogicalType, Value};
+
+/// Tried to encode a value as a key that has no meaningful key form.
+/// Today the only such case is `Value::Null`.
+#[derive(Debug)]
+pub enum KeyEncodeError {
+    /// `Value::Null` cannot be a key.
+    NullKey,
+}
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -33,17 +57,24 @@ pub enum DecodeError {
     TrailingBytes,
 }
 
-/// Encode/decode interface implemented once per primitive logical type.
+/// In-row column codec implemented once per primitive logical type.
 ///
 /// Each impl block holds the byte layout for one type — easier to read
 /// and extend than a single matched giant function.
-pub trait Codec: Sized {
+pub trait ValueCodec: Sized {
     fn encoded_size(&self) -> usize;
     fn encode(&self, buf: &mut Vec<u8>);
     fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError>;
 }
 
-impl Codec for bool {
+/// Storage user-key codec. Variable-length types emit raw bytes — no
+/// length prefix — so lex byte-sort matches content sort. Encode-only
+/// for now (see module docs).
+pub trait KeyCodec {
+    fn encode_key(&self, buf: &mut Vec<u8>);
+}
+
+impl ValueCodec for bool {
     fn encoded_size(&self) -> usize {
         1
     }
@@ -62,7 +93,7 @@ impl Codec for bool {
     }
 }
 
-impl Codec for i16 {
+impl ValueCodec for i16 {
     fn encoded_size(&self) -> usize {
         2
     }
@@ -77,7 +108,7 @@ impl Codec for i16 {
     }
 }
 
-impl Codec for i32 {
+impl ValueCodec for i32 {
     fn encoded_size(&self) -> usize {
         4
     }
@@ -92,7 +123,7 @@ impl Codec for i32 {
     }
 }
 
-impl Codec for i64 {
+impl ValueCodec for i64 {
     fn encoded_size(&self) -> usize {
         8
     }
@@ -107,7 +138,7 @@ impl Codec for i64 {
     }
 }
 
-impl Codec for String {
+impl ValueCodec for String {
     fn encoded_size(&self) -> usize {
         4 + self.len()
     }
@@ -126,7 +157,25 @@ impl Codec for String {
     }
 }
 
-impl Codec for serde_json::Value {
+impl ValueCodec for Vec<u8> {
+    fn encoded_size(&self) -> usize {
+        4 + self.len()
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        buf.extend_from_slice(self);
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let len_bytes = take(buf, 4)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let bytes = take(buf, len)?;
+        Ok(bytes.to_vec())
+    }
+}
+
+impl ValueCodec for serde_json::Value {
     fn encoded_size(&self) -> usize {
         // `to_vec` cannot fail for a well-formed `serde_json::Value`
         // unless it contains non-finite floats; we accept that as a panic
@@ -150,6 +199,55 @@ impl Codec for serde_json::Value {
     }
 }
 
+// --- KeyCodec impls ---
+//
+// Fixed-width types reuse the value encoding byte-for-byte. Variable-
+// length types drop the length prefix so lex byte-sort lines up with
+// content sort.
+
+impl KeyCodec for bool {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.push(if *self { 1 } else { 0 });
+    }
+}
+
+impl KeyCodec for i16 {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl KeyCodec for i32 {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl KeyCodec for i64 {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl KeyCodec for String {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.as_bytes());
+    }
+}
+
+impl KeyCodec for Vec<u8> {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self);
+    }
+}
+
+impl KeyCodec for serde_json::Value {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        let bytes = serde_json::to_vec(self).expect("serialize json value");
+        buf.extend_from_slice(&bytes);
+    }
+}
+
 impl Value {
     /// Bytes `encode` will append. `Null` is 0 — nulls live in the bitmap.
     pub fn encoded_size(&self) -> usize {
@@ -160,6 +258,7 @@ impl Value {
             Value::Int32(n) => n.encoded_size(),
             Value::Int64(n) => n.encoded_size(),
             Value::Text(s) => s.encoded_size(),
+            Value::Bytes(b) => b.encoded_size(),
             Value::Json(j) => j.encoded_size(),
         }
     }
@@ -176,7 +275,44 @@ impl Value {
             Value::Int32(n) => n.encode(buf),
             Value::Int64(n) => n.encode(buf),
             Value::Text(s) => s.encode(buf),
+            Value::Bytes(b) => b.encode(buf),
             Value::Json(j) => j.encode(buf),
+        }
+    }
+
+    /// Append the user-key encoding of `self` to `buf`. Errors on
+    /// `Null` — nulls have no key form.
+    pub fn encode_key(&self, buf: &mut Vec<u8>) -> Result<(), KeyEncodeError> {
+        match self {
+            Value::Null => Err(KeyEncodeError::NullKey),
+            Value::Bool(b) => {
+                b.encode_key(buf);
+                Ok(())
+            }
+            Value::Int16(n) => {
+                n.encode_key(buf);
+                Ok(())
+            }
+            Value::Int32(n) => {
+                n.encode_key(buf);
+                Ok(())
+            }
+            Value::Int64(n) => {
+                n.encode_key(buf);
+                Ok(())
+            }
+            Value::Text(s) => {
+                s.encode_key(buf);
+                Ok(())
+            }
+            Value::Bytes(b) => {
+                b.encode_key(buf);
+                Ok(())
+            }
+            Value::Json(j) => {
+                j.encode_key(buf);
+                Ok(())
+            }
         }
     }
 
@@ -189,6 +325,7 @@ impl Value {
             LogicalType::Int32 => Ok(Value::Int32(i32::decode(buf)?)),
             LogicalType::Int64 => Ok(Value::Int64(i64::decode(buf)?)),
             LogicalType::Text => Ok(Value::Text(String::decode(buf)?)),
+            LogicalType::Bytes => Ok(Value::Bytes(<Vec<u8>>::decode(buf)?)),
             LogicalType::Json => Ok(Value::Json(serde_json::Value::decode(buf)?)),
         }
     }
@@ -211,7 +348,7 @@ mod tests {
 
     /// Encode `v`, then decode and assert we get the same value back and
     /// consume every byte. `encoded_size` must match the written length.
-    fn roundtrip<T: Codec + PartialEq + std::fmt::Debug + Clone>(v: T) {
+    fn roundtrip<T: ValueCodec + PartialEq + std::fmt::Debug + Clone>(v: T) {
         let mut buf = Vec::new();
         v.encode(&mut buf);
         assert_eq!(

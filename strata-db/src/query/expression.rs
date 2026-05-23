@@ -15,7 +15,7 @@ use super::QueryError;
 
 /// Binary operators. These are the *constants* of the expression
 /// language — the verbs that combine two sub-expressions into one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOperator {
     // Comparison
     Eq,
@@ -31,7 +31,7 @@ pub enum BinaryOperator {
 
 /// A scalar expression. Each variant is a "basic operation" carrying
 /// its own data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     /// Reference column `index` in the input tuple.
     Column { index: usize },

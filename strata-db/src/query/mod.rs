@@ -1,27 +1,67 @@
 //! Query processing: planning and execution.
 //!
 //! A query passes through this module in stages: parse → bind → logical
-//! plan → optimize → physical plan → execute. Today only the physical
-//! plan and the (forthcoming) execution backends live here; a parser,
-//! binder, and logical planner will land alongside.
+//! plan → optimize → physical plan → execute. Today the logical and
+//! physical plans live here along with the execution backend; a parser
+//! and binder will land alongside.
 //!
-//! Two trees show up at this level. [`PhysicalPlan`] / [`PlanNode`]
-//! describe dataflow over rows — scans, filters, joins. [`Expr`]
+//! Two trees show up at this level. [`LogicalPlan`] / [`LogicalNode`]
+//! and [`PhysicalPlan`] / [`PlanNode`] describe dataflow over rows —
+//! the logical tree says *what*, the physical tree says *how*. [`Expr`]
 //! describes per-row computation — column refs, comparisons, boolean
 //! combinators — and lives inside plan nodes that need predicates or
 //! projections.
 
 pub mod context;
+pub mod executor;
 pub mod expression;
+pub mod logical_plan;
 pub mod physical_plan;
+pub mod planner;
+pub mod stages;
 pub mod volcano;
 
 pub use context::QueryContext;
+pub use executor::{ExecuteResult, Executor, RowResult, RowStream};
 pub use expression::{BinaryOperator, Expr};
+pub use logical_plan::{LogicalNode, LogicalPlan};
 pub use physical_plan::{PhysicalPlan, PlanNode};
+pub use planner::Planner;
+pub use volcano::Volcano;
 
 use crate::catalog::CatalogError;
-use crate::storage::codec::DecodeError;
+use crate::sql::ParserError;
+use crate::storage::codec::{DecodeError, KeyEncodeError};
+
+/// Where a [`Query`] is in the pipeline. Each variant carries the
+/// per-stage payload, so a stage and its data can't disagree — a
+/// [`QueryStage::Parsed`] always has an AST, etc.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum QueryStage {
+    Raw(stages::RawQuery),
+    Parsed(stages::ParsedQuery),
+    Analyzed(stages::AnalyzedQuery),
+    Logical(stages::LogicalQuery),
+    Physical(stages::PhysicalQuery),
+}
+
+/// The unit of work that flows through the planner, optimizer, and
+/// executor. The [`QueryStage`] carries pipeline-stage data; everything
+/// else on this struct is side-band — metadata, statistics, status
+/// fields will land here as they're needed. Plain data,
+/// JSON-serializable for the `_queries` system table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Query {
+    pub stage: QueryStage,
+}
+
+impl Query {
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            stage: QueryStage::Raw(stages::RawQuery { sql: sql.into() }),
+        }
+    }
+}
 
 /// Either side of the codec boundary: our binary codec (tuple/value
 /// encoding) or the serde-JSON path used by catalog metadata blobs.
@@ -62,11 +102,24 @@ pub enum QueryError {
     Storage(strata_store::StorageError),
     /// Tuple/value codec or catalog-metadata serde failures.
     Codec(CodecError),
+    /// Failure to parse SQL text into an AST. A user error, not an
+    /// invariant violation — surface it back to the client verbatim.
+    Parse(ParserError),
+    /// SQL feature the engine doesn't implement yet. Distinct from
+    /// `Internal` (bugs) and `Parse` (syntax) — the query is valid SQL,
+    /// we just haven't built that path.
+    Unsupported(String),
     /// Invariant violation that the binder or planner should have
     /// caught — out-of-bounds column refs, type mismatches in already-
     /// type-checked expressions, schema-shape mismatches, and the like.
     /// If this fires, it's a bug above us.
     Internal(String),
+}
+
+impl QueryError {
+    pub fn unsupported(what: impl Into<String>) -> Self {
+        Self::Unsupported(what.into())
+    }
 }
 
 impl From<CatalogError> for QueryError {
@@ -99,12 +152,28 @@ impl From<serde_json::Error> for QueryError {
     }
 }
 
+impl From<ParserError> for QueryError {
+    fn from(e: ParserError) -> Self {
+        QueryError::Parse(e)
+    }
+}
+
+impl From<KeyEncodeError> for QueryError {
+    fn from(e: KeyEncodeError) -> Self {
+        match e {
+            KeyEncodeError::NullKey => QueryError::Internal("primary key cannot be null".into()),
+        }
+    }
+}
+
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryError::Catalog(e) => write!(f, "catalog: {e:?}"),
             QueryError::Storage(e) => write!(f, "storage: {e}"),
             QueryError::Codec(e) => write!(f, "codec: {e}"),
+            QueryError::Parse(e) => write!(f, "parse: {e}"),
+            QueryError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             QueryError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }

@@ -27,10 +27,11 @@
 //!   _projects:        ffffffff-ffff-0000-0000-000000000001   ProjectId -> ProjectMeta
 //!   _datasets:        ffffffff-ffff-0000-0000-000000000002   (ProjectId, DatasetId) -> DatasetMeta
 //!   _tables:          ffffffff-ffff-0000-0000-000000000003   (ProjectId, DatasetId, TableId) -> TableMeta
+//!   _queries:         ffffffff-ffff-0000-0000-000000000004   (ProjectId, QueryId) -> QueryMeta
 //! ```
 //!
 //! Future system tables should pick the next available suffix
-//! (`...000000000004`, `...000000000005`, ...) so they remain distinct
+//! (`...000000000005`, `...000000000006`, ...) so they remain distinct
 //! [`TableId`]s within the catalog dataset.
 //!
 //! # Roles
@@ -54,15 +55,16 @@ use crate::catalog::schema::Schema;
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
 use crate::storage::types::{Field, LogicalType};
 
-/// Schema for every system table: a single `Json` column holding the
-/// serialized metadata blob.
-///
-/// This is the real on-disk shape — the catalog's `put_meta` /
-/// `get_meta` helpers encode and decode rows through this schema, just
-/// like user tables. "System tables are tables" is now literally true.
+/// Schema for every system table: a `Bytes` PK column carrying the
+/// composite natural key (project name, `(project_id, dataset_name)`,
+/// etc.) plus a `Json` blob with the serialized metadata. With this
+/// shape catalog reads and writes flow through the regular table API.
 pub(crate) fn system_table_schema() -> Schema {
     Schema {
-        fields: vec![Field::new("meta", LogicalType::Json)],
+        fields: vec![
+            Field::new("pk", LogicalType::Bytes),
+            Field::new("meta", LogicalType::Json),
+        ],
     }
 }
 
@@ -109,6 +111,14 @@ pub const TABLES_TABLE_NAME: &str = "_tables";
 
 /// Reserved [`TableId`] for the tables metadata table.
 pub const TABLES_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000003"));
+
+/// Display name of the table storing `QueryMeta` rows keyed by
+/// `(ProjectId, QueryId)`. One row per query executed, scoped to its
+/// project.
+pub const QUERIES_TABLE_NAME: &str = "_queries";
+
+/// Reserved [`TableId`] for the queries metadata table.
+pub const QUERIES_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000004"));
 
 // --- Pre-built metas ---
 //
@@ -157,6 +167,14 @@ pub(crate) fn tables_table_meta() -> TableMeta {
     TableMeta {
         id: TABLES_TABLE_ID,
         name: TABLES_TABLE_NAME.to_string(),
+        schema: system_table_schema(),
+    }
+}
+
+pub(crate) fn queries_table_meta() -> TableMeta {
+    TableMeta {
+        id: QUERIES_TABLE_ID,
+        name: QUERIES_TABLE_NAME.to_string(),
         schema: system_table_schema(),
     }
 }
