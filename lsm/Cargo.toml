@@ -7,6 +7,7 @@ edition = "2024"
 crc32fast = "1.5.0"
 fastbloom = "0.17.0"
 itertools = "0.14"
+journal = { path = "../journal" }
 thiserror = "2.0.18"
 
 [dev-dependencies]

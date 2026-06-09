@@ -1128,6 +1128,7 @@ dependencies = [
  "crc32fast",
  "fastbloom",
  "itertools 0.14.0",
+ "journal",
  "tempfile",
  "thiserror",
 ]

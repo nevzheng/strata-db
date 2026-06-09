@@ -51,3 +51,9 @@ impl From<std::io::Error> for LsmError {
         LsmError::Internal(e.to_string())
     }
 }
+
+impl From<journal::JournalError> for LsmError {
+    fn from(e: journal::JournalError) -> Self {
+        LsmError::Internal(e.to_string())
+    }
+}

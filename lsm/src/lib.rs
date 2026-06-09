@@ -15,6 +15,7 @@ mod key;
 mod memstore;
 mod storage;
 mod store;
+mod wal;
 
 pub use config::{
     BloomConfig, CachePolicy, LevelConfig, LsmConfig, PageCacheConfig, PageConfig, RunConfig,
@@ -32,6 +33,8 @@ pub use store::{MemStore, ReadStore, WriteStore};
 
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
+
+use wal::Wal;
 
 /// Globally-unique identity of an SSTable. The manifest and tree hold these;
 /// the filesystem and page cache resolve an id to the physical table — its
@@ -59,10 +62,11 @@ pub struct Level {
 
 /// The LSM tree — the live store you set and read values on.
 ///
-/// Writes land in the in-memory memtable; [`flush`](Lsm::flush) seals it into
-/// an on-disk L0 SSTable. Reads merge the memtable with the on-disk levels —
-/// resolved from their ids through the page cache — and return the newest
-/// version of each key. Generic over the memtable so it can be swapped.
+/// Writes are logged to the write-ahead journal, then land in the in-memory
+/// memtable; [`flush`](Lsm::flush) seals it into an on-disk L0 SSTable. Reads
+/// merge the memtable with the on-disk levels — resolved from their ids through
+/// the page cache — and return the newest version of each key. On open the
+/// journal is replayed to recover unflushed writes. Generic over the memtable.
 pub struct Lsm<M: MemStore = BTreeMemtable> {
     config: LsmConfig,
     dir: PathBuf,
@@ -71,30 +75,47 @@ pub struct Lsm<M: MemStore = BTreeMemtable> {
     levels: Vec<Level>,
     seq: u64,
     next_sst_id: u64,
+    journal: Wal,
 }
 
 impl<M: MemStore + Default> Lsm<M> {
     /// Open a tree rooted at `dir` with a default memtable.
-    pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Self {
+    pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Result<Self, LsmError> {
         Self::with_memtable(dir, config, M::default())
     }
 }
 
 impl<M: MemStore> Lsm<M> {
     /// Open a tree rooted at `dir` using `mem` as its memtable; SSTable files
-    /// live under `dir`.
-    pub fn with_memtable(dir: impl Into<PathBuf>, config: LsmConfig, mem: M) -> Self {
+    /// and the write-ahead journal live under `dir`. The journal is replayed
+    /// into the memtable to recover writes that hadn't been flushed.
+    pub fn with_memtable(
+        dir: impl Into<PathBuf>,
+        config: LsmConfig,
+        mut mem: M,
+    ) -> Result<Self, LsmError> {
+        let dir = dir.into();
         let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
         let cache = SstPageCache::new(config.page_cache);
-        Self {
+
+        let journal = Wal::open(dir.join("wal"))?;
+        let mut seq = 0;
+        for record in journal.replay()? {
+            let KeyValue { key, value } = record?;
+            seq = seq.max(key.seq);
+            mem.put(key, &value)?;
+        }
+
+        Ok(Self {
             config,
-            dir: dir.into(),
+            dir,
             cache,
             mem,
             levels,
-            seq: 0,
+            seq,
             next_sst_id: 0,
-        }
+            journal,
+        })
     }
 
     /// Insert or overwrite a value.
@@ -108,17 +129,28 @@ impl<M: MemStore> Lsm<M> {
     }
 
     fn write(&mut self, key: &[u8], value: &[u8], op: OpType) -> Result<(), LsmError> {
-        self.seq += 1;
         let ikey = InternalKey {
             user_key: key.to_vec(),
-            seq: self.seq,
+            seq: self.seq + 1,
             op,
         };
+        // Log durably before touching the memtable, so a crash can't lose an
+        // acknowledged write (write-ahead).
+        self.journal.append(&KeyValue {
+            key: ikey.clone(),
+            value: value.to_vec(),
+        })?;
         self.mem.put(ikey, value)?;
+        self.seq += 1;
         Ok(())
     }
 
     /// Seal the memtable into a new on-disk L0 SSTable and clear it.
+    ///
+    /// Note: the journal is *not* truncated here. Without a manifest, flushed
+    /// SSTables aren't rediscovered on open, so the journal must keep every
+    /// write for recovery. Truncation will move here once a manifest records
+    /// the on-disk levels.
     pub fn flush(&mut self) -> Result<(), LsmError> {
         // All versions (including tombstones), in InternalKey order.
         let entries: Vec<KeyValue> = self

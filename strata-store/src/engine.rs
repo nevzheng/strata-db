@@ -20,7 +20,7 @@ impl<M: MemStore> StorageEngine<M> {
     /// default level configuration. SSTable files live under `dir`.
     pub fn new(dir: &Path, mem: M) -> Result<Self, StorageError> {
         Ok(Self {
-            lsm: Lsm::with_memtable(dir, LsmConfig::default(), mem),
+            lsm: Lsm::with_memtable(dir, LsmConfig::default(), mem)?,
         })
     }
 
@@ -31,7 +31,7 @@ impl<M: MemStore> StorageEngine<M> {
             ..LsmConfig::default()
         };
         Ok(Self {
-            lsm: Lsm::with_memtable(dir, config, mem),
+            lsm: Lsm::with_memtable(dir, config, mem)?,
         })
     }
 
