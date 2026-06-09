@@ -34,9 +34,10 @@ pub struct SsTable {
 
 impl SsTable {
     /// Build a table from sorted entries, packing them into blocks of about
-    /// `config.page.page_size_bytes` and recording each block in the header.
+    /// `config.page.page_size_bytes`, padding each out to a page boundary so
+    /// blocks stay page-aligned, and recording each block in the header.
     pub fn build(sst_id: SsTableId, config: &TableConfig, entries: Vec<KeyValue>) -> Self {
-        let target = config.page.page_size_bytes;
+        let target = config.page.page_size_bytes.max(1);
         let mut data = Vec::new();
         let mut blocks = Vec::new();
 
@@ -63,6 +64,12 @@ impl SsTable {
                 offset,
                 len: (data.len() as u64 - offset) as u32,
             });
+
+            // Pad out to a page boundary so the next block starts page-aligned.
+            let rem = data.len() % target;
+            if rem != 0 {
+                data.resize(data.len() + (target - rem), 0);
+            }
         }
 
         let bloom = BloomFilter::build(
@@ -239,6 +246,19 @@ mod tests {
         );
         assert_eq!(t.header.range.min, b"a");
         assert_eq!(t.header.range.max, b"d");
+    }
+
+    #[test]
+    fn blocks_are_page_aligned() {
+        let t = table(); // page_size 24
+        for b in &t.header.blocks {
+            assert_eq!(
+                b.offset % 24,
+                0,
+                "block offset {} not page-aligned",
+                b.offset
+            );
+        }
     }
 
     #[test]
