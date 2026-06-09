@@ -30,7 +30,8 @@ pub use storage::{
 };
 pub use store::{MemStore, ReadStore, WriteStore};
 
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
+use std::path::PathBuf;
 
 /// Globally-unique identity of an SSTable. The manifest and tree hold these;
 /// the filesystem and page cache resolve an id to the physical table — its
@@ -58,24 +59,34 @@ pub struct Level {
 
 /// The LSM tree — the live store you set and read values on.
 ///
-/// Writes land in the in-memory `mem` buffer; reads check it first, then the
-/// on-disk `levels` (newest first). Generic over the memtable so it can be
-/// swapped (e.g. for a skip list).
+/// Writes land in the in-memory memtable; [`flush`](Lsm::flush) seals it into
+/// an on-disk L0 SSTable. Reads merge the memtable with the on-disk levels —
+/// resolved from their ids through the page cache — and return the newest
+/// version of each key. Generic over the memtable so it can be swapped.
 pub struct Lsm<M: MemStore = BTreeMemtable> {
     config: LsmConfig,
+    dir: PathBuf,
+    cache: SstPageCache,
     mem: M,
     levels: Vec<Level>,
     seq: u64,
+    next_sst_id: u64,
 }
 
 impl<M: MemStore + Default> Lsm<M> {
-    /// Create an empty tree with the given configuration.
-    pub fn new(config: LsmConfig) -> Self {
+    /// Open a tree rooted at `dir` with the given configuration; SSTable
+    /// files live under `dir`.
+    pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Self {
+        let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
+        let cache = SstPageCache::new(config.page_cache);
         Self {
             config,
+            dir: dir.into(),
+            cache,
             mem: M::default(),
-            levels: Vec::new(),
+            levels,
             seq: 0,
+            next_sst_id: 0,
         }
     }
 
@@ -100,15 +111,48 @@ impl<M: MemStore + Default> Lsm<M> {
         Ok(())
     }
 
-    /// Latest value for `key`, or `None` if absent or deleted.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, LsmError> {
-        // The memtable holds the newest versions; on-disk levels are searched
-        // after it once flushing is in place.
-        Ok(self.mem.get_at(key, u64::MAX)?)
+    /// Seal the memtable into a new on-disk L0 SSTable and clear it.
+    pub fn flush(&mut self) -> Result<(), LsmError> {
+        // All versions (including tombstones), in InternalKey order.
+        let entries: Vec<KeyValue> = self
+            .mem
+            .scan_at(.., u64::MAX)
+            .map(|r| r.map(|(key, value)| KeyValue { key, value }))
+            .collect::<Result<_, _>>()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let id = SsTableId(self.next_sst_id);
+        self.next_sst_id += 1;
+        let table_cfg = self
+            .config
+            .levels
+            .first()
+            .map(|l| l.table.clone())
+            .unwrap_or_default();
+        SsTable::write(id, &self.dir, &table_cfg, entries)?;
+
+        if self.levels.is_empty() {
+            self.levels.push(Level::default());
+        }
+        // Newest run first within L0.
+        self.levels[0].runs.insert(0, Run { files: vec![id] });
+        self.mem.clear();
+        Ok(())
     }
 
-    /// Scan a key range, yielding the newest version of each key in order,
-    /// with tombstones dropped.
+    /// Latest value for `key`, or `None` if absent or deleted.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, LsmError> {
+        let probe = key.to_vec();
+        match self.scan_at(probe.clone()..=probe, self.seq).next() {
+            Some(Ok((_, value))) => Ok(Some(value)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Scan a key range, newest version per key, tombstones dropped.
     pub fn scan(&self, range: impl RangeBounds<Vec<u8>>) -> ScanIterator<'_> {
         self.scan_at(range, self.seq)
     }
@@ -118,15 +162,39 @@ impl<M: MemStore + Default> Lsm<M> {
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
 
-        // One source today — the memtable; on-disk level streams merge into
-        // this same `Vec` once flushing populates them.
-        let mem: KvStream<'_> = Box::new(
-            self.mem
-                .scan_at((start, end), max_seq)
-                .map(|r| r.map(|(key, value)| KeyValue { key, value })),
-        );
+        // Each source is a sorted, owned stream: the memtable, then every
+        // on-disk file whose key range overlaps the query.
+        let mut sources: Vec<std::vec::IntoIter<Result<KeyValue, ReadError>>> = Vec::new();
 
-        let merged = MergeIterator::new(vec![mem], |a, b| match (a, b) {
+        let mem: Vec<Result<KeyValue, ReadError>> = self
+            .mem
+            .scan_at((start.clone(), end.clone()), max_seq)
+            .map(|r| r.map(|(key, value)| KeyValue { key, value }))
+            .collect();
+        sources.push(mem.into_iter());
+
+        for level in &self.levels {
+            for run in &level.runs {
+                for &id in &run.files {
+                    let table = match SsTable::open(id, &self.dir, &self.cache) {
+                        Ok(table) => table,
+                        Err(e) => {
+                            sources.push(vec![Err(read_err(e))].into_iter());
+                            continue;
+                        }
+                    };
+                    if !overlaps(&table.header().range, &start, &end) {
+                        continue;
+                    }
+                    let block: Vec<Result<KeyValue, ReadError>> = table
+                        .scan((start.clone(), end.clone()), max_seq, &self.cache)
+                        .collect();
+                    sources.push(block.into_iter());
+                }
+            }
+        }
+
+        let merged = MergeIterator::new(sources, |a, b| match (a, b) {
             (Ok(x), Ok(y)) => x.key.cmp(&y.key),
             (Err(_), Ok(_)) => std::cmp::Ordering::Less,
             (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
@@ -145,4 +213,23 @@ impl<M: MemStore + Default> Lsm<M> {
     pub fn levels(&self) -> &[Level] {
         &self.levels
     }
+}
+
+fn read_err(e: LsmError) -> ReadError {
+    ReadError::Internal(e.to_string())
+}
+
+/// Whether a table's `[min, max]` could hold any key in the query range.
+fn overlaps(range: &KeyRange, start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> bool {
+    let below = match end {
+        Bound::Included(e) => range.min.as_slice() > e.as_slice(),
+        Bound::Excluded(e) => range.min.as_slice() >= e.as_slice(),
+        Bound::Unbounded => false,
+    };
+    let above = match start {
+        Bound::Included(s) => range.max.as_slice() < s.as_slice(),
+        Bound::Excluded(s) => range.max.as_slice() <= s.as_slice(),
+        Bound::Unbounded => false,
+    };
+    !(below || above)
 }
