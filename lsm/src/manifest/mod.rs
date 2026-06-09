@@ -35,6 +35,13 @@
 //! land in later stages; this module is the in-memory model the journal will
 //! carry.)
 
+mod codec;
+mod manager;
+
+// Staged: wired into the tree's open/flush path in the next stage.
+#[allow(unused_imports)]
+pub(crate) use manager::ManifestManager;
+
 use crate::SsTableId;
 
 /// Identity of a run within the tree.
