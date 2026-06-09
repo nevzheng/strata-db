@@ -74,16 +74,23 @@ pub struct Lsm<M: MemStore = BTreeMemtable> {
 }
 
 impl<M: MemStore + Default> Lsm<M> {
-    /// Open a tree rooted at `dir` with the given configuration; SSTable
-    /// files live under `dir`.
+    /// Open a tree rooted at `dir` with a default memtable.
     pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Self {
+        Self::with_memtable(dir, config, M::default())
+    }
+}
+
+impl<M: MemStore> Lsm<M> {
+    /// Open a tree rooted at `dir` using `mem` as its memtable; SSTable files
+    /// live under `dir`.
+    pub fn with_memtable(dir: impl Into<PathBuf>, config: LsmConfig, mem: M) -> Self {
         let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
         let cache = SstPageCache::new(config.page_cache);
         Self {
             config,
             dir: dir.into(),
             cache,
-            mem: M::default(),
+            mem,
             levels,
             seq: 0,
             next_sst_id: 0,

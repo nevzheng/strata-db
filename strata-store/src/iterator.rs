@@ -58,7 +58,7 @@ mod tests {
     fn scan_surfaces_errors_inline() {
         let items: Vec<Result<KVPair, StorageError>> = vec![
             Ok((b"a".to_vec(), b"1".to_vec())),
-            Err(LsmError::InternalError("boom".into()).into()),
+            Err(LsmError::Internal("boom".into()).into()),
             Ok((b"b".to_vec(), b"2".to_vec())),
         ];
         let mut scan = ScanIterator::new(items.into_iter());

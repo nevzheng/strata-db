@@ -25,6 +25,11 @@ impl Default for BTreeMemtable {
 }
 
 impl BTreeMemtable {
+    /// A memtable with the default capacity.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Hold up to `capacity` bytes before signalling [`WriteError::StoreFull`].
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
