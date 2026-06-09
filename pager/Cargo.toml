@@ -1,0 +1,15 @@
+[package]
+name = "pager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# CRC32c (Castagnoli) — the page-header checksum the storage-foundations design
+# specifies: hardware-accelerated on x86-64/ARM, as used by PostgreSQL and RocksDB.
+# Note: this is *not* the same polynomial as `crc32fast` (IEEE) used by the journal.
+crc32c = "0.6"
+journal = { path = "../journal" }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"

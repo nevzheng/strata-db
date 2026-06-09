@@ -1,0 +1,56 @@
+//! Errors for the page system.
+
+use crate::PageId;
+use thiserror::Error;
+
+/// Anything that can go wrong reading, writing, or interpreting a page.
+#[derive(Debug, Error)]
+pub enum PageError {
+    /// A failure in the backing store (the `Vfs`).
+    #[error("vfs i/o error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A page read back from disk failed CRC32c verification — it is corrupt or
+    /// was torn by a crash mid-write.
+    #[error("page {0:?} failed checksum verification (corrupt or torn)")]
+    Checksum(PageId),
+
+    /// The bytes do not begin with the `STDB` magic — not a strata-db page.
+    #[error("not a strata-db page: bad magic")]
+    BadMagic,
+
+    /// The page header version is one this build does not understand.
+    #[error("unsupported page header version {0}")]
+    BadHeaderVersion(u8),
+
+    /// A page-type handler was pointed at a page of a different type.
+    #[error("expected page type {expected}, found {got}")]
+    BadPageType { expected: u16, got: u16 },
+
+    /// Every frame in the pool is pinned, so no page can be loaded. The caller
+    /// is holding too many pages at once for the configured pool size.
+    #[error("page cache exhausted: all {0} frames are pinned")]
+    PoolExhausted(usize),
+
+    /// A latch conflict: the page is already held in an incompatible mode
+    /// (a writer excludes all others; a reader excludes writers).
+    #[error("page {0:?} is locked by another handle")]
+    Busy(PageId),
+
+    /// A block buffer handed to the `Vfs` was not exactly [`BLOCK_SIZE`] bytes.
+    ///
+    /// [`BLOCK_SIZE`]: crate::BLOCK_SIZE
+    #[error("block buffer must be {expected} bytes, got {got}")]
+    BadBlockSize { expected: usize, got: usize },
+
+    /// A `TEXT` page chain did not decode to valid UTF-8.
+    #[error("text value is not valid utf-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+
+    /// A failure in the page journal (append, replay, or recovery).
+    #[error("journal error: {0}")]
+    Journal(#[from] ::journal::JournalError),
+}
+
+/// Result alias for the crate.
+pub type Result<T> = std::result::Result<T, PageError>;
