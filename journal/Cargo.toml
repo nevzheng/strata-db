@@ -1,0 +1,11 @@
+[package]
+name = "journal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast = "1.4"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"
