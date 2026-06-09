@@ -181,7 +181,10 @@ fn write_sstable_file(
 ///
 /// Each file is named `{id}.sst` in `dir`. IDs start at `start_id` and
 /// increment. A footer with min/max keys and data size is appended to each file.
-pub fn write_sstables(
+///
+/// Crate-internal: callers go through [`SsTableWriter`], which layers
+/// id allocation and transactional manifest updates on top.
+pub(crate) fn write_sstables(
     dir: &Path,
     start_id: u64,
     max_file_size: usize,
