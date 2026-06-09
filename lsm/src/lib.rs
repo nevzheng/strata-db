@@ -12,10 +12,11 @@ mod config;
 mod error;
 mod iterator;
 mod key;
+mod manifest;
 mod memstore;
+mod memtable_journal;
 mod storage;
 mod store;
-mod wal;
 
 pub use config::{
     BloomConfig, CachePolicy, LevelConfig, LsmConfig, PageCacheConfig, PageConfig, RunConfig,
@@ -24,6 +25,7 @@ pub use config::{
 pub use error::{LsmError, ReadError, WriteError};
 pub use iterator::{KvStream, MergeIterator, ScanIterator};
 pub use key::{InternalKey, KVPair, KeyRange, KeyValue, OpType};
+pub use manifest::{ManifestEdit, ManifestOp, RunDescriptor, RunId, Version};
 pub use memstore::BTreeMemtable;
 pub use storage::{
     BloomFilter, DataBlock, Decode, DecodeError, Encode, Header, Page, PageId, SsTable,
@@ -34,7 +36,7 @@ pub use store::{MemStore, ReadStore, WriteStore};
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
 
-use wal::Wal;
+use memtable_journal::MemtableJournal;
 
 /// Globally-unique identity of an SSTable. The manifest and tree hold these;
 /// the filesystem and page cache resolve an id to the physical table — its
@@ -62,7 +64,7 @@ pub struct Level {
 
 /// The LSM tree — the live store you set and read values on.
 ///
-/// Writes are logged to the write-ahead journal, then land in the in-memory
+/// Writes are logged to the memtable journal, then land in the in-memory
 /// memtable; [`flush`](Lsm::flush) seals it into an on-disk L0 SSTable. Reads
 /// merge the memtable with the on-disk levels — resolved from their ids through
 /// the page cache — and return the newest version of each key. On open the
@@ -75,7 +77,7 @@ pub struct Lsm<M: MemStore = BTreeMemtable> {
     levels: Vec<Level>,
     seq: u64,
     next_sst_id: u64,
-    journal: Wal,
+    journal: MemtableJournal,
 }
 
 impl<M: MemStore + Default> Lsm<M> {
@@ -87,8 +89,8 @@ impl<M: MemStore + Default> Lsm<M> {
 
 impl<M: MemStore> Lsm<M> {
     /// Open a tree rooted at `dir` using `mem` as its memtable; SSTable files
-    /// and the write-ahead journal live under `dir`. The journal is replayed
-    /// into the memtable to recover writes that hadn't been flushed.
+    /// and the memtable journal live under `dir`. The journal is replayed into
+    /// the memtable to recover writes that hadn't been flushed.
     pub fn with_memtable(
         dir: impl Into<PathBuf>,
         config: LsmConfig,
@@ -98,7 +100,7 @@ impl<M: MemStore> Lsm<M> {
         let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
         let cache = SstPageCache::new(config.page_cache);
 
-        let journal = Wal::open(dir.join("wal"))?;
+        let journal = MemtableJournal::open(dir.join("memtable.jrnl"))?;
         let mut seq = 0;
         for record in journal.replay()? {
             let KeyValue { key, value } = record?;
@@ -135,7 +137,7 @@ impl<M: MemStore> Lsm<M> {
             op,
         };
         // Log durably before touching the memtable, so a crash can't lose an
-        // acknowledged write (write-ahead).
+        // acknowledged write.
         self.journal.append(&KeyValue {
             key: ikey.clone(),
             value: value.to_vec(),
