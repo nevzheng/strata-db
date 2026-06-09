@@ -6,16 +6,23 @@ use std::ops::RangeBounds;
 
 use crate::error::{LsmError, ReadError};
 use crate::key::{KVPair, KeyValue, OpType};
+use crate::storage::SstPageCache;
 
 /// A boxed, sorted stream of versioned records — what every scannable node
 /// yields, and what merges and concats compose.
 pub type KvStream<'a> = Box<dyn Iterator<Item = Result<KeyValue, ReadError>> + 'a>;
 
 /// A node that produces a sorted [`KvStream`] over a key range as of
-/// `max_seq`. Implemented across the hierarchy (SsTable → Run → Level → Lsm);
-/// a merge or concat of `KvStream`s is itself a `KvStream`, so nodes nest.
+/// `max_seq`, reading any on-disk blocks through `cache`. Implemented across
+/// the hierarchy (SsTable → Run → Level → Lsm); a merge or concat of
+/// `KvStream`s is itself a `KvStream`, so nodes nest.
 pub trait Scan {
-    fn scan(&self, range: impl RangeBounds<Vec<u8>>, max_seq: u64) -> KvStream<'_>;
+    fn scan(
+        &self,
+        range: impl RangeBounds<Vec<u8>>,
+        max_seq: u64,
+        cache: &SstPageCache,
+    ) -> KvStream<'_>;
 }
 
 /// K-way merge over several iterators with a caller-supplied ordering. Each
