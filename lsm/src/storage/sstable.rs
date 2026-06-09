@@ -68,6 +68,49 @@ impl SsTable {
     pub fn header(&self) -> &Header {
         &self.header
     }
+
+    /// Newest version of `key` at `max_seq` in this table, or `None` if absent.
+    ///
+    /// Skips the whole table when `key` is outside its range or the bloom says
+    /// no; otherwise reads just the one block whose range covers `key`.
+    pub fn get(
+        &self,
+        key: &[u8],
+        max_seq: u64,
+        cache: &SstPageCache,
+    ) -> Result<Option<KeyValue>, LsmError> {
+        if !self.header.range.contains(key) || !self.header.bloom.contains(key) {
+            return Ok(None);
+        }
+        // Blocks are sorted and disjoint, so at most one covers `key`.
+        let found = self
+            .header
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.min_key.as_slice() <= key && key <= b.max_key.as_slice());
+        let Some((idx, block)) = found else {
+            return Ok(None);
+        };
+
+        let id = self.header.sst_id;
+        let page = cache.fetch_block(
+            PageId {
+                table: id,
+                page_index: idx as u32,
+            },
+            || read_block_page(&self.dir, id, block),
+        )?;
+        let mut cursor = page.bytes();
+        let data = DataBlock::decode(&mut cursor).map_err(|e| LsmError::Internal(e.to_string()))?;
+        // Entries sort seq-descending, so the first match ≤ max_seq is newest.
+        for kv in data.0 {
+            if kv.key.user_key == key && kv.key.seq <= max_seq {
+                return Ok(Some(kv));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl Scan for SsTable {

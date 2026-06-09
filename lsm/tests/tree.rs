@@ -104,6 +104,18 @@ fn reads_merge_memtable_over_on_disk_levels() {
 }
 
 #[test]
+fn get_reads_newest_across_flushed_files() {
+    let (_tmp, mut tree) = tree();
+    tree.put(b"k", b"old").unwrap();
+    tree.flush().unwrap(); // file 0: k=old
+    tree.put(b"k", b"new").unwrap();
+    tree.flush().unwrap(); // file 1 (newer): k=new
+
+    assert_eq!(tree.get(b"k").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(tree.get(b"absent").unwrap(), None);
+}
+
+#[test]
 fn delete_in_memtable_shadows_flushed_value() {
     let (_tmp, mut tree) = tree();
     tree.put(b"k", b"v").unwrap();

@@ -144,12 +144,29 @@ impl<M: MemStore + Default> Lsm<M> {
 
     /// Latest value for `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, LsmError> {
+        self.get_at(key, self.seq)
+    }
+
+    /// Point lookup as of `max_seq`. Checks the memtable first, then on-disk
+    /// levels newest-first, skipping tables by range + bloom. Stops at the
+    /// first layer that holds the key (a tombstone there means "deleted").
+    fn get_at(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>, LsmError> {
         let probe = key.to_vec();
-        match self.scan_at(probe.clone()..=probe, self.seq).next() {
-            Some(Ok((_, value))) => Ok(Some(value)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        if let Some(r) = self.mem.scan_at(probe.clone()..=probe, max_seq).next() {
+            let (ikey, value) = r?;
+            return Ok(resolve(ikey.op, value));
         }
+        for level in &self.levels {
+            for run in &level.runs {
+                for &id in &run.files {
+                    let table = SsTable::open(id, &self.dir, &self.cache)?;
+                    if let Some(kv) = table.get(key, max_seq, &self.cache)? {
+                        return Ok(resolve(kv.key.op, kv.value));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Scan a key range, newest version per key, tombstones dropped.
@@ -217,6 +234,14 @@ impl<M: MemStore + Default> Lsm<M> {
 
 fn read_err(e: LsmError) -> ReadError {
     ReadError::Internal(e.to_string())
+}
+
+/// Apply a record's op: a put yields its value, a tombstone yields `None`.
+fn resolve(op: OpType, value: Vec<u8>) -> Option<Vec<u8>> {
+    match op {
+        OpType::Put => Some(value),
+        OpType::Delete => None,
+    }
 }
 
 /// Whether a table's `[min, max]` could hold any key in the query range.
