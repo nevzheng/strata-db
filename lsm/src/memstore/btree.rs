@@ -59,9 +59,10 @@ impl MemStore for BTreeMemtable {
         self.size
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> Result<(), WriteError> {
         self.store.clear();
         self.size = 0;
+        Ok(())
     }
 }
 

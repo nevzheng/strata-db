@@ -37,6 +37,7 @@ pub trait MemStore: ReadStore + WriteStore {
     fn size(&self) -> usize;
 
     /// Drop all entries and reset size to zero, after the buffer has been
-    /// flushed to an on-disk level.
-    fn clear(&mut self);
+    /// flushed to an on-disk level. Fallible because a durable memstore must
+    /// also discard its journal here.
+    fn clear(&mut self) -> Result<(), WriteError>;
 }

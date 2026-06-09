@@ -12,9 +12,9 @@ mod config;
 mod error;
 mod iterator;
 mod key;
+mod layout;
 mod manifest;
 mod memstore;
-mod memtable_journal;
 mod storage;
 mod store;
 
@@ -36,7 +36,8 @@ pub use store::{MemStore, ReadStore, WriteStore};
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
 
-use memtable_journal::MemtableJournal;
+use layout::Layout;
+use memstore::Journaled;
 
 /// Globally-unique identity of an SSTable. The manifest and tree hold these;
 /// the filesystem and page cache resolve an id to the physical table — its
@@ -71,13 +72,12 @@ pub struct Level {
 /// journal is replayed to recover unflushed writes. Generic over the memtable.
 pub struct Lsm<M: MemStore = BTreeMemtable> {
     config: LsmConfig,
-    dir: PathBuf,
+    layout: Layout,
     cache: SstPageCache,
-    mem: M,
+    mem: Journaled<M>,
     levels: Vec<Level>,
     seq: u64,
     next_sst_id: u64,
-    journal: MemtableJournal,
 }
 
 impl<M: MemStore + Default> Lsm<M> {
@@ -92,31 +92,33 @@ impl<M: MemStore> Lsm<M> {
     /// and the memtable journal live under `dir`. The journal is replayed into
     /// the memtable to recover writes that hadn't been flushed.
     pub fn with_memtable(
-        dir: impl Into<PathBuf>,
+        root: impl Into<PathBuf>,
         config: LsmConfig,
-        mut mem: M,
+        mem: M,
     ) -> Result<Self, LsmError> {
-        let dir = dir.into();
+        let layout = Layout::new(root);
         let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
         let cache = SstPageCache::new(config.page_cache);
 
-        let journal = MemtableJournal::open(dir.join("memtable.jrnl"))?;
-        let mut seq = 0;
-        for record in journal.replay()? {
-            let KeyValue { key, value } = record?;
-            seq = seq.max(key.seq);
-            mem.put(key, &value)?;
-        }
+        // The memstore journals itself and replays on open; the journal is
+        // entirely internal to it. We just resume seq numbering past whatever
+        // it recovered.
+        let mem = Journaled::open(layout.memtable_journal(), mem)?;
+        let seq = mem
+            .scan_at(.., u64::MAX)
+            .filter_map(Result::ok)
+            .map(|(key, _)| key.seq)
+            .max()
+            .unwrap_or(0);
 
         Ok(Self {
             config,
-            dir,
+            layout,
             cache,
             mem,
             levels,
             seq,
             next_sst_id: 0,
-            journal,
         })
     }
 
@@ -136,12 +138,7 @@ impl<M: MemStore> Lsm<M> {
             seq: self.seq + 1,
             op,
         };
-        // Log durably before touching the memtable, so a crash can't lose an
-        // acknowledged write.
-        self.journal.append(&KeyValue {
-            key: ikey.clone(),
-            value: value.to_vec(),
-        })?;
+        // The memstore logs the write durably before applying it.
         self.mem.put(ikey, value)?;
         self.seq += 1;
         Ok(())
@@ -149,10 +146,10 @@ impl<M: MemStore> Lsm<M> {
 
     /// Seal the memtable into a new on-disk L0 SSTable and clear it.
     ///
-    /// Note: the journal is *not* truncated here. Without a manifest, flushed
-    /// SSTables aren't rediscovered on open, so the journal must keep every
-    /// write for recovery. Truncation will move here once a manifest records
-    /// the on-disk levels.
+    /// Note: the memtable journal is *not* truncated yet. Without a manifest,
+    /// flushed SSTables aren't rediscovered on open, so the journal must keep
+    /// every write for recovery; truncation lands once the manifest records the
+    /// on-disk levels.
     pub fn flush(&mut self) -> Result<(), LsmError> {
         // All versions (including tombstones), in InternalKey order.
         let entries: Vec<KeyValue> = self
@@ -172,14 +169,14 @@ impl<M: MemStore> Lsm<M> {
             .first()
             .map(|l| l.table.clone())
             .unwrap_or_default();
-        SsTable::write(id, &self.dir, &table_cfg, entries)?;
+        SsTable::write(id, &self.layout.sstables(), &table_cfg, entries)?;
 
         if self.levels.is_empty() {
             self.levels.push(Level::default());
         }
         // Newest run first within L0.
         self.levels[0].runs.insert(0, Run { files: vec![id] });
-        self.mem.clear();
+        self.mem.clear()?;
         Ok(())
     }
 
@@ -200,7 +197,7 @@ impl<M: MemStore> Lsm<M> {
         for level in &self.levels {
             for run in &level.runs {
                 for &id in &run.files {
-                    let table = SsTable::open(id, &self.dir, &self.cache)?;
+                    let table = SsTable::open(id, &self.layout.sstables(), &self.cache)?;
                     if let Some(kv) = table.get(key, max_seq, &self.cache)? {
                         return Ok(resolve(kv.key.op, kv.value));
                     }
@@ -234,7 +231,7 @@ impl<M: MemStore> Lsm<M> {
         for level in &self.levels {
             for run in &level.runs {
                 for &id in &run.files {
-                    let table = match SsTable::open(id, &self.dir, &self.cache) {
+                    let table = match SsTable::open(id, &self.layout.sstables(), &self.cache) {
                         Ok(table) => table,
                         Err(e) => {
                             sources.push(Box::new(std::iter::once(Err(read_err(e)))));
