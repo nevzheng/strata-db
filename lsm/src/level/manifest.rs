@@ -59,7 +59,7 @@ fn read_and_hash(r: &mut impl Read, hasher: &mut Hasher, buf: &mut [u8]) -> io::
 }
 
 impl ManifestOp {
-    pub fn encode(&self, w: &mut impl Write) -> io::Result<()> {
+    fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         let mut hasher = Hasher::new();
 
         match self {
@@ -93,7 +93,7 @@ impl ManifestOp {
         Ok(())
     }
 
-    pub fn decode(r: &mut impl Read) -> io::Result<Self> {
+    fn decode(r: &mut impl Read) -> io::Result<Self> {
         let mut hasher = Hasher::new();
 
         let mut op = [0u8; 1];

@@ -2,14 +2,16 @@ use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 use std::path::Path;
 
-use crate::iterator::{MergeIterator, ScanIterator};
-use crate::level::{Level, LevelConfig, Manifest, Run, SsTableWriter};
-use crate::memstore::{
+use crate::iterator::ScanIterator;
+use crate::{KVPair, StorageError};
+use itertools::Itertools;
+use lsm::ReadStore;
+use lsm::iterator::MergeIterator;
+use lsm::level::{Level, LevelConfig, Manifest, Run, SsTableWriter};
+use lsm::memstore::{
     InternalKey, MemStore, OpType, ReadError,
     wal::{WalOp, WriteAheadLog},
 };
-use crate::{KVPair, ReadStore, StorageError};
-use itertools::Itertools;
 use tracing::{info, instrument};
 
 const DEFAULT_NUM_LEVELS: usize = 7;
@@ -361,7 +363,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memstore::BTreeMapStore;
+    use lsm::memstore::BTreeMapStore;
 
     #[test]
     fn put_get_delete_round_trip() {

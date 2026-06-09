@@ -53,7 +53,7 @@ impl WalOp {
     }
 
     /// Encode this operation to the writer, appending a CRC32 checksum.
-    pub fn encode(&self, w: &mut impl Write) -> io::Result<()> {
+    fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         let mut hasher = Hasher::new();
 
         match self {
@@ -79,7 +79,7 @@ impl WalOp {
     }
 
     /// Decode a WAL operation from the reader, verifying the CRC32 checksum.
-    pub fn decode(r: &mut impl Read) -> io::Result<Self> {
+    fn decode(r: &mut impl Read) -> io::Result<Self> {
         let mut hasher = Hasher::new();
 
         // Op code.

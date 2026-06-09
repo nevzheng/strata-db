@@ -1,3 +1,11 @@
+//! The on-disk side of the LSM tree: [`SsTable`]s grouped into sorted
+//! [`Run`]s within [`Level`]s, tracked by the [`Manifest`] for recovery.
+//!
+//! These types are public on purpose — they're the API for building
+//! compaction on `lsm`: read via [`SsTable`]/[`SsTableRef`], write via
+//! [`SsTableWriter`], record via [`Manifest`]. The on-disk byte format
+//! (the `encode`/`decode` methods) stays private so it can change freely.
+
 mod manifest;
 mod sstable;
 mod writer;
@@ -11,7 +19,7 @@ use std::ops::{Bound, RangeBounds};
 use itertools::Itertools;
 
 use crate::memstore::{InternalKey, OpType, ReadError};
-use crate::{ReadStore, StorageError};
+use crate::{LsmError, ReadStore};
 
 /// Configuration for a single level in the LSM tree.
 pub struct LevelConfig {
@@ -42,7 +50,7 @@ impl Level {
         writer: &mut SsTableWriter,
         level_idx: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), LsmError> {
         let run = writer.write_run(level_idx, entries)?;
         self.runs.push(run);
         Ok(())
