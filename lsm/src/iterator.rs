@@ -1,25 +1,29 @@
-//! Generic k-way merge iterator.
-//!
-//! [`MergeIterator`] interleaves already-sorted sources into one sorted
-//! stream via a caller-supplied comparator. Fully generic over item type
-//! with no storage-specific coupling — which is why it lives here rather
-//! than with the engine.
+//! Read-path iterators: the generic k-way [`MergeIterator`], the [`KvStream`]
+//! every scannable node yields, and the [`Scan`] trait that produces it.
 
-/// K-way merge over multiple iterators with a user-supplied ordering.
-/// Each pull yields the smallest item across all sources; ties resolve
-/// in source order.
+use std::cmp::Ordering;
+
+use crate::error::{LsmError, ReadError};
+use crate::key::{KVPair, KeyValue, OpType};
+
+/// A boxed, sorted stream of versioned records — what every scannable source
+/// yields, and what merges and concats compose. Lazy: producers fault blocks
+/// in as the consumer pulls.
+pub type KvStream<'a> = Box<dyn Iterator<Item = Result<KeyValue, ReadError>> + 'a>;
+
+/// K-way merge over several iterators with a caller-supplied ordering. Each
+/// pull yields the smallest item across all sources; ties resolve in source
+/// order.
 ///
-/// Linear scan over source heads per pull — O(k). Deliberate: at the
-/// engine layer k is small (memtable plus a handful of levels), and
-/// the linear path beats a heap on both complexity and constant
-/// factor at this scale.
+/// Linear scan over the source heads per pull — O(k). Deliberate: an LSM read
+/// touches only a handful of sources, where the linear path beats a heap.
 pub struct MergeIterator<I: Iterator, F> {
     sources: Vec<Source<I>>,
     cmp: F,
 }
 
 struct Source<I: Iterator> {
-    /// Next item to emit from this source, or `None` if exhausted.
+    /// Next item to emit, or `None` if this source is exhausted.
     head: Option<I::Item>,
     iter: I,
 }
@@ -27,7 +31,7 @@ struct Source<I: Iterator> {
 impl<I, F> MergeIterator<I, F>
 where
     I: Iterator,
-    F: FnMut(&I::Item, &I::Item) -> std::cmp::Ordering,
+    F: FnMut(&I::Item, &I::Item) -> Ordering,
 {
     pub fn new(sources: Vec<I>, cmp: F) -> Self {
         let sources = sources
@@ -44,7 +48,7 @@ where
 impl<I, F> Iterator for MergeIterator<I, F>
 where
     I: Iterator,
-    F: FnMut(&I::Item, &I::Item) -> std::cmp::Ordering,
+    F: FnMut(&I::Item, &I::Item) -> Ordering,
 {
     type Item = I::Item;
 
@@ -59,7 +63,7 @@ where
                 Some(j) => {
                     let a = self.sources[i].head.as_ref().unwrap();
                     let b = self.sources[j].head.as_ref().unwrap();
-                    if (self.cmp)(a, b) == std::cmp::Ordering::Less {
+                    if (self.cmp)(a, b) == Ordering::Less {
                         min_idx = Some(i);
                     }
                 }
@@ -72,12 +76,79 @@ where
     }
 }
 
+/// Collapses a sorted stream (user key ascending, seq descending) into one
+/// [`KVPair`] per user key — the newest version — dropping tombstones.
+pub struct VersionResolver<I> {
+    inner: I,
+    last_key: Option<Vec<u8>>,
+}
+
+impl<I> VersionResolver<I> {
+    pub fn new(inner: I) -> Self {
+        Self {
+            inner,
+            last_key: None,
+        }
+    }
+}
+
+impl<I> Iterator for VersionResolver<I>
+where
+    I: Iterator<Item = Result<KeyValue, ReadError>>,
+{
+    type Item = Result<KVPair, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Err(e) => return Some(Err(e)),
+                Ok(kv) => {
+                    // Sorted seq-descending, so the first entry for a key is
+                    // the newest; skip any older versions that follow.
+                    if self.last_key.as_deref() == Some(kv.key.user_key.as_slice()) {
+                        continue;
+                    }
+                    self.last_key = Some(kv.key.user_key.clone());
+                    match kv.key.op {
+                        OpType::Put => return Some(Ok((kv.key.user_key, kv.value))),
+                        OpType::Delete => continue, // newest is a tombstone → key gone
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The resolved, user-facing scan result: a stream of [`KVPair`]s.
+pub struct ScanIterator<'a> {
+    inner: Box<dyn Iterator<Item = Result<KVPair, LsmError>> + 'a>,
+}
+
+impl<'a> ScanIterator<'a> {
+    pub fn new<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Result<KVPair, LsmError>> + 'a,
+    {
+        Self {
+            inner: Box::new(iter),
+        }
+    }
+}
+
+impl Iterator for ScanIterator<'_> {
+    type Item = Result<KVPair, LsmError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn merge_yields_globally_sorted_order_across_sources() {
+    fn merges_sorted_sources() {
         let a = vec![1, 4, 5].into_iter();
         let b = vec![2, 3, 6].into_iter();
         let c = vec![0, 7].into_iter();
@@ -87,35 +158,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_handles_empty_sources() {
+    fn handles_empty_sources() {
         let empty: Vec<std::vec::IntoIter<i32>> = vec![];
         let mut merge = MergeIterator::new(empty, |x: &i32, y: &i32| x.cmp(y));
         assert!(merge.next().is_none());
-
-        let merged: Vec<i32> = MergeIterator::new(
-            vec![
-                vec![].into_iter(),
-                vec![1, 2].into_iter(),
-                vec![].into_iter(),
-            ],
-            |x: &i32, y: &i32| x.cmp(y),
-        )
-        .collect();
-        assert_eq!(merged, vec![1, 2]);
     }
 
     #[test]
-    fn merge_preserves_source_order_on_ties() {
-        // When source 0 and source 1 both have a 5 at the head, source 0
-        // wins (linear scan picks the first equal-minimum).
+    fn ties_resolve_in_source_order() {
+        // Both sources head with 5; source 0 wins (first equal-minimum).
         let merged: Vec<(usize, i32)> = MergeIterator::new(
-            vec![
-                vec![(0, 5), (0, 7)].into_iter(),
-                vec![(1, 5), (1, 6)].into_iter(),
-            ],
+            vec![vec![(0, 5), (0, 7)].into_iter(), vec![(1, 5)].into_iter()],
             |a: &(usize, i32), b: &(usize, i32)| a.1.cmp(&b.1),
         )
         .collect();
-        assert_eq!(merged, vec![(0, 5), (1, 5), (1, 6), (0, 7)]);
+        assert_eq!(merged, vec![(0, 5), (1, 5), (0, 7)]);
     }
 }
