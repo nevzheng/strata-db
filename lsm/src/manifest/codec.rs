@@ -1,8 +1,4 @@
 //! On-disk codec for [`ManifestEdit`], carried by the manifest journal.
-//!
-//! Staged: exercised by tests and the manifest manager; wired into the tree's
-//! open/flush path in a later stage.
-#![allow(dead_code)]
 
 use journal::{Codec, JournalError};
 
@@ -12,6 +8,7 @@ use crate::SsTableId;
 const OP_ADD_RUN: u8 = 1;
 const OP_REMOVE_RUN: u8 = 2;
 const OP_SET_NEXT_SST_ID: u8 = 3;
+const OP_SET_LAST_SEQ: u8 = 4;
 
 /// Encodes a [`ManifestEdit`] for the manifest journal: a count of ops, then a
 /// tagged record per op.
@@ -42,6 +39,10 @@ impl Codec for ManifestEditCodec {
                     buf.push(OP_SET_NEXT_SST_ID);
                     buf.extend_from_slice(&next.to_be_bytes());
                 }
+                ManifestOp::SetLastSeq(seq) => {
+                    buf.push(OP_SET_LAST_SEQ);
+                    buf.extend_from_slice(&seq.to_be_bytes());
+                }
             }
         }
     }
@@ -64,6 +65,7 @@ impl Codec for ManifestEditCodec {
                 }
                 OP_REMOVE_RUN => ManifestOp::RemoveRun(RunId(get_u64(&mut cursor)?)),
                 OP_SET_NEXT_SST_ID => ManifestOp::SetNextSstId(get_u64(&mut cursor)?),
+                OP_SET_LAST_SEQ => ManifestOp::SetLastSeq(get_u64(&mut cursor)?),
                 other => return Err(JournalError::Decode(format!("unknown manifest op {other}"))),
             };
             ops.push(op);

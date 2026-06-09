@@ -72,11 +72,10 @@ impl<M: MemStore> MemStore for Journaled<M> {
     }
 
     fn clear(&mut self) -> Result<(), WriteError> {
-        // The journal is intentionally NOT truncated here yet: without a
-        // manifest, a flushed SSTable isn't rediscovered on open, so the
-        // journal must retain every write for lossless recovery. Once the
-        // manifest records flushes, truncation moves here (hence the fallible
-        // signature).
+        // The caller flushes the memtable to a durable SSTable (recorded in the
+        // manifest) before clearing, so the journal's contents are now
+        // redundant and safe to drop.
+        self.journal.truncate().map_err(into_write)?;
         self.inner.clear()
     }
 }

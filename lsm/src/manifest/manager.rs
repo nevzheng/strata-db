@@ -11,9 +11,6 @@
 //! of [`ManifestEdit`]s, the active one starting with a snapshot) plus a
 //! `CURRENT` text file naming the active number. `CURRENT` is flipped by an
 //! atomic write-temp + rename — that rename is the commit point of a checkpoint.
-//!
-//! Staged: built and tested here; wired into the tree's open/flush path next.
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::fs::{self, File};

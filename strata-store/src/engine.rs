@@ -63,7 +63,7 @@ impl<M: MemStore> StorageEngine<M> {
 
     /// Number of levels in the LSM tree.
     pub fn num_levels(&self) -> usize {
-        self.lsm.levels().len()
+        self.lsm.config().num_levels()
     }
 
     /// Scan the range, yielding the latest visible version of each user key in

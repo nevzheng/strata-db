@@ -38,8 +38,6 @@
 mod codec;
 mod manager;
 
-// Staged: wired into the tree's open/flush path in the next stage.
-#[allow(unused_imports)]
 pub(crate) use manager::ManifestManager;
 
 use crate::SsTableId;
@@ -67,6 +65,9 @@ pub enum ManifestOp {
     RemoveRun(RunId),
     /// Advance the SSTable-id allocator, so ids never collide after a restart.
     SetNextSstId(u64),
+    /// Record the highest write seq durable in the levels, so seq numbering
+    /// resumes correctly even when the memtable journal is empty after a flush.
+    SetLastSeq(u64),
 }
 
 /// An atomic batch of [`ManifestOp`]s — logged as one framed journal record and
@@ -95,6 +96,11 @@ impl ManifestEdit {
         self.ops.push(ManifestOp::SetNextSstId(next));
         self
     }
+
+    pub fn set_last_seq(mut self, seq: u64) -> Self {
+        self.ops.push(ManifestOp::SetLastSeq(seq));
+        self
+    }
 }
 
 /// The folded state of all applied edits: which runs are live, and the id
@@ -103,6 +109,7 @@ impl ManifestEdit {
 pub struct Version {
     runs: Vec<RunDescriptor>, // live runs, in the order they were added
     next_sst_id: u64,
+    last_seq: u64,
 }
 
 impl Version {
@@ -113,6 +120,7 @@ impl Version {
                 ManifestOp::AddRun(run) => self.runs.push(run.clone()),
                 ManifestOp::RemoveRun(id) => self.runs.retain(|r| r.run != *id),
                 ManifestOp::SetNextSstId(next) => self.next_sst_id = *next,
+                ManifestOp::SetLastSeq(seq) => self.last_seq = *seq,
             }
         }
     }
@@ -125,12 +133,18 @@ impl Version {
             edit.ops.push(ManifestOp::AddRun(run.clone()));
         }
         edit.ops.push(ManifestOp::SetNextSstId(self.next_sst_id));
+        edit.ops.push(ManifestOp::SetLastSeq(self.last_seq));
         edit
     }
 
     /// The next SSTable id to allocate.
     pub fn next_sst_id(&self) -> u64 {
         self.next_sst_id
+    }
+
+    /// The highest write seq durable in the on-disk levels.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
     }
 
     /// Live runs in `level`, in the order they were added (callers that need
