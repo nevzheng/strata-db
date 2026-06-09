@@ -28,3 +28,6 @@ target
 # Node (used for husky + commitlint)
 node_modules/
 package-lock.json
+
+# Project-local editor settings (e.g. Peacock color)
+.vscode/
