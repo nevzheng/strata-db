@@ -43,9 +43,8 @@ pub struct InternalKey {
 }
 
 impl InternalKey {
-    /// Encode this internal key to the writer. Crate-internal: the
-    /// on-disk byte format is an implementation detail, not part of the
-    /// LSM building-block API.
+    /// Encode to the writer. Crate-private: the byte format is not part
+    /// of the public API.
     pub(crate) fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         w.write_all(&(self.key.len() as u16).to_be_bytes())?;
         w.write_all(&self.key)?;
@@ -54,7 +53,7 @@ impl InternalKey {
         Ok(())
     }
 
-    /// Decode an internal key from the reader. Crate-internal (see [`Self::encode`]).
+    /// Decode from the reader. See [`Self::encode`].
     pub(crate) fn decode(r: &mut impl Read) -> io::Result<Self> {
         let mut key_len_buf = [0u8; 2];
         r.read_exact(&mut key_len_buf)?;

@@ -1,9 +1,9 @@
 //! Generic k-way merge iterator.
 //!
-//! [`MergeIterator`] interleaves several already-sorted sources into one
-//! sorted stream using a caller-supplied comparator. It is fully generic
-//! over item type — the engine uses it to merge a memtable scan with
-//! per-level scans, but it carries no storage-specific types.
+//! [`MergeIterator`] interleaves already-sorted sources into one sorted
+//! stream via a caller-supplied comparator. Fully generic over item type
+//! with no storage-specific coupling — which is why it lives here rather
+//! than with the engine.
 
 /// K-way merge over multiple iterators with a user-supplied ordering.
 /// Each pull yields the smallest item across all sources; ties resolve

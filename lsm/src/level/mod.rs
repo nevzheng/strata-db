@@ -1,23 +1,10 @@
-//! The on-disk side of the LSM tree.
+//! The on-disk side of the LSM tree: [`SsTable`]s grouped into sorted
+//! [`Run`]s within [`Level`]s, tracked by the [`Manifest`] for recovery.
 //!
-//! A [`Level`] holds sorted [`Run`]s; each run is a set of immutable,
-//! non-overlapping [`SsTable`]s on disk; the [`Manifest`] records which
-//! tables exist at which level and is the source of truth for recovery.
-//!
-//! # Public building blocks
-//!
-//! These types are deliberately public, not incidental leakage. They are
-//! the API you build a storage engine — and, in particular, **compaction
-//! strategies** — on top of: read inputs via [`SsTable`] / [`SsTableRef`]
-//! (or [`read_sstable_ref`] during recovery), write outputs through the
-//! transactional [`SsTableWriter`], arrange them with [`Run`] / [`Level`],
-//! and record the result via the [`Manifest`].
-//!
-//! What is *not* public is the on-disk byte format itself — the
-//! `encode`/`decode` methods on the entry, WAL, and manifest records.
-//! Compaction works with decoded values ([`InternalKey`], [`SsTableRef`],
-//! key/value entries), never raw bytes, so the wire format stays a
-//! private implementation detail free to change.
+//! These types are public on purpose — they're the API for building
+//! compaction on `lsm`: read via [`SsTable`]/[`SsTableRef`], write via
+//! [`SsTableWriter`], record via [`Manifest`]. The on-disk byte format
+//! (the `encode`/`decode` methods) stays private so it can change freely.
 
 mod manifest;
 mod sstable;

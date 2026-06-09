@@ -21,7 +21,7 @@ use thiserror::Error;
 /// A resolved key-value pair of owned byte vectors.
 pub type KVPair = (Vec<u8>, Vec<u8>);
 
-// / Read interface shared by memstores and levels.
+/// Read interface shared by memstores and levels.
 ///
 /// All reads require an explicit sequence number to support
 /// point-in-time queries. The engine provides convenience methods
