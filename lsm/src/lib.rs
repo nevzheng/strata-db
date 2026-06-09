@@ -1,16 +1,13 @@
 //! `lsm` — a log-structured merge tree.
 //!
-//! The crate root holds the top-level data hierarchy; the supporting
-//! concepts live in their own modules and are re-exported here.
+//! The crate root holds the logical data hierarchy — structure and ids only.
+//! Physical detail (on-disk format, bloom filters, paging) lives in the
+//! `storage` module and is resolved from an [`SsTableId`].
 //!
 //! ```text
-//! KeyValue → Run → SsTableRef → Level → Lsm
+//! KeyValue → Run → Level → Lsm
 //! ```
-//!
-//! Every node above the leaf carries a [`KeyRange`] and a [`BloomFilter`]
-//! so a lookup or scan can skip a subtree that can't hold the key.
 
-mod bloom;
 mod config;
 mod error;
 mod iterator;
@@ -19,7 +16,6 @@ mod memstore;
 mod storage;
 mod store;
 
-pub use bloom::BloomFilter;
 pub use config::{
     BloomConfig, CachePolicy, LevelConfig, LsmConfig, PageCacheConfig, PageConfig, RunConfig,
     SizeConfig, TableConfig,
@@ -29,47 +25,25 @@ pub use iterator::{KvStream, MergeIterator, Scan, ScanIterator};
 pub use key::{InternalKey, KVPair, KeyRange, KeyValue, OpType};
 pub use memstore::BTreeMemtable;
 pub use storage::{
-    DataBlock, Decode, DecodeError, Encode, Header, Page, PageId, SsTable, SstPageCache,
+    BloomFilter, DataBlock, Decode, DecodeError, Encode, Header, Page, PageId, SsTable,
+    SstPageCache,
 };
 pub use store::{MemStore, ReadStore, WriteStore};
 
 use std::ops::RangeBounds;
 
-/// Globally-unique identity of an SSTable file. Shared by [`SsTableRef`]
-/// (the logical handle) and [`PageId`] (the page-cache key), so the logical
-/// and storage layers name the same file the same way.
+/// Globally-unique identity of an SSTable. The manifest and tree hold these;
+/// the filesystem and page cache resolve an id to the physical table — its
+/// header (range, bloom, size) and its data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SsTableId(pub u64);
 
-/// A reference to an on-disk SSTable: its header (id, range, bloom, size),
-/// not its data. Cheap to hold; enough to decide whether to read the file.
-#[derive(Debug, Clone)]
-pub struct SsTableRef {
-    pub id: SsTableId,
-    pub range: KeyRange,
-    pub bloom: BloomFilter,
-    pub size_bytes: u64,
-}
-
-impl SsTableRef {
-    /// The page-cache key for this table's page `index`.
-    pub fn page(&self, index: u32) -> PageId {
-        PageId {
-            table: self.id,
-            page_index: index,
-        }
-    }
-}
-
-/// A sorted run: KV pairs with no key repeated. Stored as SSTable file(s) —
-/// one per run today (splitting a large run across files isn't implemented
-/// yet), so `files` is a list but currently holds a single [`SsTableRef`].
-#[derive(Debug, Clone)]
+/// A sorted run: KV pairs with no key repeated, stored as one or more SSTable
+/// files. Holds only their ids — range, bloom, and size are physical and
+/// resolved from storage.
+#[derive(Debug, Clone, Default)]
 pub struct Run {
-    pub files: Vec<SsTableRef>,
-    pub range: KeyRange,
-    pub bloom: BloomFilter, // covers every key in the run
-    pub size_bytes: u64,
+    pub files: Vec<SsTableId>,
 }
 
 /// A level: one or more runs.
@@ -77,11 +51,9 @@ pub struct Run {
 /// L0 holds multiple runs that *overlap* — one per memtable flush, sharing
 /// keys at newer seqs — so it's read newest-first. Leveled compaction keeps
 /// L1+ at a single run, so those don't overlap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Level {
     pub runs: Vec<Run>,
-    pub range: KeyRange,
-    pub bloom: BloomFilter, // covers every key in the level
 }
 
 /// The LSM tree — the live store you set and read values on.

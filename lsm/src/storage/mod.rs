@@ -3,6 +3,7 @@
 //! Logical concepts (in the crate root) stay pure; this module knows how
 //! they are encoded and read back.
 
+mod bloom;
 mod cache;
 mod codec;
 mod data;
@@ -10,6 +11,7 @@ mod header;
 mod page;
 mod sstable;
 
+pub use bloom::BloomFilter;
 pub use cache::SstPageCache;
 pub use codec::{Decode, DecodeError, Encode};
 pub use data::DataBlock;

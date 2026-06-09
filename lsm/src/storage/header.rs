@@ -1,13 +1,13 @@
-//! The SSTable header — the on-page form of an [`SsTableRef`].
+//! The SSTable header — the cheap, always-loaded metadata (id, range, bloom,
+//! size) at the front of a file, so a lookup can bound or skip the table
+//! without reading its data.
 //!
-//! It holds the cheap, always-loaded metadata (id, range, bloom, size) from
-//! the front of a file, so a lookup can bound or skip the table without
-//! reading its data. `Header` and `SsTableRef` are the same concept in two
-//! representations and convert into each other; `Header` owns the on-disk
-//! encoding, `SsTableRef` is the in-memory handle the tree holds.
+//! This is the physical home of a table's bloom and key range: the logical
+//! tree holds only the [`SsTableId`], and the cache resolves it to this header.
 
+use super::bloom::BloomFilter;
 use super::codec::{self, Decode, DecodeError, Encode};
-use crate::{BloomFilter, KeyRange, SsTableId, SsTableRef};
+use crate::{KeyRange, SsTableId};
 
 const MAGIC: u32 = 0x5353_5431; // "SST1"
 const VERSION: u16 = 1;
@@ -32,28 +32,6 @@ pub struct Header {
     pub range: KeyRange,
     pub bloom: BloomFilter,
     pub size_bytes: u64,
-}
-
-impl From<&SsTableRef> for Header {
-    fn from(r: &SsTableRef) -> Self {
-        Header {
-            sst_id: r.id,
-            range: r.range.clone(),
-            bloom: r.bloom.clone(),
-            size_bytes: r.size_bytes,
-        }
-    }
-}
-
-impl From<Header> for SsTableRef {
-    fn from(h: Header) -> Self {
-        SsTableRef {
-            id: h.sst_id,
-            range: h.range,
-            bloom: h.bloom,
-            size_bytes: h.size_bytes,
-        }
-    }
 }
 
 impl Encode for Header {
@@ -140,14 +118,6 @@ mod tests {
         let page = Page::encode(&header);
         let decoded: Header = page.decode().unwrap();
         assert_eq!(decoded, header);
-    }
-
-    #[test]
-    fn converts_to_and_from_sstable_ref() {
-        let header = sample_header();
-        let r: SsTableRef = header.clone().into();
-        let back: Header = (&r).into();
-        assert_eq!(back, header);
     }
 
     #[test]

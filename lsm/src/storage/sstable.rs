@@ -8,11 +8,12 @@
 
 use std::ops::{Bound, RangeBounds};
 
+use super::bloom::BloomFilter;
 use super::data::DataBlock;
 use super::header::Header;
 use crate::iterator::{KvStream, Scan};
 use crate::key::{KeyRange, KeyValue};
-use crate::{BloomConfig, BloomFilter, ReadError, SsTableId};
+use crate::{BloomConfig, ReadError, SsTableId};
 
 /// An opened SSTable file: its [`Header`] plus its [`DataBlock`].
 pub struct SsTable {
