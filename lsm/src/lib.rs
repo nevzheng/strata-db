@@ -1,21 +1,23 @@
 //! `lsm` — a log-structured merge tree.
 //!
-//! The crate root holds the logical data hierarchy — structure and ids only.
-//! Physical detail (on-disk format, bloom filters, paging) lives in the
-//! `storage` module and is resolved from an [`SsTableId`].
-//!
-//! ```text
-//! KeyValue → Run → Level → Lsm
-//! ```
+//! The crate root holds the tree itself ([`Lsm`]). Tree *structure* — which
+//! runs live in which level — is the [`manifest`]'s [`Version`]; physical detail
+//! (on-disk format, bloom filters, paging) lives in `storage`, resolved from an
+//! [`SsTableId`]; durability lives in the memtable journal (`memstore`) and the
+//! manifest.
 
+mod compaction;
 mod config;
 mod error;
 mod iterator;
 mod key;
+mod layout;
+mod manifest;
 mod memstore;
 mod storage;
 mod store;
 
+pub use compaction::{CompactionJob, CompactionKind};
 pub use config::{
     BloomConfig, CachePolicy, LevelConfig, LsmConfig, PageCacheConfig, PageConfig, RunConfig,
     SizeConfig, TableConfig,
@@ -23,6 +25,7 @@ pub use config::{
 pub use error::{LsmError, ReadError, WriteError};
 pub use iterator::{KvStream, MergeIterator, ScanIterator};
 pub use key::{InternalKey, KVPair, KeyRange, KeyValue, OpType};
+pub use manifest::{ManifestEdit, ManifestOp, RunDescriptor, RunId, Version};
 pub use memstore::BTreeMemtable;
 pub use storage::{
     BloomFilter, DataBlock, Decode, DecodeError, Encode, Header, Page, PageId, SsTable,
@@ -33,68 +36,75 @@ pub use store::{MemStore, ReadStore, WriteStore};
 use std::ops::{Bound, RangeBounds};
 use std::path::PathBuf;
 
+use layout::Layout;
+use manifest::ManifestManager;
+use memstore::Journaled;
+
 /// Globally-unique identity of an SSTable. The manifest and tree hold these;
 /// the filesystem and page cache resolve an id to the physical table — its
 /// header (range, bloom, size) and its data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SsTableId(pub u64);
 
-/// A sorted run: KV pairs with no key repeated, stored as one or more SSTable
-/// files. Holds only their ids — range, bloom, and size are physical and
-/// resolved from storage.
-#[derive(Debug, Clone, Default)]
-pub struct Run {
-    pub files: Vec<SsTableId>,
-}
-
-/// A level: one or more runs.
-///
-/// L0 holds multiple runs that *overlap* — one per memtable flush, sharing
-/// keys at newer seqs — so it's read newest-first. Leveled compaction keeps
-/// L1+ at a single run, so those don't overlap.
-#[derive(Debug, Clone, Default)]
-pub struct Level {
-    pub runs: Vec<Run>,
-}
-
 /// The LSM tree — the live store you set and read values on.
 ///
-/// Writes land in the in-memory memtable; [`flush`](Lsm::flush) seals it into
-/// an on-disk L0 SSTable. Reads merge the memtable with the on-disk levels —
-/// resolved from their ids through the page cache — and return the newest
-/// version of each key. Generic over the memtable so it can be swapped.
+/// Writes are logged to the memtable journal, then land in the in-memory
+/// memtable; [`flush`](Lsm::flush) seals it into an on-disk L0 SSTable and
+/// records it in the manifest. Reads merge the memtable with the levels the
+/// manifest reports, resolved from their ids through the page cache. On open
+/// the manifest rebuilds the structure and the journal replays the unflushed
+/// tail. Generic over the memtable.
 pub struct Lsm<M: MemStore = BTreeMemtable> {
     config: LsmConfig,
-    dir: PathBuf,
+    layout: Layout,
     cache: SstPageCache,
-    mem: M,
-    levels: Vec<Level>,
+    mem: Journaled<M>,
+    manifest: ManifestManager,
     seq: u64,
-    next_sst_id: u64,
 }
 
 impl<M: MemStore + Default> Lsm<M> {
     /// Open a tree rooted at `dir` with a default memtable.
-    pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Self {
+    pub fn new(dir: impl Into<PathBuf>, config: LsmConfig) -> Result<Self, LsmError> {
         Self::with_memtable(dir, config, M::default())
     }
 }
 
 impl<M: MemStore> Lsm<M> {
-    /// Open a tree rooted at `dir` using `mem` as its memtable; SSTable files
-    /// live under `dir`.
-    pub fn with_memtable(dir: impl Into<PathBuf>, config: LsmConfig, mem: M) -> Self {
-        let levels = (0..config.num_levels()).map(|_| Level::default()).collect();
+    /// Open a tree rooted at `dir` using `mem` as its memtable. Rebuilds the
+    /// structure from the manifest, replays the memtable journal for unflushed
+    /// writes, and garbage-collects any SSTables an interrupted operation orphaned.
+    pub fn with_memtable(
+        root: impl Into<PathBuf>,
+        config: LsmConfig,
+        mem: M,
+    ) -> Result<Self, LsmError> {
+        let layout = Layout::new(root);
         let cache = SstPageCache::new(config.page_cache);
-        Self {
+        let manifest = ManifestManager::open(&layout.manifests())?;
+
+        // The memstore journals itself and replays its unflushed tail on open.
+        let mem = Journaled::open(layout.memtable_journal(), mem)?;
+        // Resume seq past both the flushed watermark and the recovered tail.
+        let mem_seq = mem
+            .scan_at(.., u64::MAX)
+            .filter_map(Result::ok)
+            .map(|(key, _)| key.seq)
+            .max()
+            .unwrap_or(0);
+        let seq = manifest.version().last_seq().max(mem_seq);
+
+        // Drop SSTables no committed run references (orphaned flush/compaction output).
+        manifest.garbage_collect(&layout.sstables())?;
+
+        Ok(Self {
             config,
-            dir: dir.into(),
+            layout,
             cache,
             mem,
-            levels,
-            seq: 0,
-            next_sst_id: 0,
-        }
+            manifest,
+            seq,
+        })
     }
 
     /// Insert or overwrite a value.
@@ -108,17 +118,23 @@ impl<M: MemStore> Lsm<M> {
     }
 
     fn write(&mut self, key: &[u8], value: &[u8], op: OpType) -> Result<(), LsmError> {
-        self.seq += 1;
         let ikey = InternalKey {
             user_key: key.to_vec(),
-            seq: self.seq,
+            seq: self.seq + 1,
             op,
         };
+        // The memstore logs the write durably before applying it.
         self.mem.put(ikey, value)?;
+        self.seq += 1;
         Ok(())
     }
 
-    /// Seal the memtable into a new on-disk L0 SSTable and clear it.
+    /// Seal the memtable into a new on-disk L0 SSTable, record it in the
+    /// manifest, and clear the memtable (which truncates its journal).
+    ///
+    /// Order is what makes it crash-safe: write the file, then commit the
+    /// manifest edit (the commit point), then clear. A crash before the commit
+    /// leaves the file as an orphan that open's GC sweeps.
     pub fn flush(&mut self) -> Result<(), LsmError> {
         // All versions (including tombstones), in InternalKey order.
         let entries: Vec<KeyValue> = self
@@ -130,23 +146,34 @@ impl<M: MemStore> Lsm<M> {
             return Ok(());
         }
 
-        let id = SsTableId(self.next_sst_id);
-        self.next_sst_id += 1;
+        let id = SsTableId(self.manifest.version().next_sst_id());
         let table_cfg = self
             .config
             .levels
             .first()
             .map(|l| l.table.clone())
             .unwrap_or_default();
-        SsTable::write(id, &self.dir, &table_cfg, entries)?;
+        SsTable::write(id, &self.layout.sstables(), &table_cfg, entries)?;
 
-        if self.levels.is_empty() {
-            self.levels.push(Level::default());
-        }
-        // Newest run first within L0.
-        self.levels[0].runs.insert(0, Run { files: vec![id] });
-        self.mem.clear();
+        // A run is named by its (only) file id; record it as a new L0 run.
+        let edit = ManifestEdit::new()
+            .add_run(RunDescriptor {
+                level: 0,
+                run: RunId(id.0),
+                files: vec![id],
+            })
+            .set_next_sst_id(id.0 + 1)
+            .set_last_seq(self.seq);
+        self.manifest.commit(edit)?;
+
+        self.mem.clear()?;
         Ok(())
+    }
+
+    /// Compact the manifest to a fresh snapshot, bounding its size and the work
+    /// to replay on the next open.
+    pub fn checkpoint(&mut self) -> Result<(), LsmError> {
+        self.manifest.checkpoint()
     }
 
     /// Latest value for `key`, or `None` if absent or deleted.
@@ -163,10 +190,14 @@ impl<M: MemStore> Lsm<M> {
             let (ikey, value) = r?;
             return Ok(resolve(ikey.op, value));
         }
-        for level in &self.levels {
-            for run in &level.runs {
+        let version = self.manifest.version();
+        let sstables = self.layout.sstables();
+        for level in 0..self.config.num_levels() as u32 {
+            // Within a level, newest run first (a newer run shadows older ones).
+            let runs: Vec<_> = version.runs_in(level).collect();
+            for run in runs.into_iter().rev() {
                 for &id in &run.files {
-                    let table = SsTable::open(id, &self.dir, &self.cache)?;
+                    let table = SsTable::open(id, &sstables, &self.cache)?;
                     if let Some(kv) = table.get(key, max_seq, &self.cache)? {
                         return Ok(resolve(kv.key.op, kv.value));
                     }
@@ -197,10 +228,14 @@ impl<M: MemStore> Lsm<M> {
                 .map(|r| r.map(|(key, value)| KeyValue { key, value })),
         ));
 
-        for level in &self.levels {
-            for run in &level.runs {
+        // Version resolution handles ordering by seq, so run order doesn't
+        // matter here — every overlapping file across all levels is a source.
+        let version = self.manifest.version();
+        let sstables = self.layout.sstables();
+        for level in 0..self.config.num_levels() as u32 {
+            for run in version.runs_in(level) {
                 for &id in &run.files {
-                    let table = match SsTable::open(id, &self.dir, &self.cache) {
+                    let table = match SsTable::open(id, &sstables, &self.cache) {
                         Ok(table) => table,
                         Err(e) => {
                             sources.push(Box::new(std::iter::once(Err(read_err(e)))));
@@ -228,11 +263,6 @@ impl<M: MemStore> Lsm<M> {
     /// The tree's configuration.
     pub fn config(&self) -> &LsmConfig {
         &self.config
-    }
-
-    /// On-disk levels, L0 first.
-    pub fn levels(&self) -> &[Level] {
-        &self.levels
     }
 }
 

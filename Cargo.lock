@@ -1007,6 +1007,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1119,6 +1128,7 @@ dependencies = [
  "crc32fast",
  "fastbloom",
  "itertools 0.14.0",
+ "journal",
  "tempfile",
  "thiserror",
 ]

@@ -1,8 +1,8 @@
 //! Integration tests over the new `lsm`-backed engine: put / get / delete /
-//! scan, plus manual flush into on-disk L0.
+//! scan, manual flush into on-disk L0, and recovery across reopen.
 //!
-//! Note: the engine has no WAL or manifest yet, so there is no cross-restart
-//! recovery and no automatic compaction — `flush` is explicit.
+//! Note: compaction is still manual (`flush` is explicit); there's no automatic
+//! compaction yet.
 
 use strata_store::memstore::BTreeMapStore;
 use strata_store::{KVPair, StorageEngine};
@@ -66,6 +66,23 @@ fn many_writes_with_periodic_flush_all_readable() {
         let val = engine.get(format!("k:{i:06}").as_bytes()).unwrap();
         assert_eq!(val, Some(format!("v:{i}").into_bytes()), "missing k:{i:06}");
     }
+}
+
+#[test]
+fn data_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+        engine.put(b"config:theme", b"dark").unwrap();
+        engine.put(b"config:lang", b"en").unwrap();
+        engine.flush().unwrap(); // flushed to L0 + manifest
+        engine.put(b"config:lang", b"fr").unwrap(); // unflushed override
+        engine.delete(b"config:theme").unwrap(); // unflushed tombstone
+    }
+    // Reopen: manifest rebuilds L0, the journal replays the unflushed tail.
+    let engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
+    assert_eq!(engine.get(b"config:theme").unwrap(), None);
+    assert_eq!(engine.get(b"config:lang").unwrap(), Some(b"fr".to_vec()));
 }
 
 #[test]

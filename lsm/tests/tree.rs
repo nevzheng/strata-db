@@ -8,7 +8,7 @@ use tempfile::TempDir;
 /// the returned handle).
 fn tree_with(config: LsmConfig) -> (TempDir, Lsm) {
     let tmp = tempfile::tempdir().unwrap();
-    let lsm = Lsm::new(tmp.path(), config);
+    let lsm = Lsm::new(tmp.path(), config).unwrap();
     (tmp, lsm)
 }
 
@@ -123,4 +123,49 @@ fn delete_in_memtable_shadows_flushed_value() {
     tree.delete(b"k").unwrap(); // tombstone in the memtable
 
     assert_eq!(tree.get(b"k").unwrap(), None);
+}
+
+#[test]
+fn writes_recover_on_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+        tree.put(b"a", b"1").unwrap();
+        tree.put(b"b", b"2").unwrap();
+        tree.delete(b"a").unwrap();
+    }
+    // Reopening replays the write-ahead journal into the memtable.
+    let tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+    assert_eq!(tree.get(b"a").unwrap(), None); // tombstone recovered
+    assert_eq!(tree.get(b"b").unwrap(), Some(b"2".to_vec()));
+}
+
+#[test]
+fn writes_recover_on_reopen_even_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+        tree.put(b"k", b"v").unwrap();
+        tree.flush().unwrap(); // recorded in the manifest; journal truncated
+        tree.put(b"k2", b"v2").unwrap();
+    }
+    // Manifest rebuilds the L0 run; journal replays the unflushed tail.
+    let tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+    assert_eq!(tree.get(b"k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(tree.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn seq_resumes_after_flush_then_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+        tree.put(b"k", b"v1").unwrap();
+        tree.flush().unwrap(); // memtable empty + journal truncated; seq watermark in manifest
+    }
+    // Reopening with an empty memtable must still resume seq past the flushed
+    // write, so a fresh write wins instead of colliding with the old version.
+    let mut tree: Lsm = Lsm::new(tmp.path(), LsmConfig::default()).unwrap();
+    tree.put(b"k", b"v2").unwrap();
+    assert_eq!(tree.get(b"k").unwrap(), Some(b"v2".to_vec()));
 }
