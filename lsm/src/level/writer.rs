@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::Run;
 use super::manifest::{Manifest, ManifestOp};
 use super::sstable::SsTableRef;
-use crate::StorageError;
+use crate::LsmError;
 use crate::memstore::InternalKey;
 
 /// Centralizes SSTable writing, ID generation, and manifest tracking.
@@ -47,7 +47,7 @@ impl SsTableWriter {
         &mut self,
         level: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
-    ) -> Result<Run, StorageError> {
+    ) -> Result<Run, LsmError> {
         let sst_dir = self.dir.join("sst");
         let run_id = self.next_sst_id;
         let start_id = self.next_sst_id;
@@ -75,7 +75,7 @@ impl SsTableWriter {
     }
 
     /// Flush all accumulated ops to the manifest as a single atomic batch.
-    pub fn commit(&mut self) -> Result<(), StorageError> {
+    pub fn commit(&mut self) -> Result<(), LsmError> {
         if !self.pending_ops.is_empty() {
             let ops: Vec<_> = self.pending_ops.drain(..).collect();
             self.manifest.append(&ops, &self.dir)?;

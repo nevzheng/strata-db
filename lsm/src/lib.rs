@@ -10,7 +10,7 @@ pub mod iterator;
 pub mod level;
 pub mod memstore;
 
-pub use iterator::{MergeIterator, ScanIterator};
+pub use iterator::MergeIterator;
 pub use level::LevelConfig;
 
 use std::ops::RangeBounds;
@@ -21,7 +21,7 @@ use thiserror::Error;
 /// A resolved key-value pair of owned byte vectors.
 pub type KVPair = (Vec<u8>, Vec<u8>);
 
-/// Read interface shared by memstores and levels.
+// / Read interface shared by memstores and levels.
 ///
 /// All reads require an explicit sequence number to support
 /// point-in-time queries. The engine provides convenience methods
@@ -46,34 +46,39 @@ pub trait ReadStore {
     ) -> impl Iterator<Item = Result<(InternalKey, Vec<u8>), ReadError>> + '_;
 }
 
-/// Errors returned by storage operations across the LSM building blocks.
+/// The unified error type for the LSM library.
+///
+/// Every fallible operation across the building blocks funnels into
+/// this type; the leaf errors ([`WriteError`], [`ReadError`], and I/O
+/// failures) convert into it. Consuming crates typically wrap it in
+/// their own engine-level error.
 #[derive(Debug, Error)]
-pub enum StorageError {
+pub enum LsmError {
     #[error(transparent)]
     WriteError(WriteError),
     #[error("internal error: {0}")]
     InternalError(String),
 }
 
-impl From<WriteError> for StorageError {
+impl From<WriteError> for LsmError {
     fn from(e: WriteError) -> Self {
         match e {
-            WriteError::Internal(msg) => StorageError::InternalError(msg),
-            other => StorageError::WriteError(other),
+            WriteError::Internal(msg) => LsmError::InternalError(msg),
+            other => LsmError::WriteError(other),
         }
     }
 }
 
-impl From<ReadError> for StorageError {
+impl From<ReadError> for LsmError {
     fn from(e: ReadError) -> Self {
         match e {
-            ReadError::Internal(msg) => StorageError::InternalError(msg),
+            ReadError::Internal(msg) => LsmError::InternalError(msg),
         }
     }
 }
 
-impl From<std::io::Error> for StorageError {
+impl From<std::io::Error> for LsmError {
     fn from(e: std::io::Error) -> Self {
-        StorageError::InternalError(e.to_string())
+        LsmError::InternalError(e.to_string())
     }
 }

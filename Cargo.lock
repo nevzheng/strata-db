@@ -2024,6 +2024,7 @@ dependencies = [
  "itertools 0.14.0",
  "lsm",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 

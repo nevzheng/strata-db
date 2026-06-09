@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 lsm = { path = "../lsm" }
 itertools = "0.14"
+thiserror = "2.0.18"
 tracing = "0.1.44"
 
 [dev-dependencies]

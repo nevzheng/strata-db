@@ -1,40 +1,9 @@
-//! Iterators over storage scans.
+//! Generic k-way merge iterator.
 //!
-//! [`ScanIterator`] is the engine's scan return type. [`MergeIterator`]
-//! is the k-way merge it uses to interleave a memtable scan with
-//! per-level scans in sorted order.
-
-use crate::{KVPair, StorageError};
-
-/// Type-erased iterator over a range scan.
-///
-/// Boxing lets the engine return a stable type without leaking its
-/// source composition (memtable + N levels + merge + resolver) into
-/// every caller's signature. Errors are per-row and do not terminate
-/// the iterator.
-pub struct ScanIterator<'a> {
-    inner: Box<dyn Iterator<Item = Result<KVPair, StorageError>> + 'a>,
-}
-
-impl<'a> ScanIterator<'a> {
-    /// Wrap any fallible iterator of key-value pairs.
-    pub fn new<I>(iter: I) -> Self
-    where
-        I: Iterator<Item = Result<KVPair, StorageError>> + 'a,
-    {
-        Self {
-            inner: Box::new(iter),
-        }
-    }
-}
-
-impl Iterator for ScanIterator<'_> {
-    type Item = Result<KVPair, StorageError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
+//! [`MergeIterator`] interleaves several already-sorted sources into one
+//! sorted stream using a caller-supplied comparator. It is fully generic
+//! over item type — the engine uses it to merge a memtable scan with
+//! per-level scans, but it carries no storage-specific types.
 
 /// K-way merge over multiple iterators with a user-supplied ordering.
 /// Each pull yields the smallest item across all sources; ties resolve
@@ -106,35 +75,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scan_yields_items_in_order_then_none() {
-        let items: Vec<Result<KVPair, StorageError>> = vec![
-            Ok((b"a".to_vec(), b"1".to_vec())),
-            Ok((b"b".to_vec(), b"2".to_vec())),
-        ];
-        let mut scan = ScanIterator::new(items.into_iter());
-
-        assert_eq!(scan.next().unwrap().unwrap().0, b"a".to_vec());
-        assert_eq!(scan.next().unwrap().unwrap().0, b"b".to_vec());
-        assert!(scan.next().is_none());
-    }
-
-    #[test]
-    fn scan_surfaces_errors_inline() {
-        let items: Vec<Result<KVPair, StorageError>> = vec![
-            Ok((b"a".to_vec(), b"1".to_vec())),
-            Err(StorageError::InternalError("boom".into())),
-            Ok((b"b".to_vec(), b"2".to_vec())),
-        ];
-        let mut scan = ScanIterator::new(items.into_iter());
-
-        assert!(scan.next().unwrap().is_ok());
-        assert!(scan.next().unwrap().is_err());
-        // Errors don't terminate — pulling again yields the next item.
-        assert!(scan.next().unwrap().is_ok());
-        assert!(scan.next().is_none());
-    }
 
     #[test]
     fn merge_yields_globally_sorted_order_across_sources() {

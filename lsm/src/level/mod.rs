@@ -11,7 +11,7 @@ use std::ops::{Bound, RangeBounds};
 use itertools::Itertools;
 
 use crate::memstore::{InternalKey, OpType, ReadError};
-use crate::{ReadStore, StorageError};
+use crate::{LsmError, ReadStore};
 
 /// Configuration for a single level in the LSM tree.
 pub struct LevelConfig {
@@ -42,7 +42,7 @@ impl Level {
         writer: &mut SsTableWriter,
         level_idx: u16,
         entries: impl IntoIterator<Item = (InternalKey, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), LsmError> {
         let run = writer.write_run(level_idx, entries)?;
         self.runs.push(run);
         Ok(())
