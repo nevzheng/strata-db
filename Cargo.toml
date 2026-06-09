@@ -1,3 +1,5 @@
 [workspace]
-members = ["spec-test", "lsm", "strata-store", "strata-cli", "strata-db", "strata-server"]
+members = ["lsm"]
+# Parked while the lsm crate is rebuilt; re-added as each is migrated onto it.
+exclude = ["spec-test", "strata-store", "strata-cli", "strata-db", "strata-server"]
 resolver = "3"
