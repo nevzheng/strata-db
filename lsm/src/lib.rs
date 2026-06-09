@@ -21,7 +21,7 @@ pub use config::{
     SizeConfig, TableConfig,
 };
 pub use error::{LsmError, ReadError, WriteError};
-pub use iterator::{KvStream, MergeIterator, Scan, ScanIterator};
+pub use iterator::{KvStream, MergeIterator, ScanIterator};
 pub use key::{InternalKey, KVPair, KeyRange, KeyValue, OpType};
 pub use memstore::BTreeMemtable;
 pub use storage::{
@@ -179,16 +179,16 @@ impl<M: MemStore + Default> Lsm<M> {
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
 
-        // Each source is a sorted, owned stream: the memtable, then every
-        // on-disk file whose key range overlaps the query.
-        let mut sources: Vec<std::vec::IntoIter<Result<KeyValue, ReadError>>> = Vec::new();
+        // Lazy sources, merged on demand: the memtable, then every on-disk file
+        // whose range overlaps. Each file streams one block at a time, so peak
+        // memory is one block per source, not the whole result.
+        let mut sources: Vec<KvStream<'_>> = Vec::new();
 
-        let mem: Vec<Result<KeyValue, ReadError>> = self
-            .mem
-            .scan_at((start.clone(), end.clone()), max_seq)
-            .map(|r| r.map(|(key, value)| KeyValue { key, value }))
-            .collect();
-        sources.push(mem.into_iter());
+        sources.push(Box::new(
+            self.mem
+                .scan_at((start.clone(), end.clone()), max_seq)
+                .map(|r| r.map(|(key, value)| KeyValue { key, value })),
+        ));
 
         for level in &self.levels {
             for run in &level.runs {
@@ -196,17 +196,14 @@ impl<M: MemStore + Default> Lsm<M> {
                     let table = match SsTable::open(id, &self.dir, &self.cache) {
                         Ok(table) => table,
                         Err(e) => {
-                            sources.push(vec![Err(read_err(e))].into_iter());
+                            sources.push(Box::new(std::iter::once(Err(read_err(e)))));
                             continue;
                         }
                     };
                     if !overlaps(&table.header().range, &start, &end) {
                         continue;
                     }
-                    let block: Vec<Result<KeyValue, ReadError>> = table
-                        .scan((start.clone(), end.clone()), max_seq, &self.cache)
-                        .collect();
-                    sources.push(block.into_iter());
+                    sources.push(table.scan((start.clone(), end.clone()), max_seq, &self.cache));
                 }
             }
         }

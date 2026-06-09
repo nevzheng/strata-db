@@ -2,28 +2,14 @@
 //! every scannable node yields, and the [`Scan`] trait that produces it.
 
 use std::cmp::Ordering;
-use std::ops::RangeBounds;
 
 use crate::error::{LsmError, ReadError};
 use crate::key::{KVPair, KeyValue, OpType};
-use crate::storage::SstPageCache;
 
-/// A boxed, sorted stream of versioned records — what every scannable node
-/// yields, and what merges and concats compose.
+/// A boxed, sorted stream of versioned records — what every scannable source
+/// yields, and what merges and concats compose. Lazy: producers fault blocks
+/// in as the consumer pulls.
 pub type KvStream<'a> = Box<dyn Iterator<Item = Result<KeyValue, ReadError>> + 'a>;
-
-/// A node that produces a sorted [`KvStream`] over a key range as of
-/// `max_seq`, reading any on-disk blocks through `cache`. Implemented across
-/// the hierarchy (SsTable → Run → Level → Lsm); a merge or concat of
-/// `KvStream`s is itself a `KvStream`, so nodes nest.
-pub trait Scan {
-    fn scan(
-        &self,
-        range: impl RangeBounds<Vec<u8>>,
-        max_seq: u64,
-        cache: &SstPageCache,
-    ) -> KvStream<'_>;
-}
 
 /// K-way merge over several iterators with a caller-supplied ordering. Each
 /// pull yields the smallest item across all sources; ties resolve in source

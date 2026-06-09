@@ -3,7 +3,8 @@
 //! `write` packs sorted entries into blocks of about `page_size`, pads each to
 //! a page boundary, and records every block (key range + offset/len) in the
 //! header. Reads go through [`SstPageCache`]: `open` faults in the header,
-//! `scan` faults in only the data blocks whose range overlaps the query.
+//! `get`/`scan` fault in only the data blocks they actually need — `scan`
+//! lazily, one block at a time, so peak memory is a single block.
 //!
 //! On-disk layout:
 //! ```text
@@ -21,7 +22,7 @@ use super::codec::{Decode, Encode};
 use super::data::{self, DataBlock};
 use super::header::{BlockMeta, Header};
 use super::page::{Page, PageId};
-use crate::iterator::{KvStream, Scan};
+use crate::iterator::KvStream;
 use crate::key::{KeyRange, KeyValue};
 use crate::{LsmError, ReadError, SsTableId, TableConfig};
 
@@ -99,7 +100,7 @@ impl SsTable {
                 table: id,
                 page_index: idx as u32,
             },
-            || read_block_page(&self.dir, id, block),
+            || read_block_page(&self.dir, id, block.offset, block.len),
         )?;
         let mut cursor = page.bytes();
         let data = DataBlock::decode(&mut cursor).map_err(|e| LsmError::Internal(e.to_string()))?;
@@ -111,51 +112,97 @@ impl SsTable {
         }
         Ok(None)
     }
-}
 
-impl Scan for SsTable {
-    fn scan(
-        &self,
+    /// Lazily stream this table's entries in `range` as of `max_seq`.
+    ///
+    /// Consumes the table — the returned stream owns it and faults one block in
+    /// at a time through `cache`, so peak memory is a single block rather than
+    /// the whole result.
+    pub fn scan(
+        self,
         range: impl RangeBounds<Vec<u8>>,
         max_seq: u64,
         cache: &SstPageCache,
     ) -> KvStream<'_> {
-        let start = range.start_bound().cloned();
-        let end = range.end_bound().cloned();
-        let id = self.header.sst_id;
+        Box::new(BlockStream {
+            table: self,
+            cache,
+            start: range.start_bound().cloned(),
+            end: range.end_bound().cloned(),
+            max_seq,
+            next_block: 0,
+            current: Vec::new().into_iter(),
+        })
+    }
+}
 
-        // Fault in and decode only the blocks whose range overlaps the query.
-        let mut out: Vec<Result<KeyValue, ReadError>> = Vec::new();
-        for (idx, block) in self.header.blocks.iter().enumerate() {
-            if !block_overlaps(block, &start, &end) {
-                continue;
-            }
-            let page = match cache.fetch_block(
+/// A lazy [`KvStream`] over one [`SsTable`]: it owns the table and faults the
+/// next overlapping block in only when the current one is drained.
+struct BlockStream<'a> {
+    table: SsTable,
+    cache: &'a SstPageCache,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    max_seq: u64,
+    next_block: usize,
+    current: std::vec::IntoIter<KeyValue>,
+}
+
+impl BlockStream<'_> {
+    /// Fault block `idx` in, decode it, and keep only entries in range/seq.
+    fn load(&self, idx: usize, offset: u64, len: u32) -> Result<Vec<KeyValue>, ReadError> {
+        let id = self.table.header.sst_id;
+        let page = self
+            .cache
+            .fetch_block(
                 PageId {
                     table: id,
                     page_index: idx as u32,
                 },
-                || read_block_page(&self.dir, id, block),
-            ) {
-                Ok(page) => page,
-                Err(e) => {
-                    out.push(Err(ReadError::Internal(e.to_string())));
-                    continue;
+                || read_block_page(&self.table.dir, id, offset, len),
+            )
+            .map_err(|e| ReadError::Internal(e.to_string()))?;
+        let mut cursor = page.bytes();
+        let data =
+            DataBlock::decode(&mut cursor).map_err(|e| ReadError::Internal(e.to_string()))?;
+        Ok(data
+            .0
+            .into_iter()
+            .filter(|kv| {
+                kv.key.seq <= self.max_seq && in_bounds(&kv.key.user_key, &self.start, &self.end)
+            })
+            .collect())
+    }
+}
+
+impl Iterator for BlockStream<'_> {
+    type Item = Result<KeyValue, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(kv) = self.current.next() {
+                return Some(Ok(kv));
+            }
+            // Current block drained — find the next overlapping block.
+            let (idx, offset, len) = loop {
+                let idx = self.next_block;
+                if idx >= self.table.header.blocks.len() {
+                    return None;
+                }
+                self.next_block += 1;
+                let b = &self.table.header.blocks[idx];
+                if block_overlaps(b, &self.start, &self.end) {
+                    break (idx, b.offset, b.len);
                 }
             };
-            let mut cursor = page.bytes();
-            match DataBlock::decode(&mut cursor) {
-                Ok(decoded) => {
-                    for kv in decoded.0 {
-                        if kv.key.seq <= max_seq && in_bounds(&kv.key.user_key, &start, &end) {
-                            out.push(Ok(kv));
-                        }
-                    }
+            match self.load(idx, offset, len) {
+                Ok(entries) => self.current = entries.into_iter(),
+                Err(e) => {
+                    self.next_block = self.table.header.blocks.len(); // stop after an error
+                    return Some(Err(e));
                 }
-                Err(e) => out.push(Err(ReadError::Internal(e.to_string()))),
             }
         }
-        Box::new(out.into_iter())
     }
 }
 
@@ -252,10 +299,10 @@ fn read_header_page(dir: &Path, id: SsTableId) -> io::Result<Page> {
 }
 
 /// Read one data block's exact bytes (`[offset, offset+len)`), never its padding.
-fn read_block_page(dir: &Path, id: SsTableId, block: &BlockMeta) -> io::Result<Page> {
+fn read_block_page(dir: &Path, id: SsTableId, offset: u64, len: u32) -> io::Result<Page> {
     let mut file = File::open(sst_path(dir, id))?;
-    file.seek(SeekFrom::Start(block.offset))?;
-    let mut bytes = vec![0u8; block.len as usize];
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; len as usize];
     file.read_exact(&mut bytes)?;
     Ok(Page::new(bytes))
 }
@@ -327,6 +374,15 @@ mod tests {
         (tmp, table, cache)
     }
 
+    fn four_keys() -> Vec<KeyValue> {
+        vec![
+            kv(b"a", 1, b"1"),
+            kv(b"b", 2, b"2"),
+            kv(b"c", 3, b"3"),
+            kv(b"d", 4, b"4"),
+        ]
+    }
+
     fn keys(stream: KvStream<'_>) -> Vec<Vec<u8>> {
         stream.map(|r| r.unwrap().key.user_key).collect()
     }
@@ -356,12 +412,7 @@ mod tests {
 
     #[test]
     fn scans_full_range_across_blocks() {
-        let (_tmp, t, cache) = write_and_open(vec![
-            kv(b"a", 1, b"1"),
-            kv(b"b", 2, b"2"),
-            kv(b"c", 3, b"3"),
-            kv(b"d", 4, b"4"),
-        ]);
+        let (_tmp, t, cache) = write_and_open(four_keys());
         assert_eq!(
             keys(t.scan(.., u64::MAX, &cache)),
             vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
@@ -370,18 +421,23 @@ mod tests {
 
     #[test]
     fn scans_sub_range_only_touches_relevant_blocks() {
-        let (_tmp, t, cache) = write_and_open(vec![
-            kv(b"a", 1, b"1"),
-            kv(b"b", 2, b"2"),
-            kv(b"c", 3, b"3"),
-            kv(b"d", 4, b"4"),
-        ]);
+        let (_tmp, t, cache) = write_and_open(four_keys());
         assert_eq!(
             keys(t.scan(b"b".to_vec()..=b"c".to_vec(), u64::MAX, &cache)),
             vec![b"b".to_vec(), b"c".to_vec()]
         );
-        // Only the two overlapping blocks were faulted in.
-        assert_eq!(cache.len(), 1 /* header */ + 2 /* blocks */);
+        // header + only the two overlapping blocks were faulted in.
+        assert_eq!(cache.len(), 1 + 2);
+    }
+
+    #[test]
+    fn scan_faults_blocks_lazily() {
+        let (_tmp, t, cache) = write_and_open(four_keys());
+        assert_eq!(cache.len(), 1, "open faults just the header");
+
+        let mut stream = t.scan(.., u64::MAX, &cache);
+        stream.next().unwrap().unwrap(); // pulling one row faults only the first block
+        assert_eq!(cache.len(), 2, "header + one data block, not all four");
     }
 
     #[test]
@@ -395,7 +451,6 @@ mod tests {
             kv(b"c", 3, b"z"),
         ]);
 
-        // Sanity: padding really is present (data section larger than payload).
         let payload: u64 = t.header().blocks.iter().map(|b| b.len as u64).sum();
         assert!(
             t.header().size_bytes > payload,
@@ -408,5 +463,13 @@ mod tests {
         assert_eq!(got.len(), 3, "padding must not produce extra entries");
         assert_eq!(got[0].value, b"x");
         assert_eq!(got[2].value, b"z");
+    }
+
+    #[test]
+    fn get_finds_present_key_and_misses_absent() {
+        let (_tmp, t, cache) = write_and_open(four_keys());
+        let hit = t.get(b"c", u64::MAX, &cache).unwrap();
+        assert_eq!(hit.map(|kv| kv.value), Some(b"3".to_vec()));
+        assert!(t.get(b"z", u64::MAX, &cache).unwrap().is_none());
     }
 }
