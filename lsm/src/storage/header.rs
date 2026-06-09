@@ -1,9 +1,17 @@
-//! The SSTable header — the cheap, always-loaded metadata (id, range, bloom,
-//! size) at the front of a file, so a lookup can bound or skip the table
-//! without reading its data.
+//! The SSTable header — the cheap, always-loaded metadata at the *end* of a
+//! file: id, whole-table key range, bloom, data size, and the **block index**.
+//! A lookup uses it to bound/skip the table and locate the right block
+//! without scanning data.
 //!
-//! This is the physical home of a table's bloom and key range: the logical
-//! tree holds only the [`SsTableId`], and the cache resolves it to this header.
+//! This is the physical home of the bloom and key ranges; the logical tree
+//! holds only the [`SsTableId`], which the cache resolves to this header.
+//!
+//! ```text
+//! header:
+//! | magic(4) | version(2) | sst_id(8) | min_key | max_key | size(8)
+//! | bloom: num_hashes(4) | block_count(4) | blocks(8 each)
+//! | index: count(4) | per block: min_key | max_key | offset(8) | len(4) |
+//! ```
 
 use super::bloom::BloomFilter;
 use super::codec::{self, Decode, DecodeError, Encode};
@@ -12,26 +20,24 @@ use crate::{KeyRange, SsTableId};
 const MAGIC: u32 = 0x5353_5431; // "SST1"
 const VERSION: u16 = 1;
 
+/// Index entry for one data block: its key range and where its bytes sit in
+/// the file's data section (offset from the section start, plus length).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMeta {
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
+    pub offset: u64,
+    pub len: u32,
+}
+
 /// An SSTable file's header.
-///
-/// ```text
-/// ┌────────────┬──────────────┬─────────────┐
-/// │ magic (4B) │ version (2B) │ sst_id (8B) │
-/// ├────────────────┬──────────┼─────────────┴──┬──────────┐
-/// │ min_key_len(4B)│ min_key  │ max_key_len(4B)│ max_key  │
-/// ├────────────────┼──────────┴────┬───────────┴──────────┤
-/// │ size_bytes(8B) │ num_hashes(4B)│ block_count (4B)     │
-/// ├────────────────┴───────────────┴──────────────────────┤
-/// │ bloom blocks (8B × block_count)                        │
-/// └────────────────────────────────────────────────────────┘
-/// ```
-/// (Prefixed by `magic`/`version` so a corrupt or foreign file is rejected.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub sst_id: SsTableId,
     pub range: KeyRange,
     pub bloom: BloomFilter,
     pub size_bytes: u64,
+    pub blocks: Vec<BlockMeta>,
 }
 
 impl Encode for Header {
@@ -43,6 +49,13 @@ impl Encode for Header {
         codec::put_bytes(out, &self.range.max);
         out.extend_from_slice(&self.size_bytes.to_be_bytes());
         encode_bloom(out, &self.bloom);
+        out.extend_from_slice(&(self.blocks.len() as u32).to_be_bytes());
+        for b in &self.blocks {
+            codec::put_bytes(out, &b.min_key);
+            codec::put_bytes(out, &b.max_key);
+            out.extend_from_slice(&b.offset.to_be_bytes());
+            out.extend_from_slice(&b.len.to_be_bytes());
+        }
     }
 }
 
@@ -64,11 +77,28 @@ impl Decode for Header {
         let max = codec::get_bytes(bytes)?.to_vec();
         let size_bytes = codec::get_u64(bytes)?;
         let bloom = decode_bloom(bytes)?;
+
+        let block_count = codec::get_u32(bytes)? as usize;
+        let mut blocks = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let min_key = codec::get_bytes(bytes)?.to_vec();
+            let max_key = codec::get_bytes(bytes)?.to_vec();
+            let offset = codec::get_u64(bytes)?;
+            let len = codec::get_u32(bytes)?;
+            blocks.push(BlockMeta {
+                min_key,
+                max_key,
+                offset,
+                len,
+            });
+        }
+
         Ok(Header {
             sst_id,
             range: KeyRange { min, max },
             bloom,
             size_bytes,
+            blocks,
         })
     }
 }
@@ -109,6 +139,20 @@ mod tests {
             },
             bloom: BloomFilter::build(BloomConfig { bits_per_key: 10 }, keys.len(), keys),
             size_bytes: 4096,
+            blocks: vec![
+                BlockMeta {
+                    min_key: b"a".to_vec(),
+                    max_key: b"m".to_vec(),
+                    offset: 0,
+                    len: 2048,
+                },
+                BlockMeta {
+                    min_key: b"n".to_vec(),
+                    max_key: b"z".to_vec(),
+                    offset: 2048,
+                    len: 2048,
+                },
+            ],
         }
     }
 

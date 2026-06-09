@@ -55,7 +55,14 @@ impl Decode for KeyValue {
     }
 }
 
-/// The data section of an SSTable file: entries packed back-to-back.
+/// Encoded byte size of one entry — used to pack entries into target-size
+/// blocks. Mirrors [`Encode for KeyValue`](KeyValue): `ukey_len(4) + ukey +
+/// seq(8) + op(1) + val_len(4) + value`.
+pub(crate) fn entry_size(kv: &KeyValue) -> usize {
+    4 + kv.key.user_key.len() + 8 + 1 + 4 + kv.value.len()
+}
+
+/// One data block: entries packed back-to-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataBlock(pub Vec<KeyValue>);
 
