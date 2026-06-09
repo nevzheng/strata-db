@@ -8,6 +8,7 @@
 //! KeyValue → Run → Level → Lsm
 //! ```
 
+mod compaction;
 mod config;
 mod error;
 mod iterator;
@@ -18,6 +19,7 @@ mod memstore;
 mod storage;
 mod store;
 
+pub use compaction::{CompactionJob, CompactionKind};
 pub use config::{
     BloomConfig, CachePolicy, LevelConfig, LsmConfig, PageCacheConfig, PageConfig, RunConfig,
     SizeConfig, TableConfig,
