@@ -26,12 +26,14 @@
 mod cache;
 mod error;
 pub mod journal;
+mod loc;
 pub mod page;
 mod vfs;
 
 pub use cache::{EvictionPolicy, LruK, PageCache, ReadPage, WritePage};
 pub use error::{PageError, Result};
 pub use journal::{PageJournal, PageOp};
+pub use loc::TupleLoc;
 pub use page::{HEADER_LEN, PAGE_SIZE, PageHeader, TuplePage, TuplePageMut, read_text, write_text};
 pub use vfs::{BLOCK_SIZE, FileVfs, MemVfs, Vfs};
 
