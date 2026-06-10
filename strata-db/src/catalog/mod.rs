@@ -189,9 +189,11 @@ pub(crate) fn get_dataset(
     project_id: ProjectId,
     name: &str,
 ) -> Result<Option<DatasetMeta>, QueryError> {
-    let mut key = project_id.as_bytes().to_vec();
-    key.extend_from_slice(name.as_bytes());
-    lookup_meta(engine, &datasets_meta_table(), &key)
+    lookup_meta(
+        engine,
+        &datasets_meta_table(),
+        &dataset_key(project_id, name),
+    )
 }
 
 pub(crate) fn get_table(
@@ -200,10 +202,33 @@ pub(crate) fn get_table(
     dataset_id: DatasetId,
     name: &str,
 ) -> Result<Option<TableMeta>, QueryError> {
+    lookup_meta(
+        engine,
+        &tables_meta_table(),
+        &table_key(project_id, dataset_id, name),
+    )
+}
+
+// Composite catalog keys, shared by readers (`get_*`) and writers (`Catalog`)
+// so the two can never disagree on a row's address. Datasets are scoped under
+// their project, tables under their (project, dataset).
+
+fn dataset_key(project_id: ProjectId, name: &str) -> Vec<u8> {
+    let mut key = project_id.as_bytes().to_vec();
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+fn dataset_scope(project_id: ProjectId, dataset_id: DatasetId) -> Vec<u8> {
     let mut key = project_id.as_bytes().to_vec();
     key.extend_from_slice(dataset_id.as_bytes());
+    key
+}
+
+fn table_key(project_id: ProjectId, dataset_id: DatasetId, name: &str) -> Vec<u8> {
+    let mut key = dataset_scope(project_id, dataset_id);
     key.extend_from_slice(name.as_bytes());
-    lookup_meta(engine, &tables_meta_table(), &key)
+    key
 }
 
 /// Resolve a three-part `project.dataset.table` name to a `Table`
@@ -302,7 +327,12 @@ impl<'a> CatalogReader<'a> {
     }
 }
 
-// --- Catalog (top-level) ---
+// --- Catalog: write-side metadata operations ---
+//
+// One handle for all of projects, datasets, and tables. Scope is passed as
+// id parameters (a dataset belongs to a project, a table to a project +
+// dataset) rather than carried in nested handles. Each `create_*`/`drop_*`
+// reads-then-writes under a single engine borrow.
 
 pub(crate) struct Catalog<'db> {
     api: TableApi<'db>,
@@ -313,14 +343,12 @@ impl<'db> Catalog<'db> {
         Self { api }
     }
 
+    // --- projects ---
+
     pub(crate) fn create_project(&self, name: &str) -> Result<ProjectMeta, QueryError> {
         let mut engine = self.api.write();
         if get_project(&engine, name)?.is_some() {
-            return Err(CatalogError::AlreadyExists {
-                kind: ResourceKind::Project,
-                name: name.to_string(),
-            }
-            .into());
+            return Err(already_exists(ResourceKind::Project, name));
         }
         let meta = ProjectMeta {
             id: ProjectId::new(),
@@ -331,58 +359,31 @@ impl<'db> Catalog<'db> {
     }
 
     pub(crate) fn open_project(&self, name: &str) -> Result<Option<ProjectMeta>, QueryError> {
-        let engine = self.api.read();
-        get_project(&engine, name)
+        get_project(&self.api.read(), name)
     }
 
     pub(crate) fn drop_project(&self, name: &str) -> Result<(), QueryError> {
         let mut engine = self.api.write();
         if get_project(&engine, name)?.is_none() {
-            return Err(CatalogError::NotFound {
-                kind: ResourceKind::Project,
-                name: name.to_string(),
-            }
-            .into());
+            return Err(not_found(ResourceKind::Project, name));
         }
         remove_meta(&mut engine, &projects_meta_table(), name.as_bytes())
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
-        let engine = self.api.read();
-        list_metas(&engine, projects_meta_table(), &[])
+        list_metas(&self.api.read(), projects_meta_table(), &[])
     }
 
-    /// Narrow the catalog to a single project's scope for dataset operations.
-    pub(crate) fn project(&self, project_id: ProjectId) -> CatalogProject<'db> {
-        CatalogProject {
-            api: self.api,
-            project_id,
-        }
-    }
-}
+    // --- datasets (scoped to a project) ---
 
-// --- CatalogProject (scoped to one project) ---
-
-pub(crate) struct CatalogProject<'db> {
-    api: TableApi<'db>,
-    project_id: ProjectId,
-}
-
-impl<'db> CatalogProject<'db> {
-    fn user_key(&self, name: &str) -> Vec<u8> {
-        let mut k = self.project_id.as_bytes().to_vec();
-        k.extend_from_slice(name.as_bytes());
-        k
-    }
-
-    pub(crate) fn create_dataset(&self, name: &str) -> Result<DatasetMeta, QueryError> {
+    pub(crate) fn create_dataset(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+    ) -> Result<DatasetMeta, QueryError> {
         let mut engine = self.api.write();
-        if get_dataset(&engine, self.project_id, name)?.is_some() {
-            return Err(CatalogError::AlreadyExists {
-                kind: ResourceKind::Dataset,
-                name: name.to_string(),
-            }
-            .into());
+        if get_dataset(&engine, project_id, name)?.is_some() {
+            return Err(already_exists(ResourceKind::Dataset, name));
         }
         let meta = DatasetMeta {
             id: DatasetId::new(),
@@ -391,74 +392,55 @@ impl<'db> CatalogProject<'db> {
         write_meta(
             &mut engine,
             &datasets_meta_table(),
-            &self.user_key(name),
+            &dataset_key(project_id, name),
             &meta,
         )?;
         Ok(meta)
     }
 
-    pub(crate) fn open_dataset(&self, name: &str) -> Result<Option<DatasetMeta>, QueryError> {
-        let engine = self.api.read();
-        get_dataset(&engine, self.project_id, name)
+    pub(crate) fn open_dataset(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+    ) -> Result<Option<DatasetMeta>, QueryError> {
+        get_dataset(&self.api.read(), project_id, name)
     }
 
-    pub(crate) fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
+    pub(crate) fn drop_dataset(&self, project_id: ProjectId, name: &str) -> Result<(), QueryError> {
         let mut engine = self.api.write();
-        if get_dataset(&engine, self.project_id, name)?.is_none() {
-            return Err(CatalogError::NotFound {
-                kind: ResourceKind::Dataset,
-                name: name.to_string(),
-            }
-            .into());
+        if get_dataset(&engine, project_id, name)?.is_none() {
+            return Err(not_found(ResourceKind::Dataset, name));
         }
-        remove_meta(&mut engine, &datasets_meta_table(), &self.user_key(name))
+        remove_meta(
+            &mut engine,
+            &datasets_meta_table(),
+            &dataset_key(project_id, name),
+        )
     }
 
-    pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, QueryError> {
-        let engine = self.api.read();
-        list_metas(&engine, datasets_meta_table(), self.project_id.as_bytes())
+    pub(crate) fn list_datasets(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<DatasetMeta>, QueryError> {
+        list_metas(
+            &self.api.read(),
+            datasets_meta_table(),
+            project_id.as_bytes(),
+        )
     }
 
-    /// Narrow further to a single dataset's scope for table operations.
-    pub(crate) fn dataset(&self, dataset_id: DatasetId) -> CatalogDataset<'db> {
-        CatalogDataset {
-            api: self.api,
-            project_id: self.project_id,
-            dataset_id,
-        }
-    }
-}
+    // --- tables (scoped to a project + dataset) ---
 
-// --- CatalogDataset (scoped to one project + dataset) ---
-
-pub(crate) struct CatalogDataset<'db> {
-    api: TableApi<'db>,
-    project_id: ProjectId,
-    dataset_id: DatasetId,
-}
-
-impl<'db> CatalogDataset<'db> {
-    fn user_key(&self, name: &str) -> Vec<u8> {
-        let mut k = self.project_id.as_bytes().to_vec();
-        k.extend_from_slice(self.dataset_id.as_bytes());
-        k.extend_from_slice(name.as_bytes());
-        k
-    }
-
-    fn scope_prefix(&self) -> Vec<u8> {
-        let mut k = self.project_id.as_bytes().to_vec();
-        k.extend_from_slice(self.dataset_id.as_bytes());
-        k
-    }
-
-    pub(crate) fn create_table(&self, name: &str, schema: Schema) -> Result<TableMeta, QueryError> {
+    pub(crate) fn create_table(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: &str,
+        schema: Schema,
+    ) -> Result<TableMeta, QueryError> {
         let mut engine = self.api.write();
-        if get_table(&engine, self.project_id, self.dataset_id, name)?.is_some() {
-            return Err(CatalogError::AlreadyExists {
-                kind: ResourceKind::Table,
-                name: name.to_string(),
-            }
-            .into());
+        if get_table(&engine, project_id, dataset_id, name)?.is_some() {
+            return Err(already_exists(ResourceKind::Table, name));
         }
         let meta = TableMeta {
             id: TableId::new(),
@@ -468,31 +450,63 @@ impl<'db> CatalogDataset<'db> {
         write_meta(
             &mut engine,
             &tables_meta_table(),
-            &self.user_key(name),
+            &table_key(project_id, dataset_id, name),
             &meta,
         )?;
         Ok(meta)
     }
 
-    pub(crate) fn open_table(&self, name: &str) -> Result<Option<TableMeta>, QueryError> {
-        let engine = self.api.read();
-        get_table(&engine, self.project_id, self.dataset_id, name)
+    pub(crate) fn open_table(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: &str,
+    ) -> Result<Option<TableMeta>, QueryError> {
+        get_table(&self.api.read(), project_id, dataset_id, name)
     }
 
-    pub(crate) fn drop_table(&self, name: &str) -> Result<(), QueryError> {
+    pub(crate) fn drop_table(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: &str,
+    ) -> Result<(), QueryError> {
         let mut engine = self.api.write();
-        if get_table(&engine, self.project_id, self.dataset_id, name)?.is_none() {
-            return Err(CatalogError::NotFound {
-                kind: ResourceKind::Table,
-                name: name.to_string(),
-            }
-            .into());
+        if get_table(&engine, project_id, dataset_id, name)?.is_none() {
+            return Err(not_found(ResourceKind::Table, name));
         }
-        remove_meta(&mut engine, &tables_meta_table(), &self.user_key(name))
+        remove_meta(
+            &mut engine,
+            &tables_meta_table(),
+            &table_key(project_id, dataset_id, name),
+        )
     }
 
-    pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, QueryError> {
-        let engine = self.api.read();
-        list_metas(&engine, tables_meta_table(), &self.scope_prefix())
+    pub(crate) fn list_tables(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+    ) -> Result<Vec<TableMeta>, QueryError> {
+        list_metas(
+            &self.api.read(),
+            tables_meta_table(),
+            &dataset_scope(project_id, dataset_id),
+        )
     }
+}
+
+fn already_exists(kind: ResourceKind, name: &str) -> QueryError {
+    CatalogError::AlreadyExists {
+        kind,
+        name: name.to_string(),
+    }
+    .into()
+}
+
+fn not_found(kind: ResourceKind, name: &str) -> QueryError {
+    CatalogError::NotFound {
+        kind,
+        name: name.to_string(),
+    }
+    .into()
 }

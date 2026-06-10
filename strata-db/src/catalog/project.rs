@@ -24,16 +24,13 @@ impl<'db> Project<'db> {
     }
 
     pub fn create_dataset(&self, name: &str) -> Result<Dataset<'db>, QueryError> {
-        let meta = Catalog::new(self.api)
-            .project(self.id)
-            .create_dataset(name)?;
+        let meta = Catalog::new(self.api).create_dataset(self.id, name)?;
         Ok(Dataset::new(self.api, self.id, meta.id, meta.name))
     }
 
     pub fn dataset(&self, name: &str) -> Result<Dataset<'db>, QueryError> {
         let meta = Catalog::new(self.api)
-            .project(self.id)
-            .open_dataset(name)?
+            .open_dataset(self.id, name)?
             .ok_or_else(|| CatalogError::NotFound {
                 kind: ResourceKind::Dataset,
                 name: name.to_string(),
@@ -42,11 +39,11 @@ impl<'db> Project<'db> {
     }
 
     pub fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
-        Catalog::new(self.api).project(self.id).drop_dataset(name)
+        Catalog::new(self.api).drop_dataset(self.id, name)
     }
 
     pub fn list_datasets(&self) -> Result<Vec<String>, QueryError> {
-        let metas = Catalog::new(self.api).project(self.id).list_datasets()?;
+        let metas = Catalog::new(self.api).list_datasets(self.id)?;
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 }

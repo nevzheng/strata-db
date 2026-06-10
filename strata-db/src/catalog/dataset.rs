@@ -40,10 +40,7 @@ impl<'db> Dataset<'db> {
     }
 
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.api)
-            .project(self.project_id)
-            .dataset(self.id)
-            .create_table(name, schema)?;
+        let meta = Catalog::new(self.api).create_table(self.project_id, self.id, name, schema)?;
         Ok(Table::new(
             self.project_id,
             self.id,
@@ -55,9 +52,7 @@ impl<'db> Dataset<'db> {
 
     pub fn table(&self, name: &str) -> Result<Table, QueryError> {
         let meta = Catalog::new(self.api)
-            .project(self.project_id)
-            .dataset(self.id)
-            .open_table(name)?
+            .open_table(self.project_id, self.id, name)?
             .ok_or_else(|| CatalogError::NotFound {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
@@ -72,17 +67,11 @@ impl<'db> Dataset<'db> {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        Catalog::new(self.api)
-            .project(self.project_id)
-            .dataset(self.id)
-            .drop_table(name)
+        Catalog::new(self.api).drop_table(self.project_id, self.id, name)
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, QueryError> {
-        let metas = Catalog::new(self.api)
-            .project(self.project_id)
-            .dataset(self.id)
-            .list_tables()?;
+        let metas = Catalog::new(self.api).list_tables(self.project_id, self.id)?;
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 }
