@@ -236,6 +236,7 @@ fn to_pgwire_error(e: &QueryError) -> PgWireError {
         QueryError::Catalog(_) => "42P01",     // undefined_table (closest fit today)
         QueryError::Unsupported(_) => "0A000", // feature_not_supported
         QueryError::Type(_) => "42804",        // datatype_mismatch
+        QueryError::Storage(e) if e.is_exhausted() => "53000", // insufficient_resources
         QueryError::Storage(_) => "58000",     // system_error
         QueryError::Codec(_) | QueryError::Internal(_) => "XX000", // internal_error
     };
