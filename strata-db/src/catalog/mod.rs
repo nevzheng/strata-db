@@ -18,6 +18,18 @@
 //! - **Existence checks are non-atomic.** `create_*` and `drop_*`
 //!   read-then-write; concurrent callers could race. Fine for the
 //!   current single-threaded use; engine-level CAS would close the gap.
+//! - **Dead incarnations are not garbage-collected.** `CREATE OR
+//!   REPLACE` (and `DROP`) leave the prior incarnation's data rows on
+//!   disk under a lower [`TruncationId`](crate::catalog::ids::TruncationId)
+//!   prefix — unreachable, since reads only scan the live (largest) id.
+//!   Correctness never depends on reclaiming them: the swap is a single
+//!   metadata write, and the old rows are simply orphaned. A future GC
+//!   pass scans for these dead prefixes (incarnations below the live id,
+//!   eventually past a retention window) and deletes them — at which
+//!   point "dead incarnations" become a Time-Travel retention policy
+//!   rather than pure garbage. Because the truncation id is monotonic,
+//!   "dead = everything below the live id" is implicit; no graveyard
+//!   list is stored.
 
 pub mod consts;
 pub mod dataset;
@@ -35,7 +47,7 @@ use crate::catalog::consts::{
     system_table_schema,
 };
 use crate::catalog::db::TableApi;
-use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId};
+use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId, TruncationId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
@@ -51,8 +63,21 @@ pub enum ResourceKind {
 
 #[derive(Debug)]
 pub enum CatalogError {
-    NotFound { kind: ResourceKind, name: String },
-    AlreadyExists { kind: ResourceKind, name: String },
+    NotFound {
+        kind: ResourceKind,
+        name: String,
+    },
+    AlreadyExists {
+        kind: ResourceKind,
+        name: String,
+    },
+    /// A table's incarnation counter hit `u64::MAX` — no further
+    /// `CREATE OR REPLACE` is possible without GC reclaiming the space.
+    /// Effectively unreachable; surfaced rather than wrapping the
+    /// counter, which would alias new writes onto old incarnation data.
+    TruncationExhausted {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -67,9 +92,14 @@ pub(crate) struct DatasetMeta {
     pub name: String,
 }
 
+/// One row per table *incarnation*. `CREATE OR REPLACE` writes a new
+/// row with a higher `truncation_id`, keeping its own `schema`; the
+/// live incarnation is the one with the largest id. `id` (the logical
+/// table identity) is stable across incarnations.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TableMeta {
     pub id: TableId,
+    pub truncation_id: TruncationId,
     pub name: String,
     pub schema: Schema,
 }
@@ -138,10 +168,13 @@ fn remove_meta(
 /// catalog reuse the regular Table API instead of hand-rolling row
 /// keys against the engine.
 fn system_table(table_id: TableId, name: &'static str) -> Table {
+    // System tables are never replaced, so they live at the initial
+    // incarnation forever.
     Table::new(
         SYSTEM_PROJECT_ID,
         CATALOG_DATASET_ID,
         table_id,
+        TruncationId::INITIAL,
         name.to_string(),
         system_table_schema(),
     )
@@ -196,22 +229,43 @@ pub(crate) fn get_dataset(
     )
 }
 
+/// The live incarnation of `name`: the catalog row with the largest
+/// truncation id. `None` if the table was never created (or fully
+/// dropped). Lower-id rows are retained history.
 pub(crate) fn get_table(
     engine: &StorageEngine<BTreeMapStore>,
     project_id: ProjectId,
     dataset_id: DatasetId,
     name: &str,
 ) -> Result<Option<TableMeta>, QueryError> {
-    lookup_meta(
+    Ok(table_incarnations(engine, project_id, dataset_id, name)?
+        .into_iter()
+        .max_by_key(|m| m.truncation_id))
+}
+
+/// Every retained incarnation of `name`, in no particular order. We
+/// scan the whole dataset and filter on the deserialized name rather
+/// than prefix-scanning by name, because table names are variable
+/// length — a name prefix scan would alias `ev` onto `events`.
+fn table_incarnations(
+    engine: &StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    name: &str,
+) -> Result<Vec<TableMeta>, QueryError> {
+    let metas: Vec<TableMeta> = list_metas(
         engine,
-        &tables_meta_table(),
-        &table_key(project_id, dataset_id, name),
-    )
+        tables_meta_table(),
+        &dataset_scope(project_id, dataset_id),
+    )?;
+    Ok(metas.into_iter().filter(|m| m.name == name).collect())
 }
 
 // Composite catalog keys, shared by readers (`get_*`) and writers (`Catalog`)
 // so the two can never disagree on a row's address. Datasets are scoped under
-// their project, tables under their (project, dataset).
+// their project, tables under their (project, dataset). A table row is keyed
+// per incarnation, with the truncation id as a fixed-width suffix — so each
+// `CREATE OR REPLACE` lands a distinct row rather than overwriting.
 
 fn dataset_key(project_id: ProjectId, name: &str) -> Vec<u8> {
     let mut key = project_id.as_bytes().to_vec();
@@ -225,9 +279,17 @@ fn dataset_scope(project_id: ProjectId, dataset_id: DatasetId) -> Vec<u8> {
     key
 }
 
-fn table_key(project_id: ProjectId, dataset_id: DatasetId, name: &str) -> Vec<u8> {
+fn table_key(
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    name: &str,
+    truncation_id: TruncationId,
+) -> Vec<u8> {
     let mut key = dataset_scope(project_id, dataset_id);
     key.extend_from_slice(name.as_bytes());
+    // Fixed-width suffix: makes the (name, truncation_id) pair an
+    // injective key, so distinct incarnations never collide.
+    key.extend_from_slice(&truncation_id.to_be_bytes());
     key
 }
 
@@ -260,9 +322,89 @@ pub(crate) fn resolve_table(
         project_meta.id,
         dataset_meta.id,
         table_meta.id,
+        table_meta.truncation_id,
         table_meta.name,
         table_meta.schema,
     ))
+}
+
+// --- Write-side free functions ---------------------------------------------
+//
+// Mirror the read-side `get_*` helpers: they take a borrowed `&mut
+// StorageEngine` so a caller already holding the storage lock (the
+// executor running a DDL sink under a `QueryContext`) can write catalog
+// metadata without going through the lock-acquiring `Catalog` facade.
+// `Catalog`'s methods delegate here so the two paths can't diverge.
+
+/// `CREATE TABLE`: mint a fresh table at the initial incarnation.
+/// Errors `AlreadyExists` if any incarnation of the name is live.
+pub(crate) fn create_table(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    name: &str,
+    schema: Schema,
+) -> Result<TableMeta, QueryError> {
+    if get_table(engine, project_id, dataset_id, name)?.is_some() {
+        return Err(already_exists(ResourceKind::Table, name));
+    }
+    let meta = TableMeta {
+        id: TableId::new(),
+        truncation_id: TruncationId::INITIAL,
+        name: name.to_string(),
+        schema,
+    };
+    put_table_meta(engine, project_id, dataset_id, &meta)?;
+    Ok(meta)
+}
+
+/// `CREATE OR REPLACE TABLE`: write a new incarnation one above the
+/// current largest truncation id, keeping the table's logical `id`
+/// stable. Behaves like `create_table` when the name is absent. The new
+/// incarnation starts empty; the old one's rows are retained but
+/// unreachable (a future GC pass reclaims them). Errors
+/// `TruncationExhausted` only if the counter has hit `u64::MAX`.
+pub(crate) fn replace_table(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    name: &str,
+    schema: Schema,
+) -> Result<TableMeta, QueryError> {
+    let (truncation_id, id) = match get_table(engine, project_id, dataset_id, name)? {
+        Some(current) => (
+            current
+                .truncation_id
+                .next()
+                .ok_or_else(|| truncation_exhausted(name))?,
+            // Stable logical identity across incarnations.
+            current.id,
+        ),
+        None => (TruncationId::INITIAL, TableId::new()),
+    };
+    let meta = TableMeta {
+        id,
+        truncation_id,
+        name: name.to_string(),
+        schema,
+    };
+    put_table_meta(engine, project_id, dataset_id, &meta)?;
+    Ok(meta)
+}
+
+/// Persist one incarnation row, keyed by its `(name, truncation_id)`.
+fn put_table_meta(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    dataset_id: DatasetId,
+    meta: &TableMeta,
+) -> Result<(), QueryError> {
+    write_meta(
+        engine,
+        &tables_meta_table(),
+        &table_key(project_id, dataset_id, &meta.name, meta.truncation_id),
+        meta,
+    )
 }
 
 fn lookup_meta<T: serde::de::DeserializeOwned>(
@@ -439,21 +581,7 @@ impl<'db> Catalog<'db> {
         schema: Schema,
     ) -> Result<TableMeta, QueryError> {
         let mut engine = self.api.write();
-        if get_table(&engine, project_id, dataset_id, name)?.is_some() {
-            return Err(already_exists(ResourceKind::Table, name));
-        }
-        let meta = TableMeta {
-            id: TableId::new(),
-            name: name.to_string(),
-            schema,
-        };
-        write_meta(
-            &mut engine,
-            &tables_meta_table(),
-            &table_key(project_id, dataset_id, name),
-            &meta,
-        )?;
-        Ok(meta)
+        create_table(&mut engine, project_id, dataset_id, name, schema)
     }
 
     pub(crate) fn open_table(
@@ -472,26 +600,45 @@ impl<'db> Catalog<'db> {
         name: &str,
     ) -> Result<(), QueryError> {
         let mut engine = self.api.write();
-        if get_table(&engine, project_id, dataset_id, name)?.is_none() {
+        // Drop every incarnation so the name stops resolving entirely;
+        // their data rows become dead prefixes for a future GC pass.
+        let incarnations = table_incarnations(&engine, project_id, dataset_id, name)?;
+        if incarnations.is_empty() {
             return Err(not_found(ResourceKind::Table, name));
         }
-        remove_meta(
-            &mut engine,
-            &tables_meta_table(),
-            &table_key(project_id, dataset_id, name),
-        )
+        for meta in incarnations {
+            remove_meta(
+                &mut engine,
+                &tables_meta_table(),
+                &table_key(project_id, dataset_id, name, meta.truncation_id),
+            )?;
+        }
+        Ok(())
     }
 
+    /// One row per *live* table — the highest-truncation incarnation of
+    /// each name. Retained older incarnations are collapsed away.
     pub(crate) fn list_tables(
         &self,
         project_id: ProjectId,
         dataset_id: DatasetId,
     ) -> Result<Vec<TableMeta>, QueryError> {
-        list_metas(
+        let metas: Vec<TableMeta> = list_metas(
             &self.api.read(),
             tables_meta_table(),
             &dataset_scope(project_id, dataset_id),
-        )
+        )?;
+        let mut live: std::collections::HashMap<String, TableMeta> =
+            std::collections::HashMap::new();
+        for meta in metas {
+            let keep = live
+                .get(&meta.name)
+                .is_none_or(|existing| meta.truncation_id > existing.truncation_id);
+            if keep {
+                live.insert(meta.name.clone(), meta);
+            }
+        }
+        Ok(live.into_values().collect())
     }
 }
 
@@ -506,6 +653,13 @@ fn already_exists(kind: ResourceKind, name: &str) -> QueryError {
 fn not_found(kind: ResourceKind, name: &str) -> QueryError {
     CatalogError::NotFound {
         kind,
+        name: name.to_string(),
+    }
+    .into()
+}
+
+fn truncation_exhausted(name: &str) -> QueryError {
+    CatalogError::TruncationExhausted {
         name: name.to_string(),
     }
     .into()

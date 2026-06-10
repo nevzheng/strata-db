@@ -9,6 +9,8 @@
 //! engine, JIT codegen) consumes it and produces tuples; the plan does
 //! no work itself.
 
+use crate::catalog::ids::{DatasetId, ProjectId};
+use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
@@ -58,4 +60,16 @@ pub enum PlanNode {
     /// Sink: drain `input` and delete each tuple by its primary-key
     /// column (column 0). Same top-of-plan constraint as `Insert`.
     Delete { table: Table, input: Box<PlanNode> },
+    /// DDL sink: mint a new table in the catalog. Top-of-plan only —
+    /// it writes catalog metadata through `&mut ctx`, like the other
+    /// sinks, and produces no rows.
+    CreateTable {
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: String,
+        schema: Schema,
+        /// `CREATE OR REPLACE` — replace any existing table (bumping its
+        /// truncation id) instead of erroring on conflict.
+        or_replace: bool,
+    },
 }

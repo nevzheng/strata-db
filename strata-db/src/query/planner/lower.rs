@@ -79,6 +79,19 @@ impl LowerNode for LogicalNode {
                 table: table.clone(),
                 input: Box::new(input.lower()),
             },
+            LogicalNode::CreateTable {
+                project_id,
+                dataset_id,
+                name,
+                schema,
+                or_replace,
+            } => PlanNode::CreateTable {
+                project_id: *project_id,
+                dataset_id: *dataset_id,
+                name: name.clone(),
+                schema: schema.clone(),
+                or_replace: *or_replace,
+            },
         }
     }
 }

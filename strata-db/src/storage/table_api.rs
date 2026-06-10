@@ -21,7 +21,7 @@ use std::ops::{Bound, RangeBounds};
 use strata_store::memstore::BTreeMapStore;
 use strata_store::{Scan, StorageEngine};
 
-use crate::catalog::ids::{DatasetId, ProjectId, TableId};
+use crate::catalog::ids::{DatasetId, ProjectId, TableId, TruncationId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
@@ -94,6 +94,7 @@ pub struct TableReader<'engine> {
     project_id: ProjectId,
     dataset_id: DatasetId,
     table_id: TableId,
+    truncation_id: TruncationId,
     schema: Schema,
 }
 
@@ -104,6 +105,7 @@ impl<'engine> TableReader<'engine> {
             project_id: table.project_id(),
             dataset_id: table.dataset_id(),
             table_id: table.id(),
+            truncation_id: table.truncation_id(),
             schema: table.schema().clone(),
         }
     }
@@ -131,9 +133,10 @@ impl<'engine> TableReader<'engine> {
             project_id,
             dataset_id,
             table_id,
+            truncation_id,
             schema,
         } = self;
-        let table_prefix = RowKey::table_prefix(project_id, dataset_id, table_id);
+        let table_prefix = RowKey::table_prefix(project_id, dataset_id, table_id, truncation_id);
 
         // Prepend the table prefix to each user-key bound, defaulting
         // unbounded sides to the table boundary so the scan stays
@@ -169,6 +172,7 @@ impl<'engine> TableReader<'engine> {
             self.project_id,
             self.dataset_id,
             self.table_id,
+            self.truncation_id,
             user_key.to_vec(),
         )
         .encode()
@@ -204,6 +208,7 @@ pub struct TableWriter<'engine> {
     project_id: ProjectId,
     dataset_id: DatasetId,
     table_id: TableId,
+    truncation_id: TruncationId,
     schema: Schema,
 }
 
@@ -214,6 +219,7 @@ impl<'engine> TableWriter<'engine> {
             project_id: table.project_id(),
             dataset_id: table.dataset_id(),
             table_id: table.id(),
+            truncation_id: table.truncation_id(),
             schema: table.schema().clone(),
         }
     }
@@ -245,6 +251,7 @@ impl<'engine> TableWriter<'engine> {
             self.project_id,
             self.dataset_id,
             self.table_id,
+            self.truncation_id,
             user_key.to_vec(),
         )
         .encode()

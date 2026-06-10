@@ -50,7 +50,7 @@
 
 use uuid::uuid;
 
-use crate::catalog::ids::{DatasetId, ProjectId, TableId};
+use crate::catalog::ids::{DatasetId, ProjectId, TableId, TruncationId};
 use crate::catalog::schema::Schema;
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
 use crate::storage::types::{Field, LogicalType};
@@ -143,6 +143,7 @@ pub(crate) fn uuid_table_meta() -> TableMeta {
     TableMeta {
         id: UUID_TABLE_ID,
         name: UUID_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
     }
 }
@@ -151,6 +152,7 @@ pub(crate) fn projects_table_meta() -> TableMeta {
     TableMeta {
         id: PROJECTS_TABLE_ID,
         name: PROJECTS_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
     }
 }
@@ -159,6 +161,7 @@ pub(crate) fn datasets_table_meta() -> TableMeta {
     TableMeta {
         id: DATASETS_TABLE_ID,
         name: DATASETS_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
     }
 }
@@ -167,6 +170,7 @@ pub(crate) fn tables_table_meta() -> TableMeta {
     TableMeta {
         id: TABLES_TABLE_ID,
         name: TABLES_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
     }
 }
@@ -175,6 +179,7 @@ pub(crate) fn queries_table_meta() -> TableMeta {
     TableMeta {
         id: QUERIES_TABLE_ID,
         name: QUERIES_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
     }
 }

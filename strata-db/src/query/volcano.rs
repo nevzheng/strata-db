@@ -48,6 +48,32 @@ fn run<'ctx>(
             }
             .run(ctx)?,
         )),
+        PlanNode::CreateTable {
+            project_id,
+            dataset_id,
+            name,
+            schema,
+            or_replace,
+        } => {
+            if or_replace {
+                crate::catalog::replace_table(
+                    &mut ctx.engine,
+                    project_id,
+                    dataset_id,
+                    &name,
+                    schema,
+                )?;
+            } else {
+                crate::catalog::create_table(
+                    &mut ctx.engine,
+                    project_id,
+                    dataset_id,
+                    &name,
+                    schema,
+                )?;
+            }
+            Ok(ExecuteResult::Affected(0))
+        }
         read_node => Ok(ExecuteResult::Rows(build(read_node, &*ctx)?)),
     }
 }
@@ -70,11 +96,12 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
             remaining: count,
         })),
         PlanNode::Values { rows } => Ok(RowStream::new(rows.into_iter().map(Ok))),
-        // Insert/Delete are top-level only — they need `&mut ctx` and
-        // can't sit inside a pull iterator chain that holds `&ctx`.
-        PlanNode::Insert { .. } | PlanNode::Delete { .. } => Err(QueryError::Internal(
-            "Insert/Delete may only appear at the top of a plan".into(),
-        )),
+        // Sinks (Insert/Delete/CreateTable) are top-level only — they
+        // need `&mut ctx` and can't sit inside a pull iterator chain
+        // that holds `&ctx`.
+        PlanNode::Insert { .. } | PlanNode::Delete { .. } | PlanNode::CreateTable { .. } => Err(
+            QueryError::Internal("write sinks may only appear at the top of a plan".into()),
+        ),
     }
 }
 

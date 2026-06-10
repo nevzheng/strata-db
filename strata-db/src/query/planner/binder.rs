@@ -11,14 +11,15 @@
 //!   [`BuildLogical`](super::pass::BuildLogical) downstream.
 
 use sqlparser::ast::{
-    BinaryOperator as AstBinaryOperator, Expr as AstExpr, GroupByExpr, Ident, Query as AstQuery,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
-    Value as AstValue,
+    BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
+    DataType, Expr as AstExpr, GroupByExpr, Ident, ObjectName, Query as AstQuery, Select,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::schema::Schema;
+use crate::catalog::{CatalogError, ResourceKind};
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
-use crate::storage::types::{Tuple, Value};
+use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
 use super::super::expression::{BinaryOperator, Expr};
 use super::super::logical_plan::{LogicalNode, LogicalPlan};
@@ -75,8 +76,131 @@ impl BindNode for Statement {
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
         match self {
             Statement::Query(q) => q.bind(binder),
+            Statement::CreateTable(ct) => bind_create_table(ct, binder),
             other => Err(QueryError::unsupported(format!("statement: {other:?}"))),
         }
+    }
+}
+
+// --- CREATE TABLE ----------------------------------------------------------
+
+/// Bind a `CREATE TABLE` into a [`LogicalNode::CreateTable`]. The parent
+/// project + dataset are resolved to ids here (read-side); the table row
+/// is minted in the catalog at execution.
+fn bind_create_table(ct: &AstCreateTable, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
+    // `CREATE TABLE ... AS SELECT` and `LIKE`/`CLONE` derive their shape
+    // from another relation; we only support an explicit column list.
+    if ct.query.is_some() {
+        return Err(QueryError::unsupported("CREATE TABLE ... AS SELECT"));
+    }
+    if ct.like.is_some() || ct.clone.is_some() {
+        return Err(QueryError::unsupported("CREATE TABLE ... LIKE / CLONE"));
+    }
+    // Table-level constraints (PRIMARY KEY, UNIQUE, …) aren't modeled
+    // yet — column 0 is the PK by convention. Reject rather than drop.
+    if !ct.constraints.is_empty() {
+        return Err(QueryError::unsupported("table constraints"));
+    }
+
+    let (project, dataset, table) = three_part_name(&ct.name)?;
+
+    // Resolve the parent project + dataset to ids; either missing is a
+    // catalog NotFound, surfaced to the caller verbatim.
+    let catalog = binder.ctx().catalog();
+    let project_meta = catalog
+        .get_project(project)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Project,
+            name: project.to_string(),
+        })?;
+    let dataset_meta = catalog
+        .get_dataset(project_meta.id, dataset)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Dataset,
+            name: dataset.to_string(),
+        })?;
+
+    let schema = bind_schema(&ct.columns)?;
+
+    Ok(LogicalPlan::new(LogicalNode::CreateTable {
+        project_id: project_meta.id,
+        dataset_id: dataset_meta.id,
+        name: table.to_string(),
+        schema,
+        // `OR REPLACE` bumps the truncation id at execution; plain
+        // `CREATE` errors if the table already exists.
+        or_replace: ct.or_replace,
+    }))
+}
+
+/// Turn the AST column list into a storage [`Schema`]. Field order is
+/// preserved — column 0 is the primary key by convention.
+fn bind_schema(columns: &[ColumnDef]) -> Result<Schema, QueryError> {
+    if columns.is_empty() {
+        return Err(QueryError::unsupported("CREATE TABLE with no columns"));
+    }
+    let fields = columns
+        .iter()
+        .map(bind_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Schema { fields })
+}
+
+fn bind_column(col: &ColumnDef) -> Result<Field, QueryError> {
+    let ty = bind_data_type(&col.data_type)?;
+    // SQL columns are nullable unless `NOT NULL` is given. We accept
+    // only the null-related options for now; anything else (defaults,
+    // generated columns, inline PK/UNIQUE) is rejected so we don't
+    // silently ignore it.
+    let mut nullable = true;
+    for opt in &col.options {
+        match &opt.option {
+            ColumnOption::Null => nullable = true,
+            ColumnOption::NotNull => nullable = false,
+            other => {
+                return Err(QueryError::unsupported(format!("column option: {other:?}")));
+            }
+        }
+    }
+    Ok(Field {
+        name: FieldName::new(col.name.value.as_str()),
+        ty,
+        nullable,
+    })
+}
+
+/// Map a SQL type to one of the engine's [`LogicalType`]s. Unknown or
+/// unsupported types surface as `unsupported`.
+fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
+    Ok(match ty {
+        DataType::Bool | DataType::Boolean => LogicalType::Bool,
+        DataType::SmallInt(_) | DataType::Int2(_) => LogicalType::Int16,
+        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => LogicalType::Int32,
+        DataType::BigInt(_) | DataType::Int8(_) => LogicalType::Int64,
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::CharVarying(_) => {
+            LogicalType::Text
+        }
+        DataType::Bytea => LogicalType::Bytes,
+        DataType::JSON | DataType::JSONB => LogicalType::Json,
+        other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
+    })
+}
+
+/// Split a `project.dataset.table` object name into its three parts.
+/// Errors `unsupported` if it isn't exactly three identifier segments —
+/// we have no session defaults to fill in shorter names.
+fn three_part_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(|i| i.value.as_str()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
+    match parts.as_slice() {
+        [p, d, t] => Ok((*p, *d, *t)),
+        _ => Err(QueryError::unsupported(format!(
+            "name needs project.dataset.table, got: {name}"
+        ))),
     }
 }
 
@@ -175,20 +299,7 @@ impl BindNode for TableWithJoins {
             )));
         };
         // Three-part name only for now — no session defaults.
-        let parts: Vec<&str> = name
-            .0
-            .iter()
-            .map(|p| p.as_ident().map(|i| i.value.as_str()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
-        let (project, dataset, table_name) = match parts.as_slice() {
-            [p, d, t] => (*p, *d, *t),
-            _ => {
-                return Err(QueryError::unsupported(format!(
-                    "FROM needs project.dataset.table, got: {name}"
-                )));
-            }
-        };
+        let (project, dataset, table_name) = three_part_name(name)?;
         let table = binder
             .ctx()
             .catalog()

@@ -45,6 +45,7 @@ impl<'db> Dataset<'db> {
             self.project_id,
             self.id,
             meta.id,
+            meta.truncation_id,
             meta.name,
             meta.schema,
         ))
@@ -61,6 +62,7 @@ impl<'db> Dataset<'db> {
             self.project_id,
             self.id,
             meta.id,
+            meta.truncation_id,
             meta.name,
             meta.schema,
         ))
