@@ -154,10 +154,20 @@ impl<'a> TuplePageMut<'a> {
     pub fn get(&self, slot_id: u16) -> Option<&[u8]> {
         slot_bytes(self.0, slot_id)
     }
+
+    /// Consume the view and return a *mutable* slice of the live tuple at
+    /// `slot_id`, or `None` if out of range or deleted. For in-place,
+    /// same-length updates; the returned slice borrows the page for `'a`.
+    pub fn into_slot_bytes_mut(self, slot_id: u16) -> Option<&'a mut [u8]> {
+        let range = slot_range(self.0, slot_id)?;
+        Some(&mut self.0[range])
+    }
 }
 
-/// Resolve a slot to its live tuple bytes, or `None` if out of range/deleted.
-fn slot_bytes(buf: &[u8], slot_id: u16) -> Option<&[u8]> {
+/// The byte range of a live slot's tuple within the page, or `None` if the slot
+/// is out of range or deleted. Shared by the read and write views so they agree
+/// on where a tuple's bytes are.
+pub(crate) fn slot_range(buf: &[u8], slot_id: u16) -> Option<core::ops::Range<usize>> {
     if slot_id >= get_u16(buf, OFF_SLOT_COUNT) {
         return None;
     }
@@ -167,7 +177,12 @@ fn slot_bytes(buf: &[u8], slot_id: u16) -> Option<&[u8]> {
     }
     let off = get_u16(buf, pos) as usize;
     let len = get_u16(buf, pos + 2) as usize;
-    Some(&buf[off..off + len])
+    Some(off..off + len)
+}
+
+/// Resolve a slot to its live tuple bytes, or `None` if out of range/deleted.
+fn slot_bytes(buf: &[u8], slot_id: u16) -> Option<&[u8]> {
+    slot_range(buf, slot_id).map(|r| &buf[r])
 }
 
 fn get_u16(buf: &[u8], off: usize) -> u16 {

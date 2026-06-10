@@ -43,6 +43,11 @@ pub enum PageError {
     #[error("block buffer must be {expected} bytes, got {got}")]
     BadBlockSize { expected: usize, got: usize },
 
+    /// A tuple is larger than an (empty) page can hold; it cannot live in the
+    /// heap and needs out-of-line storage.
+    #[error("tuple of {len} bytes exceeds the {max}-byte page capacity")]
+    TupleTooLarge { len: usize, max: usize },
+
     /// A `TEXT` page chain did not decode to valid UTF-8.
     #[error("text value is not valid utf-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
