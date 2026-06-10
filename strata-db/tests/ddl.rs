@@ -270,3 +270,103 @@ fn create_table_in_a_created_schema_round_trips() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[1], Value::Text("a".into()));
 }
+
+// --- INSERT ----------------------------------------------------------------
+
+/// Create a table in the seeded `strata.public` namespace via SQL.
+fn create_public_table(db: &Db, ddl: &str) {
+    exec(db, ddl).unwrap();
+}
+
+fn rows_of(results: &[StmtResult]) -> Vec<Tuple> {
+    match &results[0] {
+        StmtResult::Rows(r) => r.clone(),
+        StmtResult::Affected(_) => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn insert_then_select_round_trips() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.events (id INT, name TEXT)");
+
+    let affected = exec(
+        &db,
+        "INSERT INTO strata.public.events VALUES (1, 'alpha'), (2, 'bravo')",
+    )
+    .unwrap();
+    assert!(matches!(affected[0], StmtResult::Affected(2)));
+
+    let rows = rows_of(&exec(&db, "SELECT * FROM strata.public.events").unwrap());
+    assert_eq!(rows.len(), 2);
+    // id is INT (Int32): the Int64 literal was coerced down on insert.
+    assert_eq!(rows[0].values[0], Value::Int32(1));
+    assert_eq!(rows[0].values[1], Value::Text("alpha".into()));
+    assert_eq!(rows[1].values[0], Value::Int32(2));
+}
+
+#[test]
+fn insert_coerces_widening_and_narrowing_within_range() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a SMALLINT, b BIGINT)");
+
+    // 30000 fits SMALLINT (Int16); 30000 widens trivially into BIGINT.
+    exec(&db, "INSERT INTO strata.public.t VALUES (30000, 30000)").unwrap();
+    let rows = rows_of(&exec(&db, "SELECT * FROM strata.public.t").unwrap());
+    assert_eq!(rows[0].values[0], Value::Int16(30000));
+    assert_eq!(rows[0].values[1], Value::Int64(30000));
+}
+
+#[test]
+fn insert_out_of_range_for_column_errors() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a SMALLINT)");
+    // 100000 > i16::MAX — narrowing must fail the range check.
+    let err = exec(&db, "INSERT INTO strata.public.t VALUES (100000)").unwrap_err();
+    assert!(matches!(err, QueryError::Type(_)), "got {err:?}");
+}
+
+#[test]
+fn insert_type_mismatch_errors() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a INT)");
+    let err = exec(&db, "INSERT INTO strata.public.t VALUES ('not a number')").unwrap_err();
+    assert!(matches!(err, QueryError::Type(_)), "got {err:?}");
+}
+
+#[test]
+fn insert_null_into_not_null_errors() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a INT, b TEXT NOT NULL)");
+    let err = exec(&db, "INSERT INTO strata.public.t VALUES (1, NULL)").unwrap_err();
+    assert!(matches!(err, QueryError::Type(_)), "got {err:?}");
+}
+
+#[test]
+fn insert_null_into_nullable_column_is_ok() {
+    let (_tmp, db) = common::temp_db();
+    // Column 0 is the primary key (must be non-null); a nullable
+    // non-key column accepts NULL.
+    create_public_table(&db, "CREATE TABLE strata.public.t (id INT, note TEXT)");
+    exec(&db, "INSERT INTO strata.public.t VALUES (1, NULL)").unwrap();
+
+    let rows = rows_of(&exec(&db, "SELECT * FROM strata.public.t").unwrap());
+    assert_eq!(rows[0].values[0], Value::Int32(1));
+    assert_eq!(rows[0].values[1], Value::Null);
+}
+
+#[test]
+fn insert_wrong_arity_errors() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a INT, b TEXT)");
+    let err = exec(&db, "INSERT INTO strata.public.t VALUES (1)").unwrap_err();
+    assert!(matches!(err, QueryError::Type(_)), "got {err:?}");
+}
+
+#[test]
+fn insert_explicit_column_list_is_unsupported() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.t (a INT, b TEXT)");
+    let err = exec(&db, "INSERT INTO strata.public.t (a, b) VALUES (1, 'x')").unwrap_err();
+    assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+}

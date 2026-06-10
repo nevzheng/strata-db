@@ -12,9 +12,9 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
-    DataType, Expr as AstExpr, GroupByExpr, Ident, ObjectName, Query as AstQuery, SchemaName,
-    Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableWithJoins, UnaryOperator,
-    Value as AstValue,
+    DataType, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery,
+    SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
+    TableWithJoins, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -78,6 +78,7 @@ impl BindNode for Statement {
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
         match self {
             Statement::Query(q) => q.bind(binder),
+            Statement::Insert(insert) => bind_insert(insert, binder),
             Statement::CreateTable(ct) => bind_create_table(ct, binder),
             Statement::CreateSchema {
                 schema_name,
@@ -148,6 +149,129 @@ fn bind_create_table(ct: &AstCreateTable, binder: &mut Binder) -> Result<Logical
         // `CREATE` errors if the table already exists.
         or_replace: ct.or_replace,
     }))
+}
+
+// --- INSERT ----------------------------------------------------------------
+
+/// Bind `INSERT INTO p.d.t VALUES (..), (..)` into an [`LogicalNode::Insert`]
+/// over a [`LogicalNode::Values`] source. v1 limits: positional values only
+/// (no column list), `VALUES` source only (no `INSERT ... SELECT`), constant
+/// expressions only. Each value is validated and coerced against the table's
+/// stored schema.
+fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
+    if !insert.columns.is_empty() {
+        return Err(QueryError::unsupported(
+            "INSERT with an explicit column list",
+        ));
+    }
+    let TableObject::TableName(name) = &insert.table else {
+        return Err(QueryError::unsupported(
+            "INSERT target must be a table name",
+        ));
+    };
+    let (project, dataset, table_name) = three_part_name(name)?;
+    let table = binder
+        .ctx()
+        .catalog()
+        .resolve_table(project, dataset, table_name)?;
+    let schema = table.schema().clone();
+
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| QueryError::unsupported("INSERT without VALUES"))?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(QueryError::unsupported("INSERT source must be VALUES"));
+    };
+
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let exprs = &row.content;
+        if exprs.len() != schema.fields.len() {
+            return Err(QueryError::type_error(format!(
+                "INSERT has {} value(s) but table `{}` has {} column(s)",
+                exprs.len(),
+                table.name(),
+                schema.fields.len()
+            )));
+        }
+        let mut row_values = Vec::with_capacity(exprs.len());
+        for (expr, field) in exprs.iter().zip(&schema.fields) {
+            let value = const_eval(expr, binder)?;
+            row_values.push(coerce_value(value, field)?);
+        }
+        rows.push(Tuple { values: row_values });
+    }
+
+    Ok(LogicalPlan::new(LogicalNode::Insert {
+        table,
+        input: Box::new(LogicalNode::Values { rows }),
+    }))
+}
+
+/// Evaluate a `VALUES` expression to a constant. It binds with no scope,
+/// so any column reference fails — `VALUES` rows are constants. Supports
+/// literals and constant expressions (e.g. `1 = 1`); negative numeric
+/// literals aren't supported yet (`-` binds as an unsupported unary op).
+fn const_eval(expr: &AstExpr, binder: &mut Binder) -> Result<Value, QueryError> {
+    let bound = expr.bind(binder)?;
+    bound.eval(&Tuple { values: vec![] })
+}
+
+/// Validate and coerce `value` to `field`'s type. Same type passes;
+/// integers widen freely and narrow with a range check; everything else
+/// (cross-category, `NULL` into `NOT NULL`) is a type error.
+fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
+    use LogicalType as T;
+    match value {
+        Value::Null if field.nullable => Ok(Value::Null),
+        Value::Null => Err(QueryError::type_error(format!(
+            "NULL into NOT NULL column `{}`",
+            field.name.as_str()
+        ))),
+        Value::Bool(b) if matches!(field.ty, T::Bool) => Ok(Value::Bool(b)),
+        Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
+        Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
+        Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_)
+            if matches!(field.ty, T::Int16 | T::Int32 | T::Int64) =>
+        {
+            let n = match value {
+                Value::Int16(x) => x as i64,
+                Value::Int32(x) => x as i64,
+                Value::Int64(x) => x,
+                _ => unreachable!(),
+            };
+            fit_int(n, field)
+        }
+        other => Err(QueryError::type_error(format!(
+            "cannot insert {other:?} into column `{}` of type {:?}",
+            field.name.as_str(),
+            field.ty
+        ))),
+    }
+}
+
+/// Fit an integer into an integer column: widening always succeeds, a
+/// narrowing conversion that overflows is a type error.
+fn fit_int(n: i64, field: &Field) -> Result<Value, QueryError> {
+    let out_of_range = || {
+        QueryError::type_error(format!(
+            "value {n} out of range for column `{}` of type {:?}",
+            field.name.as_str(),
+            field.ty
+        ))
+    };
+    match field.ty {
+        LogicalType::Int64 => Ok(Value::Int64(n)),
+        LogicalType::Int32 => i32::try_from(n)
+            .map(Value::Int32)
+            .map_err(|_| out_of_range()),
+        LogicalType::Int16 => i16::try_from(n)
+            .map(Value::Int16)
+            .map_err(|_| out_of_range()),
+        _ => unreachable!("fit_int is only called for integer columns"),
+    }
 }
 
 // --- CREATE SCHEMA ---------------------------------------------------------

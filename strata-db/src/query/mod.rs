@@ -109,6 +109,11 @@ pub enum QueryError {
     /// `Internal` (bugs) and `Parse` (syntax) — the query is valid SQL,
     /// we just haven't built that path.
     Unsupported(String),
+    /// A user value doesn't fit the column it's bound to — wrong type, a
+    /// numeric literal outside the column's range, or a `NULL` into a
+    /// `NOT NULL` column. Caught at bind time against the table's stored
+    /// schema. A user error, distinct from `Internal` (a bug).
+    Type(String),
     /// Invariant violation that the binder or planner should have
     /// caught — out-of-bounds column refs, type mismatches in already-
     /// type-checked expressions, schema-shape mismatches, and the like.
@@ -119,6 +124,10 @@ pub enum QueryError {
 impl QueryError {
     pub fn unsupported(what: impl Into<String>) -> Self {
         Self::Unsupported(what.into())
+    }
+
+    pub fn type_error(what: impl Into<String>) -> Self {
+        Self::Type(what.into())
     }
 }
 
@@ -174,6 +183,7 @@ impl std::fmt::Display for QueryError {
             QueryError::Codec(e) => write!(f, "codec: {e}"),
             QueryError::Parse(e) => write!(f, "parse: {e}"),
             QueryError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            QueryError::Type(msg) => write!(f, "type error: {msg}"),
             QueryError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
