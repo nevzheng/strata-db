@@ -34,7 +34,7 @@ use crate::catalog::consts::{
     CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, SYSTEM_PROJECT_ID, TABLES_TABLE_ID,
     system_table_schema,
 };
-use crate::catalog::db::SharedEngine;
+use crate::catalog::db::TableApi;
 use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
@@ -304,17 +304,17 @@ impl<'a> CatalogReader<'a> {
 
 // --- Catalog (top-level) ---
 
-pub(crate) struct Catalog {
-    engine: SharedEngine,
+pub(crate) struct Catalog<'db> {
+    api: TableApi<'db>,
 }
 
-impl Catalog {
-    pub(crate) fn new(engine: SharedEngine) -> Self {
-        Self { engine }
+impl<'db> Catalog<'db> {
+    pub(crate) fn new(api: TableApi<'db>) -> Self {
+        Self { api }
     }
 
     pub(crate) fn create_project(&self, name: &str) -> Result<ProjectMeta, QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_project(&engine, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Project,
@@ -331,12 +331,12 @@ impl Catalog {
     }
 
     pub(crate) fn open_project(&self, name: &str) -> Result<Option<ProjectMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         get_project(&engine, name)
     }
 
     pub(crate) fn drop_project(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_project(&engine, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Project,
@@ -348,14 +348,14 @@ impl Catalog {
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         list_metas(&engine, projects_meta_table(), &[])
     }
 
     /// Narrow the catalog to a single project's scope for dataset operations.
-    pub(crate) fn project(&self, project_id: ProjectId) -> CatalogProject {
+    pub(crate) fn project(&self, project_id: ProjectId) -> CatalogProject<'db> {
         CatalogProject {
-            engine: self.engine.clone(),
+            api: self.api,
             project_id,
         }
     }
@@ -363,12 +363,12 @@ impl Catalog {
 
 // --- CatalogProject (scoped to one project) ---
 
-pub(crate) struct CatalogProject {
-    engine: SharedEngine,
+pub(crate) struct CatalogProject<'db> {
+    api: TableApi<'db>,
     project_id: ProjectId,
 }
 
-impl CatalogProject {
+impl<'db> CatalogProject<'db> {
     fn user_key(&self, name: &str) -> Vec<u8> {
         let mut k = self.project_id.as_bytes().to_vec();
         k.extend_from_slice(name.as_bytes());
@@ -376,7 +376,7 @@ impl CatalogProject {
     }
 
     pub(crate) fn create_dataset(&self, name: &str) -> Result<DatasetMeta, QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_dataset(&engine, self.project_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Dataset,
@@ -398,12 +398,12 @@ impl CatalogProject {
     }
 
     pub(crate) fn open_dataset(&self, name: &str) -> Result<Option<DatasetMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         get_dataset(&engine, self.project_id, name)
     }
 
     pub(crate) fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_dataset(&engine, self.project_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Dataset,
@@ -415,14 +415,14 @@ impl CatalogProject {
     }
 
     pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         list_metas(&engine, datasets_meta_table(), self.project_id.as_bytes())
     }
 
     /// Narrow further to a single dataset's scope for table operations.
-    pub(crate) fn dataset(&self, dataset_id: DatasetId) -> CatalogDataset {
+    pub(crate) fn dataset(&self, dataset_id: DatasetId) -> CatalogDataset<'db> {
         CatalogDataset {
-            engine: self.engine.clone(),
+            api: self.api,
             project_id: self.project_id,
             dataset_id,
         }
@@ -431,13 +431,13 @@ impl CatalogProject {
 
 // --- CatalogDataset (scoped to one project + dataset) ---
 
-pub(crate) struct CatalogDataset {
-    engine: SharedEngine,
+pub(crate) struct CatalogDataset<'db> {
+    api: TableApi<'db>,
     project_id: ProjectId,
     dataset_id: DatasetId,
 }
 
-impl CatalogDataset {
+impl<'db> CatalogDataset<'db> {
     fn user_key(&self, name: &str) -> Vec<u8> {
         let mut k = self.project_id.as_bytes().to_vec();
         k.extend_from_slice(self.dataset_id.as_bytes());
@@ -452,7 +452,7 @@ impl CatalogDataset {
     }
 
     pub(crate) fn create_table(&self, name: &str, schema: Schema) -> Result<TableMeta, QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_table(&engine, self.project_id, self.dataset_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Table,
@@ -475,12 +475,12 @@ impl CatalogDataset {
     }
 
     pub(crate) fn open_table(&self, name: &str) -> Result<Option<TableMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         get_table(&engine, self.project_id, self.dataset_id, name)
     }
 
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.borrow_mut();
+        let mut engine = self.api.write();
         if get_table(&engine, self.project_id, self.dataset_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Table,
@@ -492,7 +492,7 @@ impl CatalogDataset {
     }
 
     pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, QueryError> {
-        let engine = self.engine.borrow();
+        let engine = self.api.read();
         list_metas(&engine, tables_meta_table(), &self.scope_prefix())
     }
 }

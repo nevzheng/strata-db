@@ -1,26 +1,26 @@
-use crate::catalog::db::SharedEngine;
+use crate::catalog::db::TableApi;
 use crate::catalog::ids::{DatasetId, ProjectId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
 use crate::query::QueryError;
 
-pub struct Dataset {
-    engine: SharedEngine,
+pub struct Dataset<'db> {
+    api: TableApi<'db>,
     project_id: ProjectId,
     id: DatasetId,
     name: String,
 }
 
-impl Dataset {
+impl<'db> Dataset<'db> {
     pub(crate) fn new(
-        engine: SharedEngine,
+        api: TableApi<'db>,
         project_id: ProjectId,
         id: DatasetId,
         name: String,
     ) -> Self {
         Self {
-            engine,
+            api,
             project_id,
             id,
             name,
@@ -40,7 +40,7 @@ impl Dataset {
     }
 
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.engine.clone())
+        let meta = Catalog::new(self.api)
             .project(self.project_id)
             .dataset(self.id)
             .create_table(name, schema)?;
@@ -54,7 +54,7 @@ impl Dataset {
     }
 
     pub fn table(&self, name: &str) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.engine.clone())
+        let meta = Catalog::new(self.api)
             .project(self.project_id)
             .dataset(self.id)
             .open_table(name)?
@@ -72,14 +72,14 @@ impl Dataset {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        Catalog::new(self.engine.clone())
+        Catalog::new(self.api)
             .project(self.project_id)
             .dataset(self.id)
             .drop_table(name)
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, QueryError> {
-        let metas = Catalog::new(self.engine.clone())
+        let metas = Catalog::new(self.api)
             .project(self.project_id)
             .dataset(self.id)
             .list_tables()?;

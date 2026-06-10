@@ -1,6 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::path::Path;
-use std::rc::Rc;
 
 use strata_store::memstore::BTreeMapStore;
 use strata_store::{LevelConfig, StorageEngine};
@@ -9,14 +8,30 @@ use crate::catalog::project::Project;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
 use crate::query::{QueryContext, QueryError};
 
-/// Shared handle to the storage engine. Single-threaded (`Rc`/`RefCell`): the
-/// engine is `!Send` (the pager is `Rc`-based), so a `Db` and everything it
-/// shares the engine with live on one thread. The server pins the `Db` to a
-/// dedicated engine thread rather than sharing it across the async runtime.
-pub(crate) type SharedEngine = Rc<RefCell<StorageEngine<BTreeMapStore>>>;
+/// A freely-copyable handle to the storage engine, borrowed from the [`Db`] that
+/// owns it. Every component that touches storage — catalog, projects, datasets —
+/// holds one of these and routes through it. The engine is owned **solely** by
+/// the `Db`; it is never shared (no `Rc`) or handed out, only borrowed for the
+/// duration of an access through this facade.
+#[derive(Clone, Copy)]
+pub(crate) struct TableApi<'db> {
+    engine: &'db RefCell<StorageEngine<BTreeMapStore>>,
+}
+
+impl<'db> TableApi<'db> {
+    /// Borrow the engine for reading.
+    pub(crate) fn read(self) -> Ref<'db, StorageEngine<BTreeMapStore>> {
+        self.engine.borrow()
+    }
+
+    /// Borrow the engine for writing.
+    pub(crate) fn write(self) -> RefMut<'db, StorageEngine<BTreeMapStore>> {
+        self.engine.borrow_mut()
+    }
+}
 
 pub struct Db {
-    engine: SharedEngine,
+    engine: RefCell<StorageEngine<BTreeMapStore>>,
 }
 
 /// Fluent configuration for opening a [`Db`].
@@ -53,7 +68,7 @@ impl DbBuilder {
             None => StorageEngine::new(path, mem),
         }?;
         Ok(Db {
-            engine: Rc::new(RefCell::new(engine)),
+            engine: RefCell::new(engine),
         })
     }
 }
@@ -67,27 +82,34 @@ impl Db {
         DbBuilder::default()
     }
 
-    pub fn create_project(&self, name: &str) -> Result<Project, QueryError> {
-        let meta = Catalog::new(self.engine.clone()).create_project(name)?;
-        Ok(Project::new(self.engine.clone(), meta.id, meta.name))
+    /// A handle to the storage facade, borrowing this `Db`.
+    fn api(&self) -> TableApi<'_> {
+        TableApi {
+            engine: &self.engine,
+        }
     }
 
-    pub fn project(&self, name: &str) -> Result<Project, QueryError> {
-        let meta = Catalog::new(self.engine.clone())
+    pub fn create_project(&self, name: &str) -> Result<Project<'_>, QueryError> {
+        let meta = Catalog::new(self.api()).create_project(name)?;
+        Ok(Project::new(self.api(), meta.id, meta.name))
+    }
+
+    pub fn project(&self, name: &str) -> Result<Project<'_>, QueryError> {
+        let meta = Catalog::new(self.api())
             .open_project(name)?
             .ok_or_else(|| CatalogError::NotFound {
                 kind: ResourceKind::Project,
                 name: name.to_string(),
             })?;
-        Ok(Project::new(self.engine.clone(), meta.id, meta.name))
+        Ok(Project::new(self.api(), meta.id, meta.name))
     }
 
     pub fn drop_project(&self, name: &str) -> Result<(), QueryError> {
-        Catalog::new(self.engine.clone()).drop_project(name)
+        Catalog::new(self.api()).drop_project(name)
     }
 
     pub fn list_projects(&self) -> Result<Vec<String>, QueryError> {
-        let metas = Catalog::new(self.engine.clone()).list_projects()?;
+        let metas = Catalog::new(self.api()).list_projects()?;
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 
