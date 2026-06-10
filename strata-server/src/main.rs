@@ -44,14 +44,55 @@ enum StatementResult {
     Affected(u64),
 }
 
+/// A query to run on the engine thread, with a channel to send the result back.
+struct Request {
+    sql: String,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<StatementResult>, QueryError>>,
+}
+
+/// Handle to the storage engine, which lives on its own dedicated thread.
+///
+/// The engine (and the `Db` that owns it) is single-threaded — `Rc`/`RefCell`
+/// all the way down — so it must never move between threads. Instead of sharing
+/// it, we pin it to one thread and talk to it over a channel: only the `sql`
+/// string and the result rows (both `Send`) cross the boundary. The engine is
+/// not, and should not be, `Send`.
 struct Backend {
-    db: Arc<Db>,
+    engine: tokio::sync::mpsc::UnboundedSender<Request>,
 }
 
 impl Backend {
     fn open(data_dir: &Path) -> Result<Self, QueryError> {
-        let db = Db::open(data_dir)?;
-        Ok(Self { db: Arc::new(db) })
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), QueryError>>();
+        let data_dir = data_dir.to_path_buf();
+
+        std::thread::Builder::new()
+            .name("strata-engine".into())
+            .spawn(move || {
+                // Open the Db *here* so it is created and used entirely on this
+                // thread, never crossing a thread boundary.
+                let db = match Db::open(&data_dir) {
+                    Ok(db) => {
+                        let _ = ready_tx.send(Ok(()));
+                        db
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                // Serve queries one at a time until every sender is dropped.
+                while let Some(req) = rx.blocking_recv() {
+                    let result = run_query(&db, &req.sql);
+                    let _ = req.reply.send(result);
+                }
+            })
+            .expect("spawn engine thread");
+
+        // Surface a failure to open the Db as the open() error.
+        ready_rx.recv().expect("engine thread reports readiness")?;
+        Ok(Self { engine: tx })
     }
 }
 
@@ -81,16 +122,20 @@ impl SimpleQueryHandler for Backend {
     {
         info!(query = %query, "received simple query");
 
-        let db = self.db.clone();
-        let sql = query.to_string();
-        // The engine lock is sync; do plan + execute on a blocking task
-        // so the tokio worker thread isn't pinned while we hold it.
-        let join = tokio::task::spawn_blocking(move || run_query(&db, &sql)).await;
+        // Hand the query to the engine thread and await its result. The engine
+        // never leaves its thread; only the sql and the rows cross the channel.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.engine
+            .send(Request {
+                sql: query.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| PgWireError::ApiError("engine thread has stopped".into()))?;
 
-        let results = match join {
+        let results = match reply_rx.await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(to_pgwire_error(&e)),
-            Err(e) => return Err(PgWireError::ApiError(Box::new(e))),
+            Err(_) => return Err(PgWireError::ApiError("engine dropped the query".into())),
         };
 
         let mut responses = Vec::with_capacity(results.len());

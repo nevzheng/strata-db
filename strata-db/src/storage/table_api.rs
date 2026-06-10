@@ -18,8 +18,8 @@
 
 use std::ops::{Bound, RangeBounds};
 
-use strata_store::StorageEngine;
 use strata_store::memstore::BTreeMapStore;
+use strata_store::{Scan, StorageEngine};
 
 use crate::catalog::ids::{DatasetId, ProjectId, TableId};
 use crate::catalog::schema::Schema;
@@ -114,17 +114,18 @@ impl<'engine> TableReader<'engine> {
         let row_key = self.row_key(&user_key);
         match self.engine.get(&row_key)? {
             None => Ok(None),
-            Some(bytes) => Ok(Some(self.schema.decode(&bytes)?)),
+            // Decode out of the pinned view — the one materializing copy.
+            Some(view) => match view.bytes() {
+                None => Ok(None),
+                Some(bytes) => Ok(Some(self.schema.decode(&bytes)?)),
+            },
         }
     }
 
-    /// Consumes the reader and returns a streaming row iterator. The
-    /// reader's owned `Schema` moves into the closure; the only borrow
-    /// left in the returned iterator is `&engine`.
-    pub fn scan(
-        self,
-        options: ScanOptions,
-    ) -> impl Iterator<Item = Result<Tuple, QueryError>> + 'engine {
+    /// Consumes the reader and returns a streaming row iterator over the table.
+    /// The owned `Schema` moves into the iterator; the only borrow left is
+    /// `&engine` (through the lending scan).
+    pub fn scan(self, options: ScanOptions) -> TableScan<'engine> {
         let Self {
             engine,
             project_id,
@@ -157,10 +158,10 @@ impl<'engine> TableReader<'engine> {
             },
         };
 
-        engine.scan((start, end)).map(move |kv| {
-            let (_key, value) = kv?;
-            Ok(schema.decode(&value)?)
-        })
+        TableScan {
+            inner: engine.scan((start, end)),
+            schema,
+        }
     }
 
     fn row_key(&self, user_key: &[u8]) -> Vec<u8> {
@@ -171,6 +172,29 @@ impl<'engine> TableReader<'engine> {
             user_key.to_vec(),
         )
         .encode()
+    }
+}
+
+/// Streaming row iterator over a table scan. Wraps the engine's lending scan,
+/// decoding each pinned tuple view into an owned [`Tuple`] — the single
+/// materializing copy on the read path.
+pub struct TableScan<'engine> {
+    inner: Scan<'engine>,
+    schema: Schema,
+}
+
+impl Iterator for TableScan<'_> {
+    type Item = Result<Tuple, QueryError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = match self.inner.next()? {
+            Ok(row) => row,
+            Err(e) => return Some(Err(e.into())),
+        };
+        match row.tuple.bytes() {
+            Some(bytes) => Some(self.schema.decode(&bytes).map_err(QueryError::from)),
+            None => Some(Err(QueryError::Internal("scanned a deleted tuple".into()))),
+        }
     }
 }
 

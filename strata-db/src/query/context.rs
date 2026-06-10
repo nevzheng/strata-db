@@ -1,13 +1,13 @@
 //! Per-query execution context.
 //!
-//! Holds the storage-engine lock for the lifetime of a query and
-//! exposes the layered handles every query operates through:
+//! Borrows the storage engine for the lifetime of a query and exposes the
+//! layered handles every query operates through:
 //!
 //! - [`QueryContext::table`] / [`QueryContext::table_mut`] — typed row
 //!   CRUD against a `Table`.
 //! - [`QueryContext::catalog`] — read-side catalog operations.
 
-use std::sync::MutexGuard;
+use std::cell::RefMut;
 
 use strata_store::StorageEngine;
 use strata_store::memstore::BTreeMapStore;
@@ -17,7 +17,7 @@ use crate::catalog::tables::Table;
 use crate::storage::table_api::{TableReader, TableWriter};
 
 pub struct QueryContext<'db> {
-    pub(crate) engine: MutexGuard<'db, StorageEngine<BTreeMapStore>>,
+    pub(crate) engine: RefMut<'db, StorageEngine<BTreeMapStore>>,
 }
 
 impl QueryContext<'_> {

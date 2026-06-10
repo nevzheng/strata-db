@@ -1,26 +1,26 @@
-use crate::catalog::db::SharedEngine;
+use crate::catalog::db::TableApi;
 use crate::catalog::ids::{DatasetId, ProjectId};
 use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
 use crate::query::QueryError;
 
-pub struct Dataset {
-    engine: SharedEngine,
+pub struct Dataset<'db> {
+    api: TableApi<'db>,
     project_id: ProjectId,
     id: DatasetId,
     name: String,
 }
 
-impl Dataset {
+impl<'db> Dataset<'db> {
     pub(crate) fn new(
-        engine: SharedEngine,
+        api: TableApi<'db>,
         project_id: ProjectId,
         id: DatasetId,
         name: String,
     ) -> Self {
         Self {
-            engine,
+            api,
             project_id,
             id,
             name,
@@ -40,10 +40,7 @@ impl Dataset {
     }
 
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.engine.clone())
-            .project(self.project_id)
-            .dataset(self.id)
-            .create_table(name, schema)?;
+        let meta = Catalog::new(self.api).create_table(self.project_id, self.id, name, schema)?;
         Ok(Table::new(
             self.project_id,
             self.id,
@@ -54,10 +51,8 @@ impl Dataset {
     }
 
     pub fn table(&self, name: &str) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.engine.clone())
-            .project(self.project_id)
-            .dataset(self.id)
-            .open_table(name)?
+        let meta = Catalog::new(self.api)
+            .open_table(self.project_id, self.id, name)?
             .ok_or_else(|| CatalogError::NotFound {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
@@ -72,17 +67,11 @@ impl Dataset {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        Catalog::new(self.engine.clone())
-            .project(self.project_id)
-            .dataset(self.id)
-            .drop_table(name)
+        Catalog::new(self.api).drop_table(self.project_id, self.id, name)
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, QueryError> {
-        let metas = Catalog::new(self.engine.clone())
-            .project(self.project_id)
-            .dataset(self.id)
-            .list_tables()?;
+        let metas = Catalog::new(self.api).list_tables(self.project_id, self.id)?;
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 }

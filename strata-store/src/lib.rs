@@ -15,11 +15,14 @@ pub mod engine;
 pub mod iterator;
 
 pub use engine::StorageEngine;
-pub use iterator::ScanIterator;
+pub use iterator::{Scan, ScanRow};
 
 // Re-export the lsm surface so dependents can keep importing storage types
 // from a single crate (`strata_store::…`).
 pub use lsm::{KVPair, LevelConfig, LsmConfig, LsmError, MergeIterator, ReadStore};
+
+// Re-export the heap's view types so dependents can name engine read results.
+pub use pager::{FileVfs, TupleRef, TupleView};
 
 /// The memtable types, kept under a `memstore` path for dependents.
 pub mod memstore {
@@ -37,9 +40,18 @@ use thiserror::Error;
 /// integration, …) add their own variants alongside it.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// A failure originating in the LSM building blocks.
+    /// A failure originating in the LSM building blocks (the index).
     #[error(transparent)]
     Lsm(#[from] LsmError),
+
+    /// A failure in the page heap (the tuple store).
+    #[error(transparent)]
+    Pager(#[from] pager::PageError),
+
+    /// The index and heap disagree: a key maps to a tuple location that is
+    /// malformed or no longer present. Indicates corruption or a bug.
+    #[error("storage corruption: {0}")]
+    Corruption(String),
 }
 
 // Convenience conversions so the engine can `?` the leaf LSM errors directly;
