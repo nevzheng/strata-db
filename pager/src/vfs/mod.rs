@@ -3,10 +3,12 @@
 //! page headers, types, or checksums; those belong to the page layer above.
 //!
 //! A `Vfs` also owns ID assignment: [`allocate`](Vfs::allocate) reserves a
-//! block and hands back a fresh [`PageId`]. IDs are unique and never reused,
-//! even across restarts — the high-water mark is persisted in the backing store.
-//! (A dedicated `Sequencer` generalizing this is deferred; for v1 the VFS is
-//! the allocator.)
+//! block and hands back a [`PageId`] — reusing one from the free list if
+//! available, otherwise a fresh id past the high-water mark (both persisted in
+//! the backing store). [`free`](Vfs::free) returns a block for reuse. A fresh
+//! id is never reused while live; a freed one may be, so only [`free`](Vfs::free)
+//! a page that holds no referenced data. (A dedicated `Sequencer` generalizing
+//! this is deferred; for v1 the VFS is the allocator.)
 
 mod file;
 mod mem;
@@ -26,8 +28,17 @@ pub const BLOCK_SIZE: usize = 8 * 1024;
 /// new blocks; makes writes durable. Implementations choose their own physical
 /// addressing — the rest of the system only ever holds opaque `PageId`s.
 pub trait Vfs {
-    /// Reserve a new block and return its freshly-issued [`PageId`].
+    /// Reserve a block and return its [`PageId`] — a reused one from the free
+    /// list, or a fresh id (growing the store) when the list is empty.
     fn allocate(&mut self) -> Result<PageId>;
+
+    /// Return `id` to the free list for reuse by a later [`allocate`](Vfs::allocate).
+    ///
+    /// **Safety of reuse:** the block must hold no data anything still
+    /// references — a later allocation will hand the id out and overwrite it.
+    /// In the heap, that means every tuple on the page is dead and no index
+    /// entry points at it. Durable once [`sync`](Vfs::sync) persists.
+    fn free(&mut self, id: PageId);
 
     /// Recovery primitive: treat `id` as already allocated, growing the backing
     /// store and bumping the high-water mark past it if needed. Used when the

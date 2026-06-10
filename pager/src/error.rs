@@ -55,6 +55,12 @@ pub enum PageError {
     /// A failure in the page journal (append, replay, or recovery).
     #[error("journal error: {0}")]
     Journal(#[from] ::journal::JournalError),
+
+    /// The inline free list outgrew the superblock. It needs to spill to
+    /// dedicated free-space-map pages — future work; today the list is
+    /// empty (nothing frees pages yet) so this is unreachable.
+    #[error("free list of {len} ids overflows the superblock (max {max})")]
+    FreeListOverflow { len: usize, max: usize },
 }
 
 /// Result alias for the crate.
