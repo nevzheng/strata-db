@@ -314,7 +314,7 @@ impl Catalog {
     }
 
     pub(crate) fn create_project(&self, name: &str) -> Result<ProjectMeta, QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_project(&engine, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Project,
@@ -331,12 +331,12 @@ impl Catalog {
     }
 
     pub(crate) fn open_project(&self, name: &str) -> Result<Option<ProjectMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         get_project(&engine, name)
     }
 
     pub(crate) fn drop_project(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_project(&engine, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Project,
@@ -348,7 +348,7 @@ impl Catalog {
     }
 
     pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         list_metas(&engine, projects_meta_table(), &[])
     }
 
@@ -376,7 +376,7 @@ impl CatalogProject {
     }
 
     pub(crate) fn create_dataset(&self, name: &str) -> Result<DatasetMeta, QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_dataset(&engine, self.project_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Dataset,
@@ -398,12 +398,12 @@ impl CatalogProject {
     }
 
     pub(crate) fn open_dataset(&self, name: &str) -> Result<Option<DatasetMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         get_dataset(&engine, self.project_id, name)
     }
 
     pub(crate) fn drop_dataset(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_dataset(&engine, self.project_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Dataset,
@@ -415,7 +415,7 @@ impl CatalogProject {
     }
 
     pub(crate) fn list_datasets(&self) -> Result<Vec<DatasetMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         list_metas(&engine, datasets_meta_table(), self.project_id.as_bytes())
     }
 
@@ -452,7 +452,7 @@ impl CatalogDataset {
     }
 
     pub(crate) fn create_table(&self, name: &str, schema: Schema) -> Result<TableMeta, QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_table(&engine, self.project_id, self.dataset_id, name)?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 kind: ResourceKind::Table,
@@ -475,12 +475,12 @@ impl CatalogDataset {
     }
 
     pub(crate) fn open_table(&self, name: &str) -> Result<Option<TableMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         get_table(&engine, self.project_id, self.dataset_id, name)
     }
 
     pub(crate) fn drop_table(&self, name: &str) -> Result<(), QueryError> {
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.borrow_mut();
         if get_table(&engine, self.project_id, self.dataset_id, name)?.is_none() {
             return Err(CatalogError::NotFound {
                 kind: ResourceKind::Table,
@@ -492,7 +492,7 @@ impl CatalogDataset {
     }
 
     pub(crate) fn list_tables(&self) -> Result<Vec<TableMeta>, QueryError> {
-        let engine = self.engine.lock().unwrap();
+        let engine = self.engine.borrow();
         list_metas(&engine, tables_meta_table(), &self.scope_prefix())
     }
 }

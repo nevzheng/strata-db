@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 
 use strata_store::memstore::BTreeMapStore;
 use strata_store::{LevelConfig, StorageEngine};
@@ -8,7 +9,11 @@ use crate::catalog::project::Project;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
 use crate::query::{QueryContext, QueryError};
 
-pub(crate) type SharedEngine = Arc<Mutex<StorageEngine<BTreeMapStore>>>;
+/// Shared handle to the storage engine. Single-threaded (`Rc`/`RefCell`): the
+/// engine is `!Send` (the pager is `Rc`-based), so a `Db` and everything it
+/// shares the engine with live on one thread. The server pins the `Db` to a
+/// dedicated engine thread rather than sharing it across the async runtime.
+pub(crate) type SharedEngine = Rc<RefCell<StorageEngine<BTreeMapStore>>>;
 
 pub struct Db {
     engine: SharedEngine,
@@ -48,7 +53,7 @@ impl DbBuilder {
             None => StorageEngine::new(path, mem),
         }?;
         Ok(Db {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Rc::new(RefCell::new(engine)),
         })
     }
 }
@@ -86,11 +91,11 @@ impl Db {
         Ok(metas.into_iter().map(|m| m.name).collect())
     }
 
-    /// Open a per-query context, acquiring the storage-engine lock for
-    /// the returned context's lifetime. Drop the context to release.
+    /// Open a per-query context, borrowing the storage engine for the returned
+    /// context's lifetime. Drop the context to release.
     pub fn query_context(&self) -> QueryContext<'_> {
         QueryContext {
-            engine: self.engine.lock().unwrap(),
+            engine: self.engine.borrow_mut(),
         }
     }
 }

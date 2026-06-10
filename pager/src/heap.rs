@@ -76,6 +76,17 @@ impl<V: Vfs> Heap<V> {
         })
     }
 
+    /// Pin a whole page for reading many of its tuples — the scan primitive.
+    ///
+    /// The returned [`PageTuples`] holds **one** pin; borrow a [`TupleView`] per
+    /// tuple from it. A scan that stays on a page thus costs one handle, not one
+    /// per row.
+    pub fn page(&self, page_id: PageId) -> Result<PageTuples<V>> {
+        Ok(PageTuples {
+            page: self.cache.read(page_id)?,
+        })
+    }
+
     /// Mark the tuple at `loc` deleted. Returns `false` if the slot is out of
     /// range. The bytes are not reclaimed here — that is compaction's job.
     pub fn delete(&self, loc: TupleLoc) -> Result<bool> {
@@ -170,6 +181,50 @@ impl<V: Vfs> TupleMut<V> {
     }
 }
 
+/// A pinned tuple page, held to read many of its tuples. Owns the single
+/// [`ReadPage`] (one pin); every [`TupleView`] borrowed from it shares that pin.
+pub struct PageTuples<V: Vfs> {
+    page: ReadPage<V>,
+}
+
+impl<V: Vfs> PageTuples<V> {
+    /// The page's id.
+    pub fn page_id(&self) -> PageId {
+        self.page.page_id()
+    }
+
+    /// A borrowed view of the tuple at `slot`. Cheap — no new pin, no I/O.
+    pub fn tuple(&self, slot: u16) -> TupleView<'_, V> {
+        TupleView {
+            page: &self.page,
+            slot,
+        }
+    }
+}
+
+/// A borrowed view of one tuple, sharing its page's single pin via the
+/// [`PageTuples`] it came from. Holds no pin of its own.
+pub struct TupleView<'p, V: Vfs> {
+    page: &'p ReadPage<V>,
+    slot: u16,
+}
+
+impl<V: Vfs> TupleView<'_, V> {
+    /// The slot this view addresses.
+    pub fn slot(&self) -> u16 {
+        self.slot
+    }
+
+    /// The tuple's bytes, borrowed from the shared pinned frame. `None` if the
+    /// slot is deleted or the page isn't a tuple page (a corrupt pointer).
+    pub fn bytes(&self) -> Option<Ref<'_, [u8]>> {
+        Ref::filter_map(self.page.bytes(), |page| {
+            TuplePage::open(page).ok()?.get(self.slot)
+        })
+        .ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +286,25 @@ mod tests {
             let view = heap.get(loc).unwrap();
             assert_eq!(&*view.bytes().unwrap(), &(i as u32).to_be_bytes()[..]);
         }
+    }
+
+    #[test]
+    fn one_pinned_page_serves_many_views() {
+        let heap = heap();
+        let a = heap.insert(b"a").unwrap();
+        let b = heap.insert(b"bb").unwrap();
+        let c = heap.insert(b"ccc").unwrap();
+        assert_eq!(
+            (a.page_id, b.page_id, c.page_id),
+            (a.page_id, a.page_id, a.page_id)
+        );
+
+        // One pinned page, three borrowed views into it — no per-tuple handle.
+        let page = heap.page(a.page_id).unwrap();
+        assert_eq!(&*page.tuple(a.slot_id).bytes().unwrap(), b"a");
+        assert_eq!(&*page.tuple(b.slot_id).bytes().unwrap(), b"bb");
+        assert_eq!(&*page.tuple(c.slot_id).bytes().unwrap(), b"ccc");
+        assert_eq!(heap.cache().resident(), 1, "only one page resident/pinned");
     }
 
     #[test]
