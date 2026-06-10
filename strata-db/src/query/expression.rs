@@ -79,9 +79,9 @@ impl Expr {
     /// `AND` / `OR` short-circuit on `false` / `true` even with the
     /// other side `NULL`; otherwise they return `NULL`.
     ///
-    /// Type mismatches return [`QueryError::Internal`] rather than
-    /// silently coercing — coercions can be added later when there's a
-    /// type-checker to drive them.
+    /// Comparisons coerce across integer widths (so a column compares
+    /// against an `Int64` literal); a non-numeric type mismatch is a
+    /// [`QueryError::Type`] surfaced to the user.
     pub fn eval(&self, tuple: &Tuple) -> Result<Value, QueryError> {
         match self {
             Expr::Column { index } => tuple.values.get(*index).cloned().ok_or_else(|| {
@@ -126,8 +126,8 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
     }
 
     match op {
-        Eq => Ok(Value::Bool(lhs == rhs)),
-        NotEq => Ok(Value::Bool(lhs != rhs)),
+        Eq => Ok(Value::Bool(values_eq(&lhs, &rhs))),
+        NotEq => Ok(Value::Bool(!values_eq(&lhs, &rhs))),
         Lt => Ok(Value::Bool(cmp_values(&lhs, &rhs)?.is_lt())),
         LtEq => Ok(Value::Bool(cmp_values(&lhs, &rhs)?.is_le())),
         Gt => Ok(Value::Bool(cmp_values(&lhs, &rhs)?.is_gt())),
@@ -147,17 +147,40 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
     }
 }
 
-/// Total order on values that share a primitive type. Cross-type
-/// comparison is an error today — once we have implicit numeric
-/// widening, this can grow a coercion step.
+/// The integer value of `v`, widened to `i64`, if it is any integer
+/// type. Lets comparisons mix integer widths — notably a column against
+/// a SQL literal, which always binds as `Int64`.
+fn as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int16(n) => Some(*n as i64),
+        Value::Int32(n) => Some(*n as i64),
+        Value::Int64(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Equality with numeric coercion: any two integers compare by value
+/// regardless of width; otherwise fall back to structural equality
+/// (`Text == Text`, `Bytes == Bytes`, mismatched types → not equal).
+fn values_eq(lhs: &Value, rhs: &Value) -> bool {
+    match (as_i64(lhs), as_i64(rhs)) {
+        (Some(a), Some(b)) => a == b,
+        _ => lhs == rhs,
+    }
+}
+
+/// Total order for ordered comparisons. Integers compare across widths
+/// (coerced to `i64`); same-typed bools and text compare directly.
+/// Anything else — including a non-numeric vs numeric mix — is a type
+/// error the caller surfaces to the user.
 fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
+    if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
+        return Ok(a.cmp(&b));
+    }
     match (lhs, rhs) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
-        (Value::Int16(a), Value::Int16(b)) => Ok(a.cmp(b)),
-        (Value::Int32(a), Value::Int32(b)) => Ok(a.cmp(b)),
-        (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        (l, r) => Err(QueryError::Internal(format!(
+        (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),
     }
@@ -218,6 +241,23 @@ mod tests {
     }
 
     #[test]
+    fn eval_compares_across_integer_widths() {
+        // An Int32 column against an Int64 literal (how SQL literals bind).
+        let tuple = t(vec![Value::Int32(2)]);
+        let eq = Expr::binary(BinaryOperator::Eq, Expr::column(0), Expr::lit(2i64));
+        assert_eq!(eq.eval(&tuple).unwrap(), Value::Bool(true));
+        let gt = Expr::binary(BinaryOperator::Gt, Expr::column(0), Expr::lit(1i64));
+        assert_eq!(gt.eval(&tuple).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_non_numeric_comparison_mismatch_is_type_error() {
+        let tuple = t(vec![Value::Text("x".into())]);
+        let pred = Expr::binary(BinaryOperator::Lt, Expr::column(0), Expr::lit(5i64));
+        assert!(matches!(pred.eval(&tuple), Err(QueryError::Type(_))));
+    }
+
+    #[test]
     fn eval_and_short_circuits_on_null() {
         // false AND NULL -> false (3VL short-circuit, even though one side is null)
         let expr = Expr::binary(
@@ -236,11 +276,9 @@ mod tests {
 
     #[test]
     fn eval_type_mismatch_is_error() {
+        // bool vs int: not coercible, so a type error.
         let expr = Expr::binary(BinaryOperator::Lt, Expr::lit(true), Expr::lit(1i32));
-        assert!(matches!(
-            expr.eval(&t(vec![])),
-            Err(QueryError::Internal(_))
-        ));
+        assert!(matches!(expr.eval(&t(vec![])), Err(QueryError::Type(_))));
     }
 
     #[test]

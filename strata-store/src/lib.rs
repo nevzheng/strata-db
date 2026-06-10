@@ -42,34 +42,91 @@ use thiserror::Error;
 pub enum StorageError {
     /// A failure originating in the LSM building blocks (the index).
     #[error(transparent)]
-    Lsm(#[from] LsmError),
+    Lsm(LsmError),
 
     /// A failure in the page heap (the tuple store).
     #[error(transparent)]
-    Pager(#[from] pager::PageError),
+    Pager(pager::PageError),
 
     /// The index and heap disagree: a key maps to a tuple location that is
     /// malformed or no longer present. Indicates corruption or a bug.
     #[error("storage corruption: {0}")]
     Corruption(String),
+
+    /// A bounded resource ran out (buffer pool, memtable, or backing
+    /// store) — every layer's exhaustion funnels here. A write/allocate
+    /// failure only: reads never allocate, so they keep serving. (The
+    /// journal is the exception — a journal-write failure is fail-stop;
+    /// see [`pager::PageJournal`].)
+    #[error("storage exhausted: {0}")]
+    Exhausted(String),
+}
+
+impl StorageError {
+    /// Whether this is a bounded-resource exhaustion — writes fail with
+    /// it while reads, which never allocate, keep serving.
+    pub fn is_exhausted(&self) -> bool {
+        matches!(self, StorageError::Exhausted(_))
+    }
+}
+
+// Leaf errors funnel here, routing their exhaustion cases into the single
+// `Exhausted` variant so callers recognize "ran out of room" uniformly.
+impl From<LsmError> for StorageError {
+    fn from(e: LsmError) -> Self {
+        if e.is_exhausted() {
+            StorageError::Exhausted(e.to_string())
+        } else {
+            StorageError::Lsm(e)
+        }
+    }
+}
+
+impl From<pager::PageError> for StorageError {
+    fn from(e: pager::PageError) -> Self {
+        if e.is_exhausted() {
+            StorageError::Exhausted(e.to_string())
+        } else {
+            StorageError::Pager(e)
+        }
+    }
 }
 
 // Convenience conversions so the engine can `?` the leaf LSM errors directly;
-// each funnels through [`LsmError`].
+// each funnels through [`LsmError`] (and thus the exhaustion routing above).
 impl From<WriteError> for StorageError {
     fn from(e: WriteError) -> Self {
-        StorageError::Lsm(e.into())
+        LsmError::from(e).into()
     }
 }
 
 impl From<ReadError> for StorageError {
     fn from(e: ReadError) -> Self {
-        StorageError::Lsm(e.into())
+        LsmError::from(e).into()
     }
 }
 
 impl From<std::io::Error> for StorageError {
     fn from(e: std::io::Error) -> Self {
-        StorageError::Lsm(e.into())
+        LsmError::from(e).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhaustion_funnels_into_one_variant() {
+        // LSM memtable-full and pager pool-exhaustion both land in Exhausted.
+        let from_lsm: StorageError = LsmError::from(WriteError::StoreFull).into();
+        assert!(from_lsm.is_exhausted());
+        let from_pager: StorageError = pager::PageError::PoolExhausted(8).into();
+        assert!(from_pager.is_exhausted());
+
+        // A non-exhaustion error keeps its own variant.
+        let internal: StorageError = LsmError::Internal("boom".into()).into();
+        assert!(!internal.is_exhausted());
+        assert!(matches!(internal, StorageError::Lsm(_)));
     }
 }

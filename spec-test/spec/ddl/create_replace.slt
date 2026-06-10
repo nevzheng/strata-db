@@ -1,0 +1,81 @@
+# DDL/DML over pgwire: CREATE SCHEMA / TABLE, INSERT, SELECT, and the
+# CREATE OR REPLACE truncation path.
+#
+# The server seeds a `strata.public` namespace at startup; this file
+# creates and uses its own `strata.ddl` schema so it is self-contained.
+
+# --- CREATE SCHEMA + CREATE TABLE --------------------------------------
+
+statement ok
+CREATE SCHEMA strata.ddl
+
+# IF NOT EXISTS is idempotent.
+statement ok
+CREATE SCHEMA IF NOT EXISTS strata.ddl
+
+statement ok
+CREATE TABLE strata.ddl.events (id INT, name TEXT)
+
+# A fresh table reads empty.
+query TT
+SELECT * FROM strata.ddl.events
+----
+
+# Duplicate CREATE without OR REPLACE errors.
+statement error
+CREATE TABLE strata.ddl.events (id INT)
+
+# --- write + read ------------------------------------------------------
+
+statement ok
+INSERT INTO strata.ddl.events VALUES (1, 'alpha'), (2, 'bravo'), (3, 'charlie')
+
+# Rows come back in primary-key (column 0) order.
+query TT
+SELECT * FROM strata.ddl.events
+----
+1 alpha
+2 bravo
+3 charlie
+
+# Filter + projection round-trip through the planner.
+query T
+SELECT id FROM strata.ddl.events WHERE name = 'bravo'
+----
+2
+
+# Integer predicate: `id` is INT (Int32) but the literal binds as Int64,
+# so the comparison coerces across widths.
+query T
+SELECT name FROM strata.ddl.events WHERE id >= 2
+----
+bravo
+charlie
+
+# A value that doesn't fit the column's type is rejected.
+statement error
+INSERT INTO strata.ddl.events VALUES ('not an int', 'x')
+
+# --- CREATE OR REPLACE truncation --------------------------------------
+
+# Replace swaps the schema and drops all prior rows: the new incarnation
+# starts empty.
+statement ok
+CREATE OR REPLACE TABLE strata.ddl.events (id BIGINT, label TEXT)
+
+query TT
+SELECT * FROM strata.ddl.events
+----
+
+# The new schema is in effect: the old column `name` is gone...
+statement error
+SELECT name FROM strata.ddl.events
+
+# ...and fresh writes land in the new incarnation only.
+statement ok
+INSERT INTO strata.ddl.events VALUES (10, 'fresh')
+
+query TT
+SELECT * FROM strata.ddl.events
+----
+10 fresh

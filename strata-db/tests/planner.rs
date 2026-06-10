@@ -92,6 +92,21 @@ fn unknown_table_errors_through_bind() {
 }
 
 #[test]
+fn create_table_lowers_to_create_table_node() {
+    let (_tmp, db) = common::temp_db();
+    let project = db.create_project("acme").unwrap();
+    project.create_dataset("metrics").unwrap();
+
+    let pq = plan(&db, "CREATE TABLE acme.metrics.events (id INT, name TEXT)").unwrap();
+    let root = &pq.physical[0].root;
+    let PlanNode::CreateTable { name, schema, .. } = root else {
+        panic!("expected CreateTable root, got {root:?}");
+    };
+    assert_eq!(name, "events");
+    assert_eq!(schema.fields.len(), 2);
+}
+
+#[test]
 fn distinct_is_unsupported() {
     let (_tmp, db) = common::temp_db();
     setup_events_table(&db);

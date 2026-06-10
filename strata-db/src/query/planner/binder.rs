@@ -11,14 +11,17 @@
 //!   [`BuildLogical`](super::pass::BuildLogical) downstream.
 
 use sqlparser::ast::{
-    BinaryOperator as AstBinaryOperator, Expr as AstExpr, GroupByExpr, Ident, Query as AstQuery,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
-    Value as AstValue,
+    BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
+    DataType, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery,
+    SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
+    TableWithJoins, UnaryOperator, Value as AstValue,
 };
 
+use crate::catalog::consts::DEFAULT_PROJECT_NAME;
 use crate::catalog::schema::Schema;
+use crate::catalog::{CatalogError, ResourceKind};
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
-use crate::storage::types::{Tuple, Value};
+use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
 use super::super::expression::{BinaryOperator, Expr};
 use super::super::logical_plan::{LogicalNode, LogicalPlan};
@@ -75,8 +78,329 @@ impl BindNode for Statement {
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
         match self {
             Statement::Query(q) => q.bind(binder),
+            Statement::Insert(insert) => bind_insert(insert, binder),
+            Statement::CreateTable(ct) => bind_create_table(ct, binder),
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                ..
+            } => bind_create_schema(
+                schema_name,
+                *if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                binder,
+            ),
             other => Err(QueryError::unsupported(format!("statement: {other:?}"))),
         }
+    }
+}
+
+// --- CREATE TABLE ----------------------------------------------------------
+
+/// Bind a `CREATE TABLE` into a [`LogicalNode::CreateTable`]. The parent
+/// project + dataset are resolved to ids here (read-side); the table row
+/// is minted in the catalog at execution.
+fn bind_create_table(ct: &AstCreateTable, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
+    // `CREATE TABLE ... AS SELECT` and `LIKE`/`CLONE` derive their shape
+    // from another relation; we only support an explicit column list.
+    if ct.query.is_some() {
+        return Err(QueryError::unsupported("CREATE TABLE ... AS SELECT"));
+    }
+    if ct.like.is_some() || ct.clone.is_some() {
+        return Err(QueryError::unsupported("CREATE TABLE ... LIKE / CLONE"));
+    }
+    // Table-level constraints (PRIMARY KEY, UNIQUE, …) aren't modeled
+    // yet — column 0 is the PK by convention. Reject rather than drop.
+    if !ct.constraints.is_empty() {
+        return Err(QueryError::unsupported("table constraints"));
+    }
+
+    let (project, dataset, table) = three_part_name(&ct.name)?;
+
+    // Resolve the parent project + dataset to ids; either missing is a
+    // catalog NotFound, surfaced to the caller verbatim.
+    let catalog = binder.ctx().catalog();
+    let project_meta = catalog
+        .get_project(project)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Project,
+            name: project.to_string(),
+        })?;
+    let dataset_meta = catalog
+        .get_dataset(project_meta.id, dataset)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Dataset,
+            name: dataset.to_string(),
+        })?;
+
+    let schema = bind_schema(&ct.columns)?;
+
+    Ok(LogicalPlan::new(LogicalNode::CreateTable {
+        project_id: project_meta.id,
+        dataset_id: dataset_meta.id,
+        name: table.to_string(),
+        schema,
+        // `OR REPLACE` bumps the truncation id at execution; plain
+        // `CREATE` errors if the table already exists.
+        or_replace: ct.or_replace,
+    }))
+}
+
+// --- INSERT ----------------------------------------------------------------
+
+/// Bind `INSERT INTO p.d.t VALUES (..), (..)` into an [`LogicalNode::Insert`]
+/// over a [`LogicalNode::Values`] source. v1 limits: positional values only
+/// (no column list), `VALUES` source only (no `INSERT ... SELECT`), constant
+/// expressions only. Each value is validated and coerced against the table's
+/// stored schema.
+fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
+    if !insert.columns.is_empty() {
+        return Err(QueryError::unsupported(
+            "INSERT with an explicit column list",
+        ));
+    }
+    let TableObject::TableName(name) = &insert.table else {
+        return Err(QueryError::unsupported(
+            "INSERT target must be a table name",
+        ));
+    };
+    let (project, dataset, table_name) = three_part_name(name)?;
+    let table = binder
+        .ctx()
+        .catalog()
+        .resolve_table(project, dataset, table_name)?;
+    let schema = table.schema().clone();
+
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| QueryError::unsupported("INSERT without VALUES"))?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(QueryError::unsupported("INSERT source must be VALUES"));
+    };
+
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let exprs = &row.content;
+        if exprs.len() != schema.fields.len() {
+            return Err(QueryError::type_error(format!(
+                "INSERT has {} value(s) but table `{}` has {} column(s)",
+                exprs.len(),
+                table.name(),
+                schema.fields.len()
+            )));
+        }
+        let mut row_values = Vec::with_capacity(exprs.len());
+        for (expr, field) in exprs.iter().zip(&schema.fields) {
+            let value = const_eval(expr, binder)?;
+            row_values.push(coerce_value(value, field)?);
+        }
+        rows.push(Tuple { values: row_values });
+    }
+
+    Ok(LogicalPlan::new(LogicalNode::Insert {
+        table,
+        input: Box::new(LogicalNode::Values { rows }),
+    }))
+}
+
+/// Evaluate a `VALUES` expression to a constant. It binds with no scope,
+/// so any column reference fails — `VALUES` rows are constants. Supports
+/// literals and constant expressions (e.g. `1 = 1`); negative numeric
+/// literals aren't supported yet (`-` binds as an unsupported unary op).
+fn const_eval(expr: &AstExpr, binder: &mut Binder) -> Result<Value, QueryError> {
+    let bound = expr.bind(binder)?;
+    bound.eval(&Tuple { values: vec![] })
+}
+
+/// Validate and coerce `value` to `field`'s type. Same type passes;
+/// integers widen freely and narrow with a range check; everything else
+/// (cross-category, `NULL` into `NOT NULL`) is a type error.
+fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
+    use LogicalType as T;
+    match value {
+        Value::Null if field.nullable => Ok(Value::Null),
+        Value::Null => Err(QueryError::type_error(format!(
+            "NULL into NOT NULL column `{}`",
+            field.name.as_str()
+        ))),
+        Value::Bool(b) if matches!(field.ty, T::Bool) => Ok(Value::Bool(b)),
+        Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
+        Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
+        Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_)
+            if matches!(field.ty, T::Int16 | T::Int32 | T::Int64) =>
+        {
+            let n = match value {
+                Value::Int16(x) => x as i64,
+                Value::Int32(x) => x as i64,
+                Value::Int64(x) => x,
+                _ => unreachable!(),
+            };
+            fit_int(n, field)
+        }
+        other => Err(QueryError::type_error(format!(
+            "cannot insert {other:?} into column `{}` of type {:?}",
+            field.name.as_str(),
+            field.ty
+        ))),
+    }
+}
+
+/// Fit an integer into an integer column: widening always succeeds, a
+/// narrowing conversion that overflows is a type error.
+fn fit_int(n: i64, field: &Field) -> Result<Value, QueryError> {
+    let out_of_range = || {
+        QueryError::type_error(format!(
+            "value {n} out of range for column `{}` of type {:?}",
+            field.name.as_str(),
+            field.ty
+        ))
+    };
+    match field.ty {
+        LogicalType::Int64 => Ok(Value::Int64(n)),
+        LogicalType::Int32 => i32::try_from(n)
+            .map(Value::Int32)
+            .map_err(|_| out_of_range()),
+        LogicalType::Int16 => i16::try_from(n)
+            .map(Value::Int16)
+            .map_err(|_| out_of_range()),
+        _ => unreachable!("fit_int is only called for integer columns"),
+    }
+}
+
+// --- CREATE SCHEMA ---------------------------------------------------------
+
+/// Bind a `CREATE SCHEMA` into a [`LogicalNode::CreateDataset`]. Follows
+/// BigQuery: a schema *is* a dataset, named `[project.]dataset`. Anything
+/// beyond the name (`WITH`, `OPTIONS`, `DEFAULT COLLATE`, authorization)
+/// is rejected as unsupported.
+fn bind_create_schema(
+    schema_name: &SchemaName,
+    if_not_exists: bool,
+    with: &Option<Vec<SqlOption>>,
+    options: &Option<Vec<SqlOption>>,
+    default_collate_spec: &Option<AstExpr>,
+    binder: &mut Binder,
+) -> Result<LogicalPlan, QueryError> {
+    if with.is_some() || options.is_some() || default_collate_spec.is_some() {
+        return Err(QueryError::unsupported("CREATE SCHEMA options"));
+    }
+    let SchemaName::Simple(name) = schema_name else {
+        return Err(QueryError::unsupported("CREATE SCHEMA AUTHORIZATION"));
+    };
+
+    let (project, dataset) = dataset_name(name)?;
+    // The project must already exist — we create datasets, not projects
+    // (matching BigQuery, where projects are provisioned out of band).
+    let project_meta = binder
+        .ctx()
+        .catalog()
+        .get_project(project)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Project,
+            name: project.to_string(),
+        })?;
+
+    Ok(LogicalPlan::new(LogicalNode::CreateDataset {
+        project_id: project_meta.id,
+        name: dataset.to_string(),
+        if_not_exists,
+    }))
+}
+
+/// Split a `CREATE SCHEMA` name into `(project, dataset)`. A bare
+/// `dataset` resolves its project to [`DEFAULT_PROJECT_NAME`] — BigQuery's
+/// "defaults to the project that runs this DDL statement".
+fn dataset_name(name: &ObjectName) -> Result<(&str, &str), QueryError> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(|i| i.value.as_str()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
+    match parts.as_slice() {
+        [d] => Ok((DEFAULT_PROJECT_NAME, *d)),
+        [p, d] => Ok((*p, *d)),
+        _ => Err(QueryError::unsupported(format!(
+            "CREATE SCHEMA needs [project.]dataset, got: {name}"
+        ))),
+    }
+}
+
+/// Turn the AST column list into a storage [`Schema`]. Field order is
+/// preserved — column 0 is the primary key by convention.
+fn bind_schema(columns: &[ColumnDef]) -> Result<Schema, QueryError> {
+    if columns.is_empty() {
+        return Err(QueryError::unsupported("CREATE TABLE with no columns"));
+    }
+    let fields = columns
+        .iter()
+        .map(bind_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Schema { fields })
+}
+
+fn bind_column(col: &ColumnDef) -> Result<Field, QueryError> {
+    let ty = bind_data_type(&col.data_type)?;
+    // SQL columns are nullable unless `NOT NULL` is given. We accept
+    // only the null-related options for now; anything else (defaults,
+    // generated columns, inline PK/UNIQUE) is rejected so we don't
+    // silently ignore it.
+    let mut nullable = true;
+    for opt in &col.options {
+        match &opt.option {
+            ColumnOption::Null => nullable = true,
+            ColumnOption::NotNull => nullable = false,
+            other => {
+                return Err(QueryError::unsupported(format!("column option: {other:?}")));
+            }
+        }
+    }
+    Ok(Field {
+        name: FieldName::new(col.name.value.as_str()),
+        ty,
+        nullable,
+    })
+}
+
+/// Map a SQL type to one of the engine's [`LogicalType`]s. Unknown or
+/// unsupported types surface as `unsupported`.
+fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
+    Ok(match ty {
+        DataType::Bool | DataType::Boolean => LogicalType::Bool,
+        DataType::SmallInt(_) | DataType::Int2(_) => LogicalType::Int16,
+        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => LogicalType::Int32,
+        DataType::BigInt(_) | DataType::Int8(_) => LogicalType::Int64,
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::CharVarying(_) => {
+            LogicalType::Text
+        }
+        DataType::Bytea => LogicalType::Bytes,
+        DataType::JSON | DataType::JSONB => LogicalType::Json,
+        other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
+    })
+}
+
+/// Split a `project.dataset.table` object name into its three parts.
+/// Errors `unsupported` if it isn't exactly three identifier segments —
+/// we have no session defaults to fill in shorter names.
+fn three_part_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(|i| i.value.as_str()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
+    match parts.as_slice() {
+        [p, d, t] => Ok((*p, *d, *t)),
+        _ => Err(QueryError::unsupported(format!(
+            "name needs project.dataset.table, got: {name}"
+        ))),
     }
 }
 
@@ -175,20 +499,7 @@ impl BindNode for TableWithJoins {
             )));
         };
         // Three-part name only for now — no session defaults.
-        let parts: Vec<&str> = name
-            .0
-            .iter()
-            .map(|p| p.as_ident().map(|i| i.value.as_str()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
-        let (project, dataset, table_name) = match parts.as_slice() {
-            [p, d, t] => (*p, *d, *t),
-            _ => {
-                return Err(QueryError::unsupported(format!(
-                    "FROM needs project.dataset.table, got: {name}"
-                )));
-            }
-        };
+        let (project, dataset, table_name) = three_part_name(name)?;
         let table = binder
             .ctx()
             .catalog()

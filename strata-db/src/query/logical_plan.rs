@@ -12,6 +12,8 @@
 //! `Scan` could become a `SeqScan` or an `IndexScan`, and rewrite rules
 //! can transform the logical tree without caring about access methods.
 
+use crate::catalog::ids::{DatasetId, ProjectId};
+use crate::catalog::schema::Schema;
 use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
@@ -59,5 +61,26 @@ pub enum LogicalNode {
     Delete {
         table: Table,
         input: Box<LogicalNode>,
+    },
+    /// DDL sink for `CREATE TABLE`. The binder resolves the parent
+    /// project + dataset to ids at bind time; the table itself is
+    /// minted in the catalog at execution. No input — it produces no
+    /// rows, only a side effect.
+    CreateTable {
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+        name: String,
+        schema: Schema,
+        /// `CREATE OR REPLACE` — replace any existing table (bumping its
+        /// truncation id) instead of erroring on conflict.
+        or_replace: bool,
+    },
+    /// DDL sink for `CREATE SCHEMA` — creates a dataset under a resolved
+    /// project (BigQuery models a schema as a dataset).
+    CreateDataset {
+        project_id: ProjectId,
+        name: String,
+        /// `IF NOT EXISTS` — succeed silently if the dataset already exists.
+        if_not_exists: bool,
     },
 }

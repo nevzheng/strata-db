@@ -55,6 +55,30 @@ pub enum PageError {
     /// A failure in the page journal (append, replay, or recovery).
     #[error("journal error: {0}")]
     Journal(#[from] ::journal::JournalError),
+
+    /// The inline free list outgrew the superblock. It needs to spill to
+    /// dedicated free-space-map pages — future work; today the list is
+    /// empty (nothing frees pages yet) so this is unreachable.
+    #[error("free list of {len} ids overflows the superblock (max {max})")]
+    FreeListOverflow { len: usize, max: usize },
+
+    /// The backing store could not grow — out of space (`ENOSPC`). A
+    /// write/allocate failure; reads never allocate, so they continue.
+    /// See also [`PoolExhausted`](Self::PoolExhausted) (the in-RAM
+    /// counterpart) and [`is_exhausted`](Self::is_exhausted).
+    #[error("backing store exhausted: {0}")]
+    Exhausted(String),
+}
+
+impl PageError {
+    /// Whether this is a bounded-resource exhaustion — the buffer pool
+    /// (RAM) or the backing store (disk) ran out. These arise only on the
+    /// allocate/write path; the layer above maps them to a single
+    /// resource-exhausted error so a write fails cleanly while reads,
+    /// which never allocate, keep serving.
+    pub fn is_exhausted(&self) -> bool {
+        matches!(self, PageError::PoolExhausted(_) | PageError::Exhausted(_))
+    }
 }
 
 /// Result alias for the crate.

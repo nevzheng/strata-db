@@ -64,8 +64,16 @@ impl PageJournal {
     }
 
     /// Durably append one record (returns once it is `fsync`'d).
+    ///
+    /// A journal write is the durability point: if we cannot record a
+    /// page image, there is no safe way to proceed — continuing would
+    /// risk applying changes we can never recover. So a failure here is
+    /// **fail-stop** (panic), unlike pager/LSM allocation exhaustion,
+    /// which fails the write but lets reads continue.
     pub fn append(&mut self, op: &PageOp) -> Result<()> {
-        self.inner.append(op)?;
+        self.inner.append(op).unwrap_or_else(|e| {
+            panic!("page journal append failed; cannot guarantee durability: {e}")
+        });
         Ok(())
     }
 

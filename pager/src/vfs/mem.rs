@@ -12,6 +12,8 @@ use crate::{PageId, Result};
 pub struct MemVfs {
     blocks: Vec<Box<[u8]>>,
     next_id: u64,
+    /// Freed block ids available for reuse, mirroring [`FileVfs`](super::FileVfs).
+    free_list: Vec<u64>,
 }
 
 impl MemVfs {
@@ -20,16 +22,24 @@ impl MemVfs {
         Self {
             blocks: vec![zeroed()], // block 0 reserved
             next_id: 1,
+            free_list: Vec::new(),
         }
     }
 }
 
 impl Vfs for MemVfs {
     fn allocate(&mut self) -> Result<PageId> {
+        if let Some(id) = self.free_list.pop() {
+            return Ok(PageId(id)); // block already exists; reuse it in place
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.blocks.push(zeroed());
         Ok(PageId(id))
+    }
+
+    fn free(&mut self, id: PageId) {
+        self.free_list.push(id.0);
     }
 
     fn ensure_allocated(&mut self, id: PageId) -> Result<()> {

@@ -4,6 +4,7 @@ use std::path::Path;
 use strata_store::memstore::BTreeMapStore;
 use strata_store::{LevelConfig, StorageEngine};
 
+use crate::catalog::consts::{DEFAULT_DATASET_NAME, DEFAULT_PROJECT_NAME};
 use crate::catalog::project::Project;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
 use crate::query::{QueryContext, QueryError};
@@ -67,9 +68,11 @@ impl DbBuilder {
             Some(configs) => StorageEngine::with_levels(path, mem, configs),
             None => StorageEngine::new(path, mem),
         }?;
-        Ok(Db {
+        let db = Db {
             engine: RefCell::new(engine),
-        })
+        };
+        db.ensure_default_namespace()?;
+        Ok(db)
     }
 }
 
@@ -87,6 +90,24 @@ impl Db {
         TableApi {
             engine: &self.engine,
         }
+    }
+
+    /// Idempotently seed the default `strata.public` namespace, so a
+    /// freshly opened (or reopened) database always has a project and
+    /// dataset that SQL can reference. Existing rows are left untouched.
+    fn ensure_default_namespace(&self) -> Result<(), QueryError> {
+        let catalog = Catalog::new(self.api());
+        let project = match catalog.open_project(DEFAULT_PROJECT_NAME)? {
+            Some(meta) => meta,
+            None => catalog.create_project(DEFAULT_PROJECT_NAME)?,
+        };
+        if catalog
+            .open_dataset(project.id, DEFAULT_DATASET_NAME)?
+            .is_none()
+        {
+            catalog.create_dataset(project.id, DEFAULT_DATASET_NAME)?;
+        }
+        Ok(())
     }
 
     pub fn create_project(&self, name: &str) -> Result<Project<'_>, QueryError> {
