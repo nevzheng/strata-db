@@ -44,6 +44,14 @@ SELECT id FROM strata.ddl.events WHERE name = 'bravo'
 ----
 2
 
+# Integer predicate: `id` is INT (Int32) but the literal binds as Int64,
+# so the comparison coerces across widths.
+query T
+SELECT name FROM strata.ddl.events WHERE id >= 2
+----
+bravo
+charlie
+
 # A value that doesn't fit the column's type is rejected.
 statement error
 INSERT INTO strata.ddl.events VALUES ('not an int', 'x')

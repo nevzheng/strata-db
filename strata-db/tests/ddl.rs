@@ -306,6 +306,25 @@ fn insert_then_select_round_trips() {
 }
 
 #[test]
+fn select_filters_int_column_against_literal() {
+    let (_tmp, db) = common::temp_db();
+    create_public_table(&db, "CREATE TABLE strata.public.events (id INT, name TEXT)");
+    exec(
+        &db,
+        "INSERT INTO strata.public.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .unwrap();
+
+    // `id` is Int32 but the literal binds as Int64 — comparison coerces.
+    let rows = rows_of(&exec(&db, "SELECT name FROM strata.public.events WHERE id = 2").unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Text("b".into()));
+
+    let rows = rows_of(&exec(&db, "SELECT name FROM strata.public.events WHERE id > 1").unwrap());
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
 fn insert_coerces_widening_and_narrowing_within_range() {
     let (_tmp, db) = common::temp_db();
     create_public_table(&db, "CREATE TABLE strata.public.t (a SMALLINT, b BIGINT)");
