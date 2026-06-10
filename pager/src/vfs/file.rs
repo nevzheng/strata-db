@@ -82,7 +82,9 @@ impl FileVfs {
 
     /// Physically size the file to exactly `blocks` blocks.
     fn set_capacity(&mut self, blocks: u64) -> Result<()> {
-        self.file.set_len(blocks * BLOCK_SIZE as u64)?;
+        self.file
+            .set_len(blocks * BLOCK_SIZE as u64)
+            .map_err(grow_error)?;
         self.capacity_blocks = blocks;
         Ok(())
     }
@@ -207,6 +209,20 @@ fn check_len(got: usize) -> Result<()> {
     Ok(())
 }
 
+/// `errno` for "no space left on device" — the same value on Linux,
+/// macOS, and the BSDs.
+const ENOSPC: i32 = 28;
+
+/// Classify a file-growth failure: a full disk is resource exhaustion
+/// (a clean write failure), anything else is a genuine I/O fault.
+fn grow_error(e: std::io::Error) -> PageError {
+    if e.raw_os_error() == Some(ENOSPC) {
+        PageError::Exhausted(format!("cannot grow backing file: {e}"))
+    } else {
+        PageError::Io(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +294,13 @@ mod tests {
         // Reopen recovers the free list, so the freed id is reused first.
         let mut vfs = FileVfs::open(&path).unwrap();
         assert_eq!(vfs.allocate().unwrap(), freed);
+    }
+
+    #[test]
+    fn exhaustion_errors_are_classified() {
+        assert!(PageError::PoolExhausted(8).is_exhausted());
+        assert!(PageError::Exhausted("full".into()).is_exhausted());
+        assert!(!PageError::BadMagic.is_exhausted());
     }
 
     #[test]
