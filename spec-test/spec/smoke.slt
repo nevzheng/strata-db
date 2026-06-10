@@ -1,9 +1,10 @@
-# Server tests covering what the planner supports today.
+# Server tests covering literal SELECTs, comparison/logical expressions,
+# and error paths through parse / analysis / lowering.
 #
-# Today: literal SELECTs, comparison/logical expressions, and error
-# paths through parse / analysis / lowering. Real table queries arrive
-# once CREATE TABLE / INSERT / DROP land in the planner — those
-# statements currently surface as `statement error`.
+# Table DDL/DML (CREATE SCHEMA / TABLE, INSERT, CREATE OR REPLACE) lives
+# in `ddl/`. The error cases below still fail — but now because their
+# names are unqualified (tables need `project.dataset.table`) or the
+# statement isn't supported yet (DROP), not because DDL is unplanned.
 
 # Literal SELECTs ------------------------------------------------------
 
@@ -54,12 +55,13 @@ SELECT * FROM acme.metrics.events
 statement error
 SELECT DISTINCT 1
 
-# DDL/DML aren't through the planner yet — they error today.
+# Unqualified table names are rejected — DDL/DML need `project.dataset.table`.
 statement error
 CREATE TABLE foo (a INT)
 
 statement error
 INSERT INTO foo VALUES (1)
 
+# DROP TABLE isn't supported yet.
 statement error
 DROP TABLE foo
