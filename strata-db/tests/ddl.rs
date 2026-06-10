@@ -184,3 +184,89 @@ fn duplicate_create_table_errors_already_exists() {
         "got {err:?}"
     );
 }
+
+// --- CREATE SCHEMA + default namespace -------------------------------------
+
+#[test]
+fn default_namespace_is_seeded_on_open() {
+    let (_tmp, db) = common::temp_db();
+    // `strata.public` exists out of the box, no DDL needed.
+    assert!(db.project("strata").unwrap().dataset("public").is_ok());
+}
+
+#[test]
+fn create_schema_creates_dataset_in_named_project() {
+    let (_tmp, db) = common::temp_db();
+    exec(&db, "CREATE SCHEMA strata.analytics").unwrap();
+    assert!(db.project("strata").unwrap().dataset("analytics").is_ok());
+}
+
+#[test]
+fn create_schema_without_project_uses_default() {
+    let (_tmp, db) = common::temp_db();
+    // Bare dataset name resolves its project to the default (`strata`).
+    exec(&db, "CREATE SCHEMA reports").unwrap();
+    assert!(db.project("strata").unwrap().dataset("reports").is_ok());
+}
+
+#[test]
+fn create_schema_if_not_exists_is_idempotent() {
+    let (_tmp, db) = common::temp_db();
+    exec(&db, "CREATE SCHEMA strata.analytics").unwrap();
+
+    // Re-creating without IF NOT EXISTS errors...
+    assert!(matches!(
+        exec(&db, "CREATE SCHEMA strata.analytics").unwrap_err(),
+        QueryError::Catalog(strata_db::CatalogError::AlreadyExists { .. })
+    ));
+    // ...with IF NOT EXISTS it's a silent no-op.
+    exec(&db, "CREATE SCHEMA IF NOT EXISTS strata.analytics").unwrap();
+}
+
+#[test]
+fn create_schema_in_missing_project_errors() {
+    let (_tmp, db) = common::temp_db();
+    let err = exec(&db, "CREATE SCHEMA nope.analytics").unwrap_err();
+    assert!(matches!(err, QueryError::Catalog(_)), "got {err:?}");
+}
+
+#[test]
+fn create_schema_authorization_is_unsupported() {
+    let (_tmp, db) = common::temp_db();
+    // Only `[project.]dataset` is supported; authorization forms are not.
+    let err = exec(&db, "CREATE SCHEMA AUTHORIZATION someone").unwrap_err();
+    assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
+}
+
+#[test]
+fn create_table_in_a_created_schema_round_trips() {
+    let (_tmp, db) = common::temp_db();
+    exec(&db, "CREATE SCHEMA strata.analytics").unwrap();
+    exec(
+        &db,
+        "CREATE TABLE strata.analytics.events (id INT, name TEXT)",
+    )
+    .unwrap();
+
+    let table = db
+        .project("strata")
+        .unwrap()
+        .dataset("analytics")
+        .unwrap()
+        .table("events")
+        .unwrap();
+    {
+        let mut ctx = db.query_context();
+        ctx.table_mut(&table)
+            .put(&Tuple {
+                values: vec![Value::Int32(1), Value::Text("a".into())],
+            })
+            .unwrap();
+    }
+    let rows = match &exec(&db, "SELECT * FROM strata.analytics.events").unwrap()[0] {
+        StmtResult::Rows(r) => r.clone(),
+        StmtResult::Affected(_) => panic!("expected rows"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[1], Value::Text("a".into()));
+}

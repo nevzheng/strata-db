@@ -336,6 +336,30 @@ pub(crate) fn resolve_table(
 // metadata without going through the lock-acquiring `Catalog` facade.
 // `Catalog`'s methods delegate here so the two paths can't diverge.
 
+/// `CREATE SCHEMA`: create a dataset under `project_id`. Errors
+/// `AlreadyExists` if the name is taken (the `IF NOT EXISTS` caller
+/// decides whether to swallow that).
+pub(crate) fn create_dataset(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    project_id: ProjectId,
+    name: &str,
+) -> Result<DatasetMeta, QueryError> {
+    if get_dataset(engine, project_id, name)?.is_some() {
+        return Err(already_exists(ResourceKind::Dataset, name));
+    }
+    let meta = DatasetMeta {
+        id: DatasetId::new(),
+        name: name.to_string(),
+    };
+    write_meta(
+        engine,
+        &datasets_meta_table(),
+        &dataset_key(project_id, name),
+        &meta,
+    )?;
+    Ok(meta)
+}
+
 /// `CREATE TABLE`: mint a fresh table at the initial incarnation.
 /// Errors `AlreadyExists` if any incarnation of the name is live.
 pub(crate) fn create_table(
@@ -524,20 +548,7 @@ impl<'db> Catalog<'db> {
         name: &str,
     ) -> Result<DatasetMeta, QueryError> {
         let mut engine = self.api.write();
-        if get_dataset(&engine, project_id, name)?.is_some() {
-            return Err(already_exists(ResourceKind::Dataset, name));
-        }
-        let meta = DatasetMeta {
-            id: DatasetId::new(),
-            name: name.to_string(),
-        };
-        write_meta(
-            &mut engine,
-            &datasets_meta_table(),
-            &dataset_key(project_id, name),
-            &meta,
-        )?;
-        Ok(meta)
+        create_dataset(&mut engine, project_id, name)
     }
 
     pub(crate) fn open_dataset(

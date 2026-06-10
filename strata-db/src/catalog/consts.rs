@@ -51,6 +51,20 @@
 use uuid::uuid;
 
 use crate::catalog::ids::{DatasetId, ProjectId, TableId, TruncationId};
+
+// --- Default namespace ---
+//
+// Seeded by [`crate::Db`] on open so SQL has a namespace to reference
+// out of the box, and so `CREATE SCHEMA <dataset>` (no project segment)
+// resolves its project here — mirroring BigQuery's "defaults to the
+// project that runs this DDL statement".
+
+/// Default project, seeded on open and used when a `CREATE SCHEMA` name
+/// omits the project segment.
+pub const DEFAULT_PROJECT_NAME: &str = "strata";
+
+/// Default dataset, seeded under [`DEFAULT_PROJECT_NAME`].
+pub const DEFAULT_DATASET_NAME: &str = "public";
 use crate::catalog::schema::Schema;
 use crate::catalog::{DatasetMeta, ProjectMeta, TableMeta};
 use crate::storage::types::{Field, LogicalType};

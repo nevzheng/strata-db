@@ -92,6 +92,15 @@ impl LowerNode for LogicalNode {
                 schema: schema.clone(),
                 or_replace: *or_replace,
             },
+            LogicalNode::CreateDataset {
+                project_id,
+                name,
+                if_not_exists,
+            } => PlanNode::CreateDataset {
+                project_id: *project_id,
+                name: name.clone(),
+                if_not_exists: *if_not_exists,
+            },
         }
     }
 }

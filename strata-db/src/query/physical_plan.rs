@@ -72,4 +72,11 @@ pub enum PlanNode {
         /// truncation id) instead of erroring on conflict.
         or_replace: bool,
     },
+    /// DDL sink: create a dataset (`CREATE SCHEMA`) under a resolved project.
+    CreateDataset {
+        project_id: ProjectId,
+        name: String,
+        /// `IF NOT EXISTS` — succeed silently if the dataset already exists.
+        if_not_exists: bool,
+    },
 }

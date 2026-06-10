@@ -12,10 +12,12 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
-    DataType, Expr as AstExpr, GroupByExpr, Ident, ObjectName, Query as AstQuery, Select,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
+    DataType, Expr as AstExpr, GroupByExpr, Ident, ObjectName, Query as AstQuery, SchemaName,
+    Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableWithJoins, UnaryOperator,
+    Value as AstValue,
 };
 
+use crate::catalog::consts::DEFAULT_PROJECT_NAME;
 use crate::catalog::schema::Schema;
 use crate::catalog::{CatalogError, ResourceKind};
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
@@ -77,6 +79,21 @@ impl BindNode for Statement {
         match self {
             Statement::Query(q) => q.bind(binder),
             Statement::CreateTable(ct) => bind_create_table(ct, binder),
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                ..
+            } => bind_create_schema(
+                schema_name,
+                *if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                binder,
+            ),
             other => Err(QueryError::unsupported(format!("statement: {other:?}"))),
         }
     }
@@ -131,6 +148,65 @@ fn bind_create_table(ct: &AstCreateTable, binder: &mut Binder) -> Result<Logical
         // `CREATE` errors if the table already exists.
         or_replace: ct.or_replace,
     }))
+}
+
+// --- CREATE SCHEMA ---------------------------------------------------------
+
+/// Bind a `CREATE SCHEMA` into a [`LogicalNode::CreateDataset`]. Follows
+/// BigQuery: a schema *is* a dataset, named `[project.]dataset`. Anything
+/// beyond the name (`WITH`, `OPTIONS`, `DEFAULT COLLATE`, authorization)
+/// is rejected as unsupported.
+fn bind_create_schema(
+    schema_name: &SchemaName,
+    if_not_exists: bool,
+    with: &Option<Vec<SqlOption>>,
+    options: &Option<Vec<SqlOption>>,
+    default_collate_spec: &Option<AstExpr>,
+    binder: &mut Binder,
+) -> Result<LogicalPlan, QueryError> {
+    if with.is_some() || options.is_some() || default_collate_spec.is_some() {
+        return Err(QueryError::unsupported("CREATE SCHEMA options"));
+    }
+    let SchemaName::Simple(name) = schema_name else {
+        return Err(QueryError::unsupported("CREATE SCHEMA AUTHORIZATION"));
+    };
+
+    let (project, dataset) = dataset_name(name)?;
+    // The project must already exist — we create datasets, not projects
+    // (matching BigQuery, where projects are provisioned out of band).
+    let project_meta = binder
+        .ctx()
+        .catalog()
+        .get_project(project)?
+        .ok_or_else(|| CatalogError::NotFound {
+            kind: ResourceKind::Project,
+            name: project.to_string(),
+        })?;
+
+    Ok(LogicalPlan::new(LogicalNode::CreateDataset {
+        project_id: project_meta.id,
+        name: dataset.to_string(),
+        if_not_exists,
+    }))
+}
+
+/// Split a `CREATE SCHEMA` name into `(project, dataset)`. A bare
+/// `dataset` resolves its project to [`DEFAULT_PROJECT_NAME`] — BigQuery's
+/// "defaults to the project that runs this DDL statement".
+fn dataset_name(name: &ObjectName) -> Result<(&str, &str), QueryError> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(|i| i.value.as_str()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
+    match parts.as_slice() {
+        [d] => Ok((DEFAULT_PROJECT_NAME, *d)),
+        [p, d] => Ok((*p, *d)),
+        _ => Err(QueryError::unsupported(format!(
+            "CREATE SCHEMA needs [project.]dataset, got: {name}"
+        ))),
+    }
 }
 
 /// Turn the AST column list into a storage [`Schema`]. Field order is

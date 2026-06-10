@@ -75,4 +75,12 @@ pub enum LogicalNode {
         /// truncation id) instead of erroring on conflict.
         or_replace: bool,
     },
+    /// DDL sink for `CREATE SCHEMA` — creates a dataset under a resolved
+    /// project (BigQuery models a schema as a dataset).
+    CreateDataset {
+        project_id: ProjectId,
+        name: String,
+        /// `IF NOT EXISTS` — succeed silently if the dataset already exists.
+        if_not_exists: bool,
+    },
 }
