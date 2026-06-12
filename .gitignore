@@ -29,8 +29,9 @@ target
 node_modules/
 package-lock.json
 
-# Project-local editor settings (e.g. Peacock color)
+# Project-local editor and agent settings
 .vscode/
+.claude/
 
 notes/
 
