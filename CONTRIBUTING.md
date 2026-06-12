@@ -1,5 +1,46 @@
 # Contributing
 
+## Contents
+
+- [How this project is run](#how-this-project-is-run)
+- [Getting started](#getting-started)
+- [Branches](#branches)
+- [Commits](#commits)
+- [Pull requests](#pull-requests)
+- [Code](#code)
+- [Writing style](#writing-style)
+
+## How this project is run
+
+strata-db is my personal craft project for the time being. I maintain it solo and
+make the final call on scope, design, and direction — a single vision keeps it coherent.
+
+I also believe in learning in the open — teaching, sharing what I work through, and
+learning from others. Engaging with people here is part of that, and something I
+genuinely value.
+
+That engagement is best-effort, though — my time is finite:
+
+- I work on this by capacity and interest. Reviews and replies come when they come — no promises on turnaround.
+- Issues and PRs are welcome. I may decline ones that don't fit where I'm taking it — that's about fit, not about you or your work.
+- Before a sizable PR, open an issue so we can align on the approach first.
+
+## Getting started
+
+Rust workspace, 2024 edition. Hooks run via husky (`npm install` once).
+
+```bash
+cargo build
+cargo test
+cargo run -p spec-test -- spec-test/spec                                  # SQL spec suite
+cargo run -p strata-server -- --listen 127.0.0.1:5433 --data-dir ./strata-data
+cargo run -p strata-cli -- --port 5433                                    # or any pgwire client
+```
+
+Testing is Rust unit tests plus the sqllogictest spec suite — cover changes with both where it fits.
+
+Architecture and crate layout live in the [README](README.md).
+
 ## Branches
 
 Branch names follow the pattern `type/short-description`:
