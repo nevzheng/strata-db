@@ -1,5 +1,79 @@
 # Contributing
 
+## Contents
+
+- [How this project is run](#how-this-project-is-run)
+- [Getting started](#getting-started)
+- [Workflow](#workflow)
+- [Branches](#branches)
+- [Commits](#commits)
+- [Pull requests](#pull-requests)
+- [Code](#code)
+- [Writing style](#writing-style)
+
+## How this project is run
+
+strata-db is my personal craft project for the time being. I maintain it solo and
+make the final call on scope, design, and direction — a single vision keeps it coherent.
+
+I also believe in learning in the open — teaching, sharing what I work through, and
+learning from others. Engaging with people here is part of that, and something I
+genuinely value.
+
+That engagement is best-effort, though — my time is finite:
+
+- I work on this by capacity and interest. Reviews and replies come when they come — no promises on turnaround.
+- Issues and PRs are welcome. I may decline ones that don't fit where I'm taking it — that's about fit, not about you or your work.
+- Before a sizable PR, open an issue so we can align on the approach first.
+
+## Getting started
+
+Rust workspace, 2024 edition. Hooks run via husky (`npm install` once).
+
+```bash
+cargo build
+cargo test
+cargo run -p spec-test -- spec-test/spec                                  # SQL spec suite
+cargo run -p strata-server -- --listen 127.0.0.1:5433 --data-dir ./strata-data
+cargo run -p strata-cli -- --port 5433                                    # or any pgwire client
+```
+
+Testing is Rust unit tests plus the sqllogictest spec suite — cover changes with both where it fits.
+
+Architecture and crate layout live in the [README](README.md).
+
+## Workflow
+
+Match the process to the size of the change.
+
+- **Small to medium** — bug fixes and focused improvements. Open a PR directly, following the branch and commit conventions below. Prefer to batch several small fixes into one coherent PR rather than a stream of tiny ones.
+- **Large or structural** — new subsystems, on-disk format changes, anything that moves the design. Open an issue first with a design doc (or ADR), written in the issue or linked from it. We align on the approach before any code.
+
+Design docs and ADRs live in issues, not in the repo.
+
+I hold a high bar for design and engineering here. A strong proposal reasons from
+the problem up, not from a solution backward.
+
+### Design docs & ADRs
+
+Both follow one structure, posted in the issue (or linked). I like the top-down
+style of [Smart Brevity](https://www.axios.com/smart-brevity) — lead with the point,
+then just enough to support it, not a word more.
+
+- **Context & problem** — what exists, and what's wrong. Clear, clean, concise.
+- **Options + recommendation** — the alternatives, a comparison **table** (each dimension tied to a requirement), and the one you recommend.
+- **Scope & future work** — what's in, what's deferred, what it opens up later.
+- **References** — papers, prior art, links.
+
+Keep deep implementation detail in your own notes, not the doc. Be ready to share
+or present it on request.
+
+Start one with the **Design doc** or **ADR** issue template. For a worked example,
+see [Beyond Inline Values](https://n8z.dev/posts/beyond-inline-values/).
+
+<!-- TODO(nlz): write up thoughts on design process & documentation in the wiki (TBD) -->
+
+
 ## Branches
 
 Branch names follow the pattern `type/short-description`:

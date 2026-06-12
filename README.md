@@ -1,40 +1,160 @@
-# 🌥️ strata-db — a layered database you can take apart
+# 🗿 strata-db
 
-StrataDB is an educational SQL database built in Rust, designed to make every layer of database engineering visible and swappable. It takes an embedded key-value store ([sled](https://github.com/spacejam/sled)) and builds every layer of a SQL database on top of it — key encoding, row encoding, schema catalog, indexing, query execution, and SQL parsing.
+[![CI](https://github.com/nevzheng/strata-db/actions/workflows/ci.yml/badge.svg)](https://github.com/nevzheng/strata-db/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 2024](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-This is not a production database. It's a playground for exploring database engineering trade-offs.
+**A database hewn from bedrock.**
+
+strata-db is a database system, execution engine, and storage system, written from
+scratch in Rust. A craft project: database engineering on my own terms, every layer
+built from the bedrock up, free to explore wherever it leads.
+
+> 🚧 **Work in progress.** Early and moving fast — interfaces, on-disk formats, and
+> features change without notice.
+
+## Influences & Directions
+
+The systems that shape strata, and the directions I want to explore through it:
+
+- **Log-Structured Merge storage:** RocksDB · Pebble · LevelDB — the foundation strata is built on.
+- **In-memory storage:** Redis · VoltDB · SAP HANA · MonetDB — the whole working set in RAM.
+- **OLTP:** PostgreSQL · CockroachDB · Spanner — the transactional direction I'm pursuing.
+- **OLAP:** BigQuery · DuckDB · ClickHouse — the analytical direction I want to grow into.
+- **HTAP:** HyPer · Umbra — doing both OLTP and OLAP well in the same system.
+- **Single-node *and* cloud-native:** excellent on a laptop, excellent in the cluster.
+- **AI / ML:** a grounded approach to AI/ML integrations and workloads — applying it to the project where sensible, and pursuing the use cases worth serving.
 
 ## Architecture
 
-```txt
-SQL Parser  (sqlparser-rs)
-     ↓
-Query Executor
-     ↓
-Table API
-     ↓
-Row Encoding / Key Encoding
-     ↓
-Schema Catalog
-     ↓
-Storage Trait  ← pluggable
-     ↓
-sled  ← default backend
+Read it from the bedrock up. Each layer is its own crate behind a clean boundary,
+which keeps experimenting cheap: swap an implementation, try a different one, or
+peel a layer off into its own service — without disturbing the rest.
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','lineColor':'#7d7264','primaryTextColor':'#2b2722','fontSize':'13px'}}}%%
+flowchart TB
+  client(["Postgres client"])
+
+  subgraph L1["protocol"]
+    server["pgwire server"]
+  end
+
+  subgraph L2["query engine"]
+    parser["SQL parser · AST"]
+    subgraph cas["Cascades optimizer · TBD"]
+      logical["logical planning"]
+      physical["physical planning"]
+      logical --> physical
+    end
+    volcano["Volcano streaming · now"]
+    compiled["compiled / pipelined · planned"]
+    catalog["catalog · system tables"]
+    parser --> logical
+    physical --> volcano
+    physical -.-> compiled
+    logical --> catalog
+  end
+
+  subgraph L3["storage layer"]
+    tapi["Table API"]
+    sapi["Storage API"]
+    lsm["LSM tree · index"]
+    heap["tuple heap · rows"]
+    sst["SSTable block cache"]
+    pc["page cache + VFS"]
+    tapi --> sapi
+    sapi --> lsm --> sst
+    sapi --> heap --> pc
+  end
+
+  os[("OS file storage")]
+
+  client --> server --> parser
+  volcano --> tapi
+  catalog --> tapi
+  sst --> os
+  pc --> os
+
+  classDef future fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4;
+  class compiled future
+  style cas fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4
+
+  style L1 fill:#e7ddc9,stroke:#b7a47e,color:#2b2722
+  style L2 fill:#d4c2a1,stroke:#a48f66,color:#2b2722
+  style L3 fill:#bda985,stroke:#8c7651,color:#2b2722
+  style os fill:#574c3c,stroke:#3a3225,color:#f4efe6
 ```
 
-## Roadmap
+| Component | Crate | What it does |
+|---|---|---|
+| **pgwire server** | `strata-server` | Speaks the Postgres wire protocol; one engine thread owns the database behind a channel. |
+| **Planner** | `strata-db` | Parses SQL (sqlparser-rs, Postgres dialect), binds and type-checks against the catalog, and lowers to a physical plan. No cost-based optimization yet — a Cascades-style optimizer is the likely direction. |
+| **Executor** | `strata-db` | Pull-based Volcano streaming — rows flow through operators on demand, nothing materialized. A compiled/pipelined path is planned. |
+| **Catalog & schema** | `strata-db` | Projects, datasets, and tables, stored as system tables, over a small type system (bool, ints, text, bytes, json). |
+| **Row / key encoding** | `strata-db` | Turns typed tuples into bytes, with order-preserving keys so range scans fall out of the sort order. |
+| **Table API** | `strata-db` | Row-level insert / get / scan / delete over the storage engine. |
+| **Storage API** | `strata-store` | Composes the LSM index (key → location) over the tuple heap (the bytes) into one store. |
+| **LSM tree** | `lsm` | Journaled memtable that seals into immutable, bloom-filtered SSTables, tracked by a manifest for recovery; own SSTable block cache. |
+| **Tuple heap + page cache** | `pager` | Fixed-size pages over the VFS, with pinning, dirty writeback, and LRU-K eviction; tuples addressed by a compact location. |
+| **Journal (WAL)** | `journal` | A CRC-framed, fsync'd append-only log with replay. Backs both page mutations and the LSM memtable. |
+| **VFS** | `pager` | The bedrock: an abstract block store with file (`FileVfs`) and in-memory (`MemVfs`) backends. |
 
-- [ ] Storage trait + sled backend
-- [ ] Key encoder
-- [ ] Row encoder
-- [ ] Schema catalog
-- [ ] Table API (create, insert, get, scan, delete)
-- [ ] Secondary indexes
-- [ ] SQL parsing + REPL
-- [ ] Query executor (scan, filter, project, joins, aggregations)
-- [ ] DSM (column-store) table layout
-- [ ] Parquet export
+## Try it
 
-## Writing
+Needs a recent Rust toolchain (2024 edition).
 
-I'm blogging about the design decisions and trade-offs along the way at [n8z.dev](https://n8z.dev).
+```bash
+# build, then start the server (it speaks the Postgres wire protocol)
+cargo build
+cargo run -p strata-server -- --listen 127.0.0.1:5433 --data-dir ./strata-data
+```
+
+Connect with the bundled REPL — or any Postgres client, since it's pgwire:
+
+```bash
+cargo run -p strata-cli -- --host localhost --port 5433
+psql -h localhost -p 5433
+```
+
+```sql
+CREATE SCHEMA strata.demo;
+CREATE TABLE strata.demo.events (id INT, name TEXT);
+INSERT INTO strata.demo.events VALUES (1, 'alpha'), (2, 'bravo'), (3, 'charlie');
+
+SELECT * FROM strata.demo.events WHERE id > 1;
+-- 2  bravo
+-- 3  charlie
+```
+
+Tables are named `project.dataset.table`.
+
+## Docs & wiki _(TBD)_
+
+- **Design docs** — the *why* behind each layer
+- **Design process** — how I make decisions
+- **Project documentation** — guides and reference
+
+## Contributing
+
+My craft project — solo-maintained, at my own pace and capacity.
+
+- **Issues & PRs** — welcome. Open an issue before a big PR so we can align.
+- **Direction** — I make the final call on scope and design.
+- **Pace** — I can be slow; no promises on turnaround.
+
+Full guide: [CONTRIBUTING](CONTRIBUTING.md).
+
+## Follow along
+
+I'm building strata-db in the open. Design notes and trade-offs go up on the blog as I go.
+
+- **Blog** — [n8z.dev](https://n8z.dev)
+- **Connect** — [LinkedIn](https://linkedin.com/in/nevinzheng) · [nevzheng@gmail.com](mailto:nevzheng@gmail.com)
+- **Coffee** — [ko-fi.com/nevzheng](https://ko-fi.com/nevzheng) ☕
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
