@@ -32,5 +32,12 @@ package-lock.json
 # Project-local editor settings (e.g. Peacock color)
 .vscode/
 
-# personal branding working notes — not for publishing
 notes/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
