@@ -138,8 +138,13 @@ Tables are named `project.dataset.table`.
 
 ## Contributing
 
-Issues and PRs are welcome. See [CONTRIBUTING](CONTRIBUTING.md) for the workflow,
-dev setup, and test suites.
+My craft project — solo-maintained, at my own pace and capacity.
+
+- **Issues & PRs** — welcome. Open an issue before a big PR so we can align.
+- **Direction** — I make the final call on scope and design.
+- **Pace** — I can be slow; no promises on turnaround.
+
+Full guide: [CONTRIBUTING](CONTRIBUTING.md).
 
 ## Follow along
 
