@@ -68,10 +68,9 @@ then just enough to support it, not a word more.
 Keep deep implementation detail in your own notes, not the doc. Be ready to share
 or present it on request.
 
-Start one with the **Design doc** or **ADR** issue template. For a worked example,
-see [Beyond Inline Values](https://n8z.dev/posts/beyond-inline-values/).
-
-<!-- TODO(nlz): write up thoughts on design process & documentation in the wiki (TBD) -->
+Start one with the **Design doc** or **ADR** issue template. For the full process,
+templates, and lifecycle, see the [Engineering Design Process](https://ossified-particle-27e.notion.site/Engineering-Design-Process-37d624fc572e80f59514c9314619fe4a)
+on the wiki — and the published ADR [Beyond Inline Values](https://n8z.dev/posts/beyond-inline-values/) as a worked example.
 
 
 ## Branches
