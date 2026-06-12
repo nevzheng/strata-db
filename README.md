@@ -128,5 +128,28 @@ SELECT * FROM strata.demo.events WHERE id > 1;
 -- 3  charlie
 ```
 
-Tables are named `project.dataset.table`. Want to build on it? See
-[CONTRIBUTING](CONTRIBUTING.md) for the dev loop and test suites.
+Tables are named `project.dataset.table`.
+
+## Docs & wiki _(TBD)_
+
+- **Design docs** — the *why* behind each layer
+- **Design process** — how I make decisions
+- **Project documentation** — guides and reference
+
+## Contributing
+
+Issues and PRs are welcome. See [CONTRIBUTING](CONTRIBUTING.md) for the workflow,
+dev setup, and test suites.
+
+## Follow along
+
+I'm building strata-db in the open. Design notes and trade-offs go up on the blog as I go.
+
+- **Blog** — [n8z.dev](https://n8z.dev)
+- **Connect** — [LinkedIn](https://linkedin.com/in/nevinzheng) · [nevzheng@gmail.com](mailto:nevzheng@gmail.com)
+- **Coffee** — [ko-fi.com/nevzheng](https://ko-fi.com/nevzheng) ☕
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
