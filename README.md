@@ -4,6 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 2024](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Wiki: Slate](https://img.shields.io/badge/wiki-Slate-8c7651)](https://ossified-particle-27e.notion.site/Slate-37d624fc572e80b3b117ff61b594dc82)
 
 **A database hewn from bedrock.**
 
@@ -130,11 +131,13 @@ SELECT * FROM strata.demo.events WHERE id > 1;
 
 Tables are named `project.dataset.table`.
 
-## Docs & wiki _(TBD)_
+## Docs & wiki
 
-- **Design docs** — the *why* behind each layer
-- **Design process** — how I make decisions
-- **Project documentation** — guides and reference
+All documentation lives on Notion — **[Slate](https://ossified-particle-27e.notion.site/Slate-37d624fc572e80b3b117ff61b594dc82)**, the strata-db wiki: design docs, process docs, technical documentation, and meeting notes. _(WIP.)_
+
+- **[Engineering Design Process](https://ossified-particle-27e.notion.site/Engineering-Design-Process-37d624fc572e80f59514c9314619fe4a)** — how design is run, with the ADR & design-doc templates
+- **[Design Documents](https://ossified-particle-27e.notion.site/37d624fc572e809f9619fb97e4adb701?v=37d624fc572e8093a81e000c3af4cf44)** — ADRs, design docs, proposals
+- **[Technical Documentation](https://ossified-particle-27e.notion.site/37d624fc572e80969646f2f66d82a167?v=37d624fc572e80fb8b15000ca035f017)** — how the system works, layer by layer
 
 ## Contributing
 
