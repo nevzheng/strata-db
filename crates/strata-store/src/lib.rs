@@ -46,7 +46,7 @@ pub enum StorageError {
 
     /// A failure in the page heap (the tuple store).
     #[error(transparent)]
-    Pager(filesystem::PageError),
+    Vfs(filesystem::PageError),
 
     /// The index and heap disagree: a key maps to a tuple location that is
     /// malformed or no longer present. Indicates corruption or a bug.
@@ -87,7 +87,7 @@ impl From<filesystem::PageError> for StorageError {
         if e.is_exhausted() {
             StorageError::Exhausted(e.to_string())
         } else {
-            StorageError::Pager(e)
+            StorageError::Vfs(e)
         }
     }
 }
