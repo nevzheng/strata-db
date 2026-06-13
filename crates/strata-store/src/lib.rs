@@ -22,7 +22,7 @@ pub use iterator::{Scan, ScanRow};
 pub use lsm::{KVPair, LevelConfig, LsmConfig, LsmError, MergeIterator, ReadStore};
 
 // Re-export the heap's view types so dependents can name engine read results.
-pub use filesystem::{FileVfs, TupleRef, TupleView};
+pub use filesystem::{FileBlockStore, TupleRef, TupleView};
 
 /// The memtable types, kept under a `memstore` path for dependents.
 pub mod memstore {
@@ -46,7 +46,7 @@ pub enum StorageError {
 
     /// A failure in the page heap (the tuple store).
     #[error(transparent)]
-    Vfs(filesystem::PageError),
+    Block(filesystem::Error),
 
     /// The index and heap disagree: a key maps to a tuple location that is
     /// malformed or no longer present. Indicates corruption or a bug.
@@ -57,7 +57,7 @@ pub enum StorageError {
     /// store) — every layer's exhaustion funnels here. A write/allocate
     /// failure only: reads never allocate, so they keep serving. (The
     /// journal is the exception — a journal-write failure is fail-stop;
-    /// see [`filesystem::PageJournal`].)
+    /// see [`filesystem::BlockJournal`].)
     #[error("storage exhausted: {0}")]
     Exhausted(String),
 }
@@ -82,12 +82,12 @@ impl From<LsmError> for StorageError {
     }
 }
 
-impl From<filesystem::PageError> for StorageError {
-    fn from(e: filesystem::PageError) -> Self {
+impl From<filesystem::Error> for StorageError {
+    fn from(e: filesystem::Error) -> Self {
         if e.is_exhausted() {
             StorageError::Exhausted(e.to_string())
         } else {
-            StorageError::Vfs(e)
+            StorageError::Block(e)
         }
     }
 }
@@ -121,7 +121,7 @@ mod tests {
         // LSM memtable-full and filesystem pool-exhaustion both land in Exhausted.
         let from_lsm: StorageError = LsmError::from(WriteError::StoreFull).into();
         assert!(from_lsm.is_exhausted());
-        let from_pager: StorageError = filesystem::PageError::PoolExhausted(8).into();
+        let from_pager: StorageError = filesystem::Error::PoolExhausted(8).into();
         assert!(from_pager.is_exhausted());
 
         // A non-exhaustion error keeps its own variant.

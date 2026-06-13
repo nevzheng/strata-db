@@ -15,8 +15,8 @@
 //! finalizes it just before writeback and verifies it on load; nothing else
 //! needs to touch it.
 
-use crate::error::PageError;
-use crate::{PageId, Result};
+use crate::error::Error;
+use crate::{BlockId, Result};
 
 const MAGIC: [u8; 4] = *b"STDB";
 const HEADER_VERSION: u8 = 1;
@@ -65,10 +65,10 @@ impl PageHeader {
     /// on load — see [`verify_checksum`]).
     pub fn parse(page: &[u8]) -> Result<Self> {
         if page.len() < HEADER_LEN || page[0..4] != MAGIC {
-            return Err(PageError::BadMagic);
+            return Err(Error::BadMagic);
         }
         if page[4] != HEADER_VERSION {
-            return Err(PageError::BadHeaderVersion(page[4]));
+            return Err(Error::BadHeaderVersion(page[4]));
         }
         Ok(Self {
             page_type: u16::from_be_bytes(page[5..7].try_into().unwrap()),
@@ -79,7 +79,7 @@ impl PageHeader {
 }
 
 /// Compute and store the page's CRC32c checksum. Call immediately before
-/// writing the page to the VFS.
+/// writing the page to the block store.
 pub fn finalize_checksum(page: &mut [u8]) {
     let sum = checksum(page);
     page[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&sum.to_be_bytes());
@@ -87,10 +87,10 @@ pub fn finalize_checksum(page: &mut [u8]) {
 
 /// Verify the stored checksum against the page's current bytes. `id` is only
 /// used to label the error.
-pub fn verify_checksum(page: &[u8], id: PageId) -> Result<()> {
+pub fn verify_checksum(page: &[u8], id: BlockId) -> Result<()> {
     let stored = u32::from_be_bytes(page[OFF_CHECKSUM..OFF_CHECKSUM + 4].try_into().unwrap());
     if checksum(page) != stored {
-        return Err(PageError::Checksum(id));
+        return Err(Error::Checksum(id));
     }
     Ok(())
 }
@@ -124,15 +124,15 @@ mod tests {
         let mut page = vec![0u8; PAGE_SIZE];
         PageHeader::new(1, 1).write(&mut page);
         finalize_checksum(&mut page);
-        verify_checksum(&page, PageId(7)).unwrap();
+        verify_checksum(&page, BlockId(7)).unwrap();
 
         page[100] ^= 0xFF; // flip a payload bit
-        assert!(verify_checksum(&page, PageId(7)).is_err());
+        assert!(verify_checksum(&page, BlockId(7)).is_err());
     }
 
     #[test]
     fn rejects_foreign_bytes() {
         let page = vec![0u8; PAGE_SIZE];
-        assert!(matches!(PageHeader::parse(&page), Err(PageError::BadMagic)));
+        assert!(matches!(PageHeader::parse(&page), Err(Error::BadMagic)));
     }
 }

@@ -59,10 +59,14 @@ impl SstPageCache {
         // One `match` per cache because the two policies are distinct types
         // (`Lru<SsTableId>` vs `Lru<PageId>`); a shared closure can't return both.
         let headers = match config.policy {
-            CachePolicy::Lru => filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new()),
+            CachePolicy::Lru => {
+                filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new())
+            }
         };
         let blocks = match config.policy {
-            CachePolicy::Lru => filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new()),
+            CachePolicy::Lru => {
+                filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new())
+            }
         };
         Self {
             headers,

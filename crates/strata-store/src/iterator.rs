@@ -8,7 +8,7 @@
 //! [`ScanRow`] borrows that held page, this is a lending iterator: finish with a
 //! row before pulling the next.
 
-use filesystem::{FileVfs, Heap, PageTuples, TupleView};
+use filesystem::{FileBlockStore, Heap, PageTuples, TupleView};
 use lsm::KVPair;
 
 use crate::StorageError;
@@ -20,21 +20,21 @@ pub struct ScanRow<'p> {
     /// The row's key (the index key).
     pub key: Vec<u8>,
     /// A zero-copy view of the tuple's bytes. Copy out (decode) to materialize.
-    pub tuple: TupleView<'p, FileVfs>,
+    pub tuple: TupleView<'p, FileBlockStore>,
 }
 
 /// A lending scan over the engine. Pulls index entries (key → location) and
 /// resolves each through the heap, holding one pinned page at a time.
 pub struct Scan<'e> {
     index: Box<dyn Iterator<Item = Result<KVPair, StorageError>> + 'e>,
-    heap: &'e Heap<FileVfs>,
-    current: Option<PageTuples<FileVfs>>,
+    heap: &'e Heap<FileBlockStore>,
+    current: Option<PageTuples<FileBlockStore>>,
 }
 
 impl<'e> Scan<'e> {
     pub(crate) fn new(
         index: Box<dyn Iterator<Item = Result<KVPair, StorageError>> + 'e>,
-        heap: &'e Heap<FileVfs>,
+        heap: &'e Heap<FileBlockStore>,
     ) -> Self {
         Self {
             index,

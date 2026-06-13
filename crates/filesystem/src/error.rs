@@ -1,19 +1,19 @@
 //! Errors for the page system.
 
-use crate::PageId;
+use crate::BlockId;
 use thiserror::Error;
 
 /// Anything that can go wrong reading, writing, or interpreting a page.
 #[derive(Debug, Error)]
-pub enum PageError {
-    /// A failure in the backing store (the `Vfs`).
-    #[error("vfs i/o error: {0}")]
+pub enum Error {
+    /// A failure in the backing store (the `BlockStore`).
+    #[error("block i/o error: {0}")]
     Io(#[from] std::io::Error),
 
     /// A page read back from disk failed CRC32c verification — it is corrupt or
     /// was torn by a crash mid-write.
     #[error("page {0:?} failed checksum verification (corrupt or torn)")]
-    Checksum(PageId),
+    Checksum(BlockId),
 
     /// The bytes do not begin with the `STDB` magic — not a strata-db page.
     #[error("not a strata-db page: bad magic")]
@@ -35,9 +35,9 @@ pub enum PageError {
     /// A latch conflict: the page is already held in an incompatible mode
     /// (a writer excludes all others; a reader excludes writers).
     #[error("page {0:?} is locked by another handle")]
-    Busy(PageId),
+    Busy(BlockId),
 
-    /// A block buffer handed to the `Vfs` was not exactly [`BLOCK_SIZE`] bytes.
+    /// A block buffer handed to the `BlockStore` was not exactly [`BLOCK_SIZE`] bytes.
     ///
     /// [`BLOCK_SIZE`]: crate::BLOCK_SIZE
     #[error("block buffer must be {expected} bytes, got {got}")]
@@ -70,16 +70,16 @@ pub enum PageError {
     Exhausted(String),
 }
 
-impl PageError {
+impl Error {
     /// Whether this is a bounded-resource exhaustion — the buffer pool
     /// (RAM) or the backing store (disk) ran out. These arise only on the
     /// allocate/write path; the layer above maps them to a single
     /// resource-exhausted error so a write fails cleanly while reads,
     /// which never allocate, keep serving.
     pub fn is_exhausted(&self) -> bool {
-        matches!(self, PageError::PoolExhausted(_) | PageError::Exhausted(_))
+        matches!(self, Error::PoolExhausted(_) | Error::Exhausted(_))
     }
 }
 
 /// Result alias for the crate.
-pub type Result<T> = std::result::Result<T, PageError>;
+pub type Result<T> = std::result::Result<T, Error>;

@@ -12,17 +12,17 @@
 //!              tuple data, packed upward from the bottom
 //! ```
 //!
-//! A tuple's stable logical identity is `(PageId, slot_id)`: `slot_id` is the
+//! A tuple's stable logical identity is `(BlockId, slot_id)`: `slot_id` is the
 //! index into the slot array and never changes for the tuple's lifetime, which
 //! is what makes it usable by indexes and any future MVCC chain.
 //!
 //! The page stores **opaque tuple bytes** — field layout is the schema's
 //! concern, encoded by the engine and passed in. (The doc's dedicated VarLen
 //! section is an in-place-varchar optimization folded into the opaque blob for
-//! v1; `TEXT` is just a [`PageId`](crate::PageId) pointer inside the blob,
+//! v1; `TEXT` is just a [`BlockId`](crate::BlockId) pointer inside the blob,
 //! resolved against a [`TextPage`](crate::page::text).)
 
-use crate::error::PageError;
+use crate::error::Error;
 use crate::page::types::TUPLE_PAGE;
 use crate::page::{HEADER_LEN, PageHeader};
 use crate::{PAGE_SIZE, Result};
@@ -56,7 +56,7 @@ impl<'a> TuplePage<'a> {
     pub fn open(buf: &'a [u8]) -> Result<Self> {
         let header = PageHeader::parse(buf)?;
         if header.page_type != TUPLE_PAGE {
-            return Err(PageError::BadPageType {
+            return Err(Error::BadPageType {
                 expected: TUPLE_PAGE,
                 got: header.page_type,
             });
@@ -98,7 +98,7 @@ impl<'a> TuplePageMut<'a> {
     pub fn open(buf: &'a mut [u8]) -> Result<Self> {
         let header = PageHeader::parse(buf)?;
         if header.page_type != TUPLE_PAGE {
-            return Err(PageError::BadPageType {
+            return Err(Error::BadPageType {
                 expected: TUPLE_PAGE,
                 got: header.page_type,
             });
@@ -245,7 +245,7 @@ mod tests {
         PageHeader::new(crate::page::types::TEXT_PAGE, 1).write(&mut buf);
         assert!(matches!(
             TuplePage::open(&buf),
-            Err(PageError::BadPageType { .. })
+            Err(Error::BadPageType { .. })
         ));
     }
 }

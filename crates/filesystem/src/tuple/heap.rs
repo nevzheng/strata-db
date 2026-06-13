@@ -17,17 +17,17 @@
 use std::cell::{Cell, Ref, RefMut};
 
 use super::page::{TuplePage, TuplePageMut};
-use crate::error::PageError;
-use crate::{PageCache, PageId, ReadPage, Result, TupleLoc, Vfs, WritePage};
+use crate::error::Error;
+use crate::{BlockId, BlockStore, PageCache, ReadPage, Result, TupleLoc, WritePage};
 
 /// A heap of tuples over a page cache.
-pub struct Heap<V: Vfs> {
+pub struct Heap<V: BlockStore> {
     cache: PageCache<V>,
     /// The page currently being filled. `None` until the first insert.
-    current: Cell<Option<PageId>>,
+    current: Cell<Option<BlockId>>,
 }
 
-impl<V: Vfs> Heap<V> {
+impl<V: BlockStore> Heap<V> {
     /// Build a heap over `cache`.
     pub fn new(cache: PageCache<V>) -> Self {
         Self {
@@ -43,7 +43,7 @@ impl<V: Vfs> Heap<V> {
     }
 
     /// Store `tuple`'s bytes and return where they landed. Errors only if the
-    /// tuple is too large for any page (see [`PageError::TupleTooLarge`]).
+    /// tuple is too large for any page (see [`Error::TupleTooLarge`]).
     pub fn insert(&self, tuple: &[u8]) -> Result<TupleLoc> {
         // Fast path: append to the page we're already filling.
         if let Some(page_id) = self.current.get()
@@ -81,7 +81,7 @@ impl<V: Vfs> Heap<V> {
     /// The returned [`PageTuples`] holds **one** pin; borrow a [`TupleView`] per
     /// tuple from it. A scan that stays on a page thus costs one handle, not one
     /// per row.
-    pub fn page(&self, page_id: PageId) -> Result<PageTuples<V>> {
+    pub fn page(&self, page_id: BlockId) -> Result<PageTuples<V>> {
         Ok(PageTuples {
             page: self.cache.read(page_id)?,
         })
@@ -102,7 +102,7 @@ impl<V: Vfs> Heap<V> {
     }
 
     /// Try to append to an existing page; `None` if it's full.
-    fn try_append(&self, page_id: PageId, tuple: &[u8]) -> Result<Option<u16>> {
+    fn try_append(&self, page_id: BlockId, tuple: &[u8]) -> Result<Option<u16>> {
         let page = self.cache.write(page_id)?;
         let mut buf = page.bytes_mut();
         let mut tuple_page = TuplePageMut::open(&mut buf)?;
@@ -111,12 +111,12 @@ impl<V: Vfs> Heap<V> {
 
     /// Allocate a fresh page and append to it. Errors if `tuple` can't fit an
     /// empty page.
-    fn append_to_new_page(&self, tuple: &[u8]) -> Result<(PageId, u16)> {
+    fn append_to_new_page(&self, tuple: &[u8]) -> Result<(BlockId, u16)> {
         let (page_id, page) = self.cache.allocate()?;
         let mut buf = page.bytes_mut();
         let mut tuple_page = TuplePageMut::init(&mut buf);
         let max = tuple_page.free_space();
-        let slot = tuple_page.insert(tuple).ok_or(PageError::TupleTooLarge {
+        let slot = tuple_page.insert(tuple).ok_or(Error::TupleTooLarge {
             len: tuple.len(),
             max,
         })?;
@@ -126,12 +126,12 @@ impl<V: Vfs> Heap<V> {
 
 /// A read view of one tuple, owning the pin on its page. The bytes it exposes
 /// borrow straight into the cached frame.
-pub struct TupleRef<V: Vfs> {
+pub struct TupleRef<V: BlockStore> {
     page: ReadPage<V>,
     slot: u16,
 }
 
-impl<V: Vfs> TupleRef<V> {
+impl<V: BlockStore> TupleRef<V> {
     /// This tuple's location.
     pub fn loc(&self) -> TupleLoc {
         TupleLoc::new(self.page.page_id(), self.slot)
@@ -149,12 +149,12 @@ impl<V: Vfs> TupleRef<V> {
 
 /// A write view of one tuple, owning the exclusive pin on its page. Allows
 /// in-place, same-length mutation of the tuple's bytes.
-pub struct TupleMut<V: Vfs> {
+pub struct TupleMut<V: BlockStore> {
     page: WritePage<V>,
     slot: u16,
 }
 
-impl<V: Vfs> TupleMut<V> {
+impl<V: BlockStore> TupleMut<V> {
     /// This tuple's location.
     pub fn loc(&self) -> TupleLoc {
         TupleLoc::new(self.page.page_id(), self.slot)
@@ -183,13 +183,13 @@ impl<V: Vfs> TupleMut<V> {
 
 /// A pinned tuple page, held to read many of its tuples. Owns the single
 /// [`ReadPage`] (one pin); every [`TupleView`] borrowed from it shares that pin.
-pub struct PageTuples<V: Vfs> {
+pub struct PageTuples<V: BlockStore> {
     page: ReadPage<V>,
 }
 
-impl<V: Vfs> PageTuples<V> {
+impl<V: BlockStore> PageTuples<V> {
     /// The page's id.
-    pub fn page_id(&self) -> PageId {
+    pub fn page_id(&self) -> BlockId {
         self.page.page_id()
     }
 
@@ -204,12 +204,12 @@ impl<V: Vfs> PageTuples<V> {
 
 /// A borrowed view of one tuple, sharing its page's single pin via the
 /// [`PageTuples`] it came from. Holds no pin of its own.
-pub struct TupleView<'p, V: Vfs> {
+pub struct TupleView<'p, V: BlockStore> {
     page: &'p ReadPage<V>,
     slot: u16,
 }
 
-impl<V: Vfs> TupleView<'_, V> {
+impl<V: BlockStore> TupleView<'_, V> {
     /// The slot this view addresses.
     pub fn slot(&self) -> u16 {
         self.slot
@@ -228,10 +228,10 @@ impl<V: Vfs> TupleView<'_, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemVfs;
+    use crate::MemBlockStore;
 
-    fn heap() -> Heap<MemVfs> {
-        Heap::new(PageCache::new(MemVfs::new(), 8))
+    fn heap() -> Heap<MemBlockStore> {
+        Heap::new(PageCache::new(MemBlockStore::new(), 8))
     }
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn survives_eviction_and_flush() {
         // Tiny pool so inserts spill across pages and get evicted/written back.
-        let heap = Heap::new(PageCache::new(MemVfs::new(), 2));
+        let heap = Heap::new(PageCache::new(MemBlockStore::new(), 2));
         let mut locs = Vec::new();
         for i in 0..500u32 {
             locs.push(heap.insert(&i.to_be_bytes()).unwrap());
@@ -313,7 +313,7 @@ mod tests {
         let huge = vec![0u8; crate::PAGE_SIZE];
         assert!(matches!(
             heap.insert(&huge),
-            Err(PageError::TupleTooLarge { .. })
+            Err(Error::TupleTooLarge { .. })
         ));
     }
 }

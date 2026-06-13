@@ -1,12 +1,12 @@
-//! `filesystem` — strata-db's storage foundation: the virtual file system and
+//! `filesystem` — strata-db's storage foundation: the block storage and
 //! the primitives that sit on it. Everything between the backing file and the
 //! rest of the engine lives here, exposed as a small set of nouns:
 //!
-//! - **`vfs`** ([`Vfs`], [`FileVfs`], [`MemVfs`], [`journal`]) — raw, fixed-size
+//! - **`block`** ([`BlockStore`], [`FileBlockStore`], [`MemBlockStore`], [`journal`]) — raw, fixed-size
 //!   *block* I/O over a backing store, plus the redo [`journal`] that makes its
 //!   writes durable. Nothing above it touches `std::fs`.
 //! - **Codec** ([`Encode`], [`Decode`]) — the on-disk serialization vocabulary,
-//!   shared by page types and the LSM. A sibling of the Vfs, not part of it.
+//!   shared by page types and the LSM. A sibling of the BlockStore, not part of it.
 //! - **`cache`** — the generic read-through [`Cache`] (memoizes immutable values,
 //!   hands out owned handles) and the [`PageCache`] buffer pool (the mutable,
 //!   pinned, journaled read/write path). Eviction [`policies`] live alongside.
@@ -23,24 +23,24 @@
 //!
 //! The v1 caches are single-threaded (`Rc`/`RefCell`); concurrency is deferred.
 
+mod block;
 mod cache;
 mod codec;
 mod error;
 pub mod page;
 mod tuple;
-mod vfs;
 
 // Virtual file system — raw block I/O plus the redo journal that makes its
 // writes durable.
-pub use vfs::journal::{PageJournal, PageOp};
-pub use vfs::{BLOCK_SIZE, FileVfs, MemVfs, Vfs, journal};
+pub use block::journal::{BlockJournal, JournalOp};
+pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
 
 // Codec — the on-disk serialization vocabulary (used by page types and the LSM).
 pub use codec::{
     Decode, DecodeError, Encode, get_bytes, get_u8, get_u16, get_u32, get_u64, put_bytes, take,
 };
 
-// Caches & buffers — the read/write paths over a Vfs. Eviction policies live in
+// Caches & buffers — the read/write paths over a BlockStore. Eviction policies live in
 // their own namespace: `filesystem::policies::{EvictionPolicy, Lru, LruK, Clock, Lfu}`.
 pub use cache::policies;
 pub use cache::{Budget, Cache, PageCache, ReadPage, Weight, WritePage};
@@ -54,10 +54,10 @@ pub use tuple::{
 };
 
 // Errors.
-pub use error::{PageError, Result};
+pub use error::{Error, Result};
 
 /// Logical identity of a page — stable, unique, and never reused (see the
 /// Storage Foundations design). Opaque: it encodes nothing about the page's
-/// type, contents, or physical location. The `Vfs` resolves it to bytes.
+/// type, contents, or physical location. The `BlockStore` resolves it to bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PageId(pub u64);
+pub struct BlockId(pub u64);

@@ -1,7 +1,7 @@
-//! The Page Cache — a fixed pool of in-memory frames over a [`Vfs`].
+//! The Page Cache — a fixed pool of in-memory frames over a [`BlockStore`].
 //!
 //! Callers [`read`](PageCache::read), [`write`](PageCache::write), or
-//! [`allocate`](PageCache::allocate) a page by [`PageId`] and get back a RAII
+//! [`allocate`](PageCache::allocate) a page by [`BlockId`] and get back a RAII
 //! handle that pins the frame; the pin is released on drop. A miss evicts an
 //! unpinned frame (writing it back first if dirty) and reads the page in.
 //! Dirty pages reach disk on eviction or [`flush`](PageCache::flush).
@@ -11,7 +11,7 @@
 //!
 //! ## v1 scope
 //! Single-threaded ([`Rc`]/[`RefCell`]); the per-frame read/write latch is
-//! modeled as a count, and a conflicting acquire fails with [`PageError::Busy`]
+//! modeled as a count, and a conflicting acquire fails with [`Error::Busy`]
 //! rather than blocking. Concurrency, prefetch, and a separate scan-buffer pool
 //! are deferred (see the Page Cache design doc); [`prefetch`](PageCache::prefetch)
 //! is a no-op placeholder.
@@ -26,11 +26,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::block::journal::{BlockJournal, JournalOp};
 use crate::cache::policies::{EvictionPolicy, FrameId, LruK};
-use crate::error::PageError;
+use crate::error::Error;
 use crate::page::{finalize_checksum, verify_checksum};
-use crate::vfs::journal::{PageJournal, PageOp};
-use crate::{HEADER_LEN, PAGE_SIZE, PageHeader, PageId, Result, Vfs};
+use crate::{BlockId, BlockStore, HEADER_LEN, PAGE_SIZE, PageHeader, Result};
 
 /// A frame's page-sized buffer. Shared (`Rc`) so a handle can keep reading the
 /// bytes independently of the pool's own borrow; mutable (`RefCell`) so reads
@@ -44,7 +44,7 @@ type FrameBuf = Rc<RefCell<Box<[u8]>>>;
 /// unpinned (`readers == 0 && !writer`), at which point no handle holds a clone,
 /// so reusing the same allocation in place is safe.
 struct Frame {
-    page_id: Option<PageId>,
+    page_id: Option<BlockId>,
     buf: FrameBuf,
     readers: u32,
     writer: bool,
@@ -64,23 +64,23 @@ impl Frame {
 }
 
 /// The cache's mutable interior, shared with every outstanding handle.
-struct Inner<V: Vfs> {
-    vfs: V,
+struct Inner<V: BlockStore> {
+    block: V,
     frames: Vec<Frame>,
-    table: HashMap<PageId, FrameId>,
+    table: HashMap<BlockId, FrameId>,
     free: Vec<FrameId>,
     policy: Box<dyn EvictionPolicy<FrameId>>,
     /// The redo journal. `None` disables journaling (ephemeral/in-memory
-    /// stores); `flush` then just writes through to the VFS, with no crash
-    /// atomicity beyond what the VFS itself provides.
-    journal: Option<PageJournal>,
+    /// stores); `flush` then just writes through to the block store, with no crash
+    /// atomicity beyond what the block store itself provides.
+    journal: Option<BlockJournal>,
 }
 
-impl<V: Vfs> Inner<V> {
+impl<V: BlockStore> Inner<V> {
     /// A free frame, evicting an unpinned one if the pool is full. The returned
     /// frame is clean and absent from the page table.
     ///
-    /// No-steal: a dirty page is never written to the VFS here — only in
+    /// No-steal: a dirty page is never written to the block store here — only in
     /// [`flush`](Inner::flush), behind the WAL. So we evict a clean frame, and if
     /// none is available we flush first to clean the dirty ones.
     fn victim_frame(&mut self) -> Result<FrameId> {
@@ -97,12 +97,12 @@ impl<V: Vfs> Inner<V> {
             .iter()
             .any(|fr| fr.readers == 0 && !fr.writer && fr.dirty);
         if !has_dirty_unpinned {
-            return Err(PageError::PoolExhausted(self.frames.len()));
+            return Err(Error::PoolExhausted(self.frames.len()));
         }
         self.flush()?;
         let f = self
             .pick_evictable(false)
-            .ok_or(PageError::PoolExhausted(self.frames.len()))?;
+            .ok_or(Error::PoolExhausted(self.frames.len()))?;
         Ok(self.reclaim(f))
     }
 
@@ -130,17 +130,17 @@ impl<V: Vfs> Inner<V> {
         f
     }
 
-    /// Read page `id` from the VFS into frame `f` and verify its checksum.
-    fn load(&mut self, f: FrameId, id: PageId) -> Result<()> {
+    /// Read page `id` from the block store into frame `f` and verify its checksum.
+    fn load(&mut self, f: FrameId, id: BlockId) -> Result<()> {
         let buf = self.frames[f].buf.clone();
-        self.vfs.read(id, &mut buf.borrow_mut())?;
+        self.block.read(id, &mut buf.borrow_mut())?;
         verify_checksum(&buf.borrow(), id)
     }
 
-    fn acquire_read(&mut self, id: PageId) -> Result<(FrameId, FrameBuf)> {
+    fn acquire_read(&mut self, id: BlockId) -> Result<(FrameId, FrameBuf)> {
         if let Some(&f) = self.table.get(&id) {
             if self.frames[f].writer {
-                return Err(PageError::Busy(id));
+                return Err(Error::Busy(id));
             }
             self.frames[f].readers += 1;
             self.policy.record_access(f);
@@ -159,10 +159,10 @@ impl<V: Vfs> Inner<V> {
         Ok((f, self.frames[f].buf.clone()))
     }
 
-    fn acquire_write(&mut self, id: PageId) -> Result<(FrameId, FrameBuf)> {
+    fn acquire_write(&mut self, id: BlockId) -> Result<(FrameId, FrameBuf)> {
         if let Some(&f) = self.table.get(&id) {
             if self.frames[f].writer || self.frames[f].readers > 0 {
-                return Err(PageError::Busy(id));
+                return Err(Error::Busy(id));
             }
             self.frames[f].writer = true;
             self.policy.record_access(f);
@@ -181,8 +181,8 @@ impl<V: Vfs> Inner<V> {
         Ok((f, self.frames[f].buf.clone()))
     }
 
-    fn allocate(&mut self) -> Result<(PageId, FrameId, FrameBuf)> {
-        let id = self.vfs.allocate()?;
+    fn allocate(&mut self) -> Result<(BlockId, FrameId, FrameBuf)> {
+        let id = self.block.allocate()?;
         let f = self.victim_frame()?;
         self.frames[f].buf.borrow_mut().fill(0);
         let frame = &mut self.frames[f];
@@ -206,7 +206,7 @@ impl<V: Vfs> Inner<V> {
 
     /// Commit all dirty pages durably. With a journal this is a WAL commit:
     /// log every after-image plus a `Commit` marker (the durability point),
-    /// then write the pages to the VFS, sync, and discard the now-redundant log.
+    /// then write the pages to the block store, sync, and discard the now-redundant log.
     /// A crash before the `Commit` marker rolls the whole flush back on recovery.
     fn flush(&mut self) -> Result<()> {
         let dirty: Vec<FrameId> = (0..self.frames.len())
@@ -223,7 +223,7 @@ impl<V: Vfs> Inner<V> {
             finalize_checksum(&mut buf.borrow_mut());
         }
 
-        // Journal the records durably before any page reaches the VFS. Collect
+        // Journal the records durably before any page reaches the block store. Collect
         // the after-images first so we don't hold a `frames` borrow across the
         // journal borrow.
         let images: Vec<(u64, Vec<u8>)> = if self.journal.is_some() {
@@ -239,19 +239,19 @@ impl<V: Vfs> Inner<V> {
         };
         if let Some(journal) = self.journal.as_mut() {
             for (page_id, image) in images {
-                journal.append(&PageOp::Write { page_id, image })?;
+                journal.append(&JournalOp::Write { page_id, image })?;
             }
-            journal.append(&PageOp::Commit)?;
+            journal.append(&JournalOp::Commit)?;
         }
 
         // Now safe to write the pages through and make them durable.
         for &f in &dirty {
             let id = self.frames[f].page_id.unwrap();
             let buf = self.frames[f].buf.clone();
-            self.vfs.write(id, &buf.borrow())?;
+            self.block.write(id, &buf.borrow())?;
             self.frames[f].dirty = false;
         }
-        self.vfs.sync()?;
+        self.block.sync()?;
 
         // The pages are on disk; their log records are no longer needed.
         if let Some(journal) = self.journal.as_mut() {
@@ -263,33 +263,37 @@ impl<V: Vfs> Inner<V> {
 
 /// The page cache. Cheap to clone the handle to (it shares one pool); v1 is
 /// single-threaded, so don't send it across threads.
-pub struct PageCache<V: Vfs> {
+pub struct PageCache<V: BlockStore> {
     inner: Rc<RefCell<Inner<V>>>,
 }
 
-impl<V: Vfs> PageCache<V> {
-    /// A cache over `vfs` with a pool of `frames` slots and the default LRU-K
+impl<V: BlockStore> PageCache<V> {
+    /// A cache over `block` with a pool of `frames` slots and the default LRU-K
     /// (K=2) policy.
-    pub fn new(vfs: V, frames: usize) -> Self {
-        Self::with_policy(vfs, frames, Box::new(LruK::<FrameId>::new(2)))
+    pub fn new(block: V, frames: usize) -> Self {
+        Self::with_policy(block, frames, Box::new(LruK::<FrameId>::new(2)))
     }
 
     /// A cache with an explicit eviction policy — for benchmarking alternatives.
     /// Not journaled (see [`with_journal`](Self::with_journal)).
-    pub fn with_policy(vfs: V, frames: usize, policy: Box<dyn EvictionPolicy<FrameId>>) -> Self {
-        Self::build(vfs, frames, policy, None)
+    pub fn with_policy(block: V, frames: usize, policy: Box<dyn EvictionPolicy<FrameId>>) -> Self {
+        Self::build(block, frames, policy, None)
     }
 
     /// A journaled cache: recover from `journal_path` (replaying the last
-    /// committed flush into `vfs`), then run with write-ahead logging so a crash
+    /// committed flush into `block`), then run with write-ahead logging so a crash
     /// loses nothing committed by [`flush`](Self::flush). Uses the default LRU-K.
-    pub fn with_journal(mut vfs: V, frames: usize, journal_path: impl AsRef<Path>) -> Result<Self> {
-        let mut journal = PageJournal::open(journal_path)?;
-        Self::recover(&mut vfs, &journal)?;
-        // Recovery is now durably applied to the VFS; the journal starts empty.
+    pub fn with_journal(
+        mut block: V,
+        frames: usize,
+        journal_path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let mut journal = BlockJournal::open(journal_path)?;
+        Self::recover(&mut block, &journal)?;
+        // Recovery is now durably applied to the block store; the journal starts empty.
         journal.truncate()?;
         Ok(Self::build(
-            vfs,
+            block,
             frames,
             Box::new(LruK::<FrameId>::new(2)),
             Some(journal),
@@ -297,14 +301,14 @@ impl<V: Vfs> PageCache<V> {
     }
 
     fn build(
-        vfs: V,
+        block: V,
         frames: usize,
         policy: Box<dyn EvictionPolicy<FrameId>>,
-        journal: Option<PageJournal>,
+        journal: Option<BlockJournal>,
     ) -> Self {
         assert!(frames >= 1, "page cache needs at least one frame");
         let inner = Inner {
-            vfs,
+            block,
             frames: (0..frames).map(|_| Frame::new()).collect(),
             table: HashMap::new(),
             free: (0..frames).rev().collect(),
@@ -316,27 +320,30 @@ impl<V: Vfs> PageCache<V> {
         }
     }
 
-    /// Replay the journal into `vfs`: apply the after-images of the last fully
+    /// Replay the journal into `block`: apply the after-images of the last fully
     /// committed flush (everything up to the final `Commit`), then sync. Records
     /// after the last `Commit` are a torn flush and are dropped.
-    fn recover(vfs: &mut V, journal: &PageJournal) -> Result<()> {
+    fn recover(block: &mut V, journal: &BlockJournal) -> Result<()> {
         let records = journal.replay()?;
-        let Some(committed) = records.iter().rposition(|op| matches!(op, PageOp::Commit)) else {
+        let Some(committed) = records
+            .iter()
+            .rposition(|op| matches!(op, JournalOp::Commit))
+        else {
             return Ok(()); // nothing committed
         };
         for op in &records[..committed] {
-            if let PageOp::Write { page_id, image } = op {
-                let id = PageId(*page_id);
-                vfs.ensure_allocated(id)?;
-                vfs.write(id, image)?;
+            if let JournalOp::Write { page_id, image } = op {
+                let id = BlockId(*page_id);
+                block.ensure_allocated(id)?;
+                block.write(id, image)?;
             }
         }
-        vfs.sync()
+        block.sync()
     }
 
-    /// Fetch `id` for shared reading. Fails with [`PageError::Busy`] if a writer
+    /// Fetch `id` for shared reading. Fails with [`Error::Busy`] if a writer
     /// holds it.
-    pub fn read(&self, id: PageId) -> Result<ReadPage<V>> {
+    pub fn read(&self, id: BlockId) -> Result<ReadPage<V>> {
         let (frame, buf) = self.inner.borrow_mut().acquire_read(id)?;
         Ok(ReadPage {
             pool: self.inner.clone(),
@@ -346,9 +353,9 @@ impl<V: Vfs> PageCache<V> {
         })
     }
 
-    /// Fetch `id` for exclusive writing. Fails with [`PageError::Busy`] if any
+    /// Fetch `id` for exclusive writing. Fails with [`Error::Busy`] if any
     /// other handle holds it.
-    pub fn write(&self, id: PageId) -> Result<WritePage<V>> {
+    pub fn write(&self, id: BlockId) -> Result<WritePage<V>> {
         let (frame, buf) = self.inner.borrow_mut().acquire_write(id)?;
         Ok(WritePage {
             pool: self.inner.clone(),
@@ -361,7 +368,7 @@ impl<V: Vfs> PageCache<V> {
     /// Allocate a brand-new page, returning its id and an exclusive, zeroed,
     /// dirty handle. The caller stamps a valid header before the page is read
     /// back (the page-type initializers do this).
-    pub fn allocate(&self) -> Result<(PageId, WritePage<V>)> {
+    pub fn allocate(&self) -> Result<(BlockId, WritePage<V>)> {
         let (id, frame, buf) = self.inner.borrow_mut().allocate()?;
         Ok((
             id,
@@ -374,14 +381,14 @@ impl<V: Vfs> PageCache<V> {
         ))
     }
 
-    /// Write every dirty frame back and `sync` the VFS — the durability point.
+    /// Write every dirty frame back and `sync` the block store — the durability point.
     pub fn flush(&self) -> Result<()> {
         self.inner.borrow_mut().flush()
     }
 
     /// Hint that `id` will be needed soon. A no-op in v1 (placeholder for the
     /// scan-buffer / prefetch path).
-    pub fn prefetch(&self, _id: PageId) {}
+    pub fn prefetch(&self, _id: BlockId) {}
 
     /// Number of frames in the pool.
     pub fn frame_count(&self) -> usize {
@@ -396,16 +403,16 @@ impl<V: Vfs> PageCache<V> {
 
 /// A pinned, shared-read handle to a page. Unpins on drop. Multiple may coexist
 /// on one page.
-pub struct ReadPage<V: Vfs> {
+pub struct ReadPage<V: BlockStore> {
     pool: Rc<RefCell<Inner<V>>>,
     frame: FrameId,
-    page_id: PageId,
+    page_id: BlockId,
     buf: FrameBuf,
 }
 
-impl<V: Vfs> ReadPage<V> {
+impl<V: BlockStore> ReadPage<V> {
     /// The page's id.
-    pub fn page_id(&self) -> PageId {
+    pub fn page_id(&self) -> BlockId {
         self.page_id
     }
 
@@ -426,7 +433,7 @@ impl<V: Vfs> ReadPage<V> {
     }
 }
 
-impl<V: Vfs> Drop for ReadPage<V> {
+impl<V: BlockStore> Drop for ReadPage<V> {
     fn drop(&mut self) {
         self.pool.borrow_mut().release_read(self.frame);
     }
@@ -434,16 +441,16 @@ impl<V: Vfs> Drop for ReadPage<V> {
 
 /// A pinned, exclusive-write handle to a page. Marks the frame dirty and unpins
 /// on drop.
-pub struct WritePage<V: Vfs> {
+pub struct WritePage<V: BlockStore> {
     pool: Rc<RefCell<Inner<V>>>,
     frame: FrameId,
-    page_id: PageId,
+    page_id: BlockId,
     buf: FrameBuf,
 }
 
-impl<V: Vfs> WritePage<V> {
+impl<V: BlockStore> WritePage<V> {
     /// The page's id.
-    pub fn page_id(&self) -> PageId {
+    pub fn page_id(&self) -> BlockId {
         self.page_id
     }
 
@@ -480,7 +487,7 @@ impl<V: Vfs> WritePage<V> {
     }
 }
 
-impl<V: Vfs> Drop for WritePage<V> {
+impl<V: BlockStore> Drop for WritePage<V> {
     fn drop(&mut self) {
         self.pool.borrow_mut().release_write(self.frame);
     }
