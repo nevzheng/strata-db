@@ -1,9 +1,12 @@
-//! Concrete [`EvictionPolicy`] implementations, all generic over the tracked
-//! id so they work for both the buffer pool ([`FrameId`](super::FrameId)) and
-//! the read-through [`Cache`](super::Cache).
+//! Eviction policies — the contract a cache uses to choose victims, plus a menu
+//! of implementations.
 //!
-//! These are deliberately a menu to experiment with — swap one in via
-//! `with_policy` / [`Cache::new`](super::Cache::new) and benchmark:
+//! The [`EvictionPolicy`] trait is generic over the *id* it tracks, so one
+//! contract serves both caches: the buffer pool tracks frame slots
+//! ([`FrameId`]); the read-through [`Cache`](crate::Cache) tracks its own keys.
+//!
+//! The implementations are a menu to experiment with — swap one in via
+//! `with_policy` / [`Cache::new`](crate::Cache::new) and benchmark:
 //!
 //! - [`Lru`]   — evict the least-recently-used. Simple, cheap, scan-fragile.
 //! - [`LruK`]  — LRU-K (K=2 default): rank by the K-th-most-recent access, so a
@@ -16,7 +19,26 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
-use super::EvictionPolicy;
+/// Index of a frame in the buffer pool's slot array.
+pub type FrameId = usize;
+
+/// Tracks access recency/frequency and picks eviction victims. The cache calls
+/// [`record_access`](EvictionPolicy::record_access) on every fetch and
+/// [`remove`](EvictionPolicy::remove) when an entry leaves the cache.
+pub trait EvictionPolicy<Id> {
+    /// Note that `id` was just accessed.
+    fn record_access(&mut self, id: Id);
+
+    /// Choose an id to evict among those for which `evictable` returns true
+    /// (e.g. currently unpinned). Returns `None` if none qualify.
+    ///
+    /// Takes a predicate because the coldest entry may be un-evictable (pinned
+    /// in the pool), in which case the next-coldest evictable one is chosen.
+    fn evict_candidate(&self, evictable: &dyn Fn(Id) -> bool) -> Option<Id>;
+
+    /// Drop all history for `id` (it left the cache).
+    fn remove(&mut self, id: Id);
+}
 
 /// Least-recently-used: evict the entry whose last access is furthest in the past.
 pub struct Lru<Id> {

@@ -16,12 +16,8 @@
 //! are deferred (see the Page Cache design doc); [`prefetch`](PageCache::prefetch)
 //! is a no-op placeholder.
 
-mod eviction;
-mod eviction_policies;
 mod memo;
 
-pub use eviction::{EvictionPolicy, FrameId};
-pub use eviction_policies::{Clock, Lfu, Lru, LruK};
 pub use memo::{Budget, Cache, Weight};
 
 use std::cell::{Ref, RefCell, RefMut};
@@ -30,6 +26,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::error::PageError;
+use crate::policies::{EvictionPolicy, FrameId, LruK};
 use crate::journal::{PageJournal, PageOp};
 use crate::page::{finalize_checksum, verify_checksum};
 use crate::{HEADER_LEN, PAGE_SIZE, PageHeader, PageId, Result, Vfs};

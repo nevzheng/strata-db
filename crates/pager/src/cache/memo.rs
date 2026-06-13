@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use super::EvictionPolicy;
+use crate::policies::EvictionPolicy;
 
 /// A value's cache cost, for the byte budget. A bytes handle weighs its length;
 /// a decoded value can weigh its in-memory footprint.
@@ -131,7 +131,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Lru;
+    use crate::policies::Lru;
     use std::cell::Cell;
 
     impl Weight for Vec<u8> {
