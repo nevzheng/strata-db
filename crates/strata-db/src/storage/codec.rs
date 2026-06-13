@@ -38,6 +38,8 @@
 //! decoded unambiguously without an end marker; composite-key decoding
 //! will land alongside composite keys.
 
+use rust_decimal::Decimal;
+
 use crate::storage::types::{LogicalType, Value};
 
 /// Tried to encode a value as a key that has no meaningful key form.
@@ -173,6 +175,23 @@ impl ValueCodec for f64 {
     }
 }
 
+impl ValueCodec for Decimal {
+    fn encoded_size(&self) -> usize {
+        16
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        // rust_decimal's own 16-byte form. Compact and exact, but NOT
+        // order-preserving — that's `KeyCodec`'s job.
+        buf.extend_from_slice(&self.serialize());
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = take(buf, 16)?;
+        Ok(Decimal::deserialize(bytes.try_into().unwrap()))
+    }
+}
+
 impl ValueCodec for String {
     fn encoded_size(&self) -> usize {
         4 + self.len()
@@ -287,6 +306,61 @@ impl KeyCodec for f64 {
     }
 }
 
+// Sign-bucket tags for the decimal key encoding. Ordering negative <
+// zero < positive falls out of `0x03 < 0x04 < 0x05`.
+const DEC_NEG: u8 = 0x03;
+const DEC_ZERO: u8 = 0x04;
+const DEC_POS: u8 = 0x05;
+
+impl KeyCodec for Decimal {
+    /// Order-preserving decimal encoding (CockroachDB-style): sign bucket,
+    /// then exponent, then big-endian base-100 "centimal" digits. The
+    /// exponent leads the digits so magnitude dominates (`100 > 9`); for
+    /// negatives the whole payload is one's-complemented so larger
+    /// magnitudes sort lower. `rust_decimal`'s own bytes aren't sortable,
+    /// hence this bespoke form.
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        let d = self.normalize();
+        if d.is_zero() {
+            buf.push(DEC_ZERO);
+            return;
+        }
+        let negative = d.is_sign_negative();
+        let a = d.abs();
+
+        // a = coeff × 10^(-scale); `digits` is the coefficient's decimal
+        // text. In the F×10^E form with F ∈ [0.1, 1), the significand is
+        // `digits` and E = (#digits) − scale.
+        let digits = a.mantissa().to_string();
+        let exponent = digits.len() as i32 - a.scale() as i32;
+
+        let mut payload = Vec::with_capacity(2 + digits.len() / 2);
+        // Exponent as one order-preserving signed byte (range is small:
+        // rust_decimal caps digits at 29 and scale at 28, so E ∈ [-27, 29]).
+        payload.push((exponent as i8 as u8) ^ 0x80);
+
+        // Pair the digits into base-100; pad an odd tail with a trailing
+        // zero (safe — `normalize` already stripped real trailing zeros).
+        let mut ds = digits.into_bytes();
+        if ds.len() % 2 == 1 {
+            ds.push(b'0');
+        }
+        for pair in ds.chunks(2) {
+            let cent = (pair[0] - b'0') * 10 + (pair[1] - b'0'); // 0..=99
+            payload.push(cent + 1); // 1..=100, leaving 0x00 as a terminator
+        }
+        payload.push(0x00);
+
+        if negative {
+            buf.push(DEC_NEG);
+            buf.extend(payload.iter().map(|b| !b)); // complement reverses order
+        } else {
+            buf.push(DEC_POS);
+            buf.extend_from_slice(&payload);
+        }
+    }
+}
+
 impl KeyCodec for String {
     fn encode_key(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self.as_bytes());
@@ -323,6 +397,7 @@ impl Value {
             Value::Timestamp(n) => n.encoded_size(),
             Value::Float32(f) => f.encoded_size(),
             Value::Float64(f) => f.encoded_size(),
+            Value::Numeric(d) => d.encoded_size(),
         }
     }
 
@@ -344,6 +419,7 @@ impl Value {
             Value::Timestamp(n) => n.encode(buf),
             Value::Float32(f) => f.encode(buf),
             Value::Float64(f) => f.encode(buf),
+            Value::Numeric(d) => d.encode(buf),
         }
     }
 
@@ -396,6 +472,10 @@ impl Value {
                 f.encode_key(buf);
                 Ok(())
             }
+            Value::Numeric(d) => {
+                d.encode_key(buf);
+                Ok(())
+            }
         }
     }
 
@@ -414,6 +494,7 @@ impl Value {
             LogicalType::Timestamp => Ok(Value::Timestamp(i64::decode(buf)?)),
             LogicalType::Float32 => Ok(Value::Float32(f32::decode(buf)?)),
             LogicalType::Float64 => Ok(Value::Float64(f64::decode(buf)?)),
+            LogicalType::Numeric => Ok(Value::Numeric(Decimal::decode(buf)?)),
         }
     }
 }
@@ -571,6 +652,54 @@ mod tests {
         assert_key_order_preserving(&[i16::MIN, -100, -1, 0, 1, 100, i16::MAX]);
         assert_key_order_preserving(&[i32::MIN, -100, -1, 0, 1, 100, i32::MAX]);
         assert_key_order_preserving(&[i64::MIN, -100, -1, 0, 1, 100, i64::MAX]);
+    }
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn decimal_value_roundtrips() {
+        for s in [
+            "0",
+            "1.5",
+            "-2.25",
+            "100",
+            "0.001",
+            "-0.001",
+            "79228162514264337593543950335", // Decimal::MAX
+        ] {
+            let d = dec(s);
+            let mut buf = Vec::new();
+            d.encode(&mut buf);
+            assert_eq!(buf.len(), d.encoded_size());
+            let mut cur: &[u8] = &buf;
+            assert_eq!(Decimal::decode(&mut cur).unwrap(), d);
+            assert!(cur.is_empty());
+        }
+    }
+
+    #[test]
+    fn decimal_keys_sort_in_numeric_order() {
+        let ascending: Vec<Decimal> = [
+            "-1000.25", "-100", "-10", "-9.5", "-1", "-0.5", "-0.05", "-0.001", "0", "0.001",
+            "0.05", "0.5", "1", "9.5", "10", "100", "1000.25",
+        ]
+        .iter()
+        .map(|s| dec(s))
+        .collect();
+        assert_key_order_preserving(&ascending);
+    }
+
+    #[test]
+    fn decimal_equal_values_encode_identically() {
+        // Different textual scales, same value → identical keys, so a
+        // NUMERIC primary key treats them as one row.
+        let mut a = Vec::new();
+        dec("1.5").encode_key(&mut a);
+        let mut b = Vec::new();
+        dec("1.50").encode_key(&mut b);
+        assert_eq!(a, b);
     }
 
     #[test]

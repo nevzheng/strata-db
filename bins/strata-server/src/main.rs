@@ -234,6 +234,7 @@ fn value_to_text(v: &Value) -> Option<String> {
             *f >= 0.0,
             f.to_string(),
         )),
+        Value::Numeric(d) => Some(d.to_string()),
     }
 }
 

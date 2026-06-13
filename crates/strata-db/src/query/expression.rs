@@ -9,6 +9,9 @@
 //! pretty-printer can render them, a future JIT can walk the tree to
 //! emit code. Closures would be opaque to all of that.
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+
 use crate::storage::types::{Tuple, Value};
 
 use super::QueryError;
@@ -143,6 +146,7 @@ fn eval_abs(v: Value) -> Result<Value, QueryError> {
         Value::Int64(n) => n.checked_abs().map(Value::Int64).ok_or_else(overflow),
         Value::Float32(f) => Ok(Value::Float32(f.abs())),
         Value::Float64(f) => Ok(Value::Float64(f.abs())),
+        Value::Numeric(d) => Ok(Value::Numeric(d.abs())),
         other => Err(QueryError::type_error(format!(
             "ABS of non-numeric value {other:?}"
         ))),
@@ -223,9 +227,23 @@ fn as_i64(v: &Value) -> Option<i64> {
     }
 }
 
-/// The value of `v` as `f64`, if it is any numeric type (integer or
-/// float). Lets a float coerce across the numeric types — a float
-/// against an integer literal, or `REAL` against `DOUBLE`.
+/// The exact `Decimal` value of `v`, if it is an integer or a numeric.
+/// Lets numerics compare exactly with each other and with integers
+/// (floats are excluded — a float comparison goes through [`as_f64`]).
+fn as_decimal(v: &Value) -> Option<Decimal> {
+    match v {
+        Value::Int16(n) => Some(Decimal::from(*n)),
+        Value::Int32(n) => Some(Decimal::from(*n)),
+        Value::Int64(n) => Some(Decimal::from(*n)),
+        Value::Numeric(d) => Some(*d),
+        _ => None,
+    }
+}
+
+/// The value of `v` as `f64`, if it is any numeric type (integer, float,
+/// or numeric). Used when a float is involved, so the comparison happens
+/// in `f64` (possibly lossy for a large numeric — matching Postgres,
+/// which promotes to float8 for a numeric-vs-float8 comparison).
 fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int16(n) => Some(*n as f64),
@@ -233,6 +251,7 @@ fn as_f64(v: &Value) -> Option<f64> {
         Value::Int64(n) => Some(*n as f64),
         Value::Float32(f) => Some(*f as f64),
         Value::Float64(f) => Some(*f),
+        Value::Numeric(d) => d.to_f64(),
         _ => None,
     }
 }
@@ -243,6 +262,9 @@ fn as_f64(v: &Value) -> Option<f64> {
 /// equality (`Text == Text`, mismatched types → not equal).
 fn values_eq(lhs: &Value, rhs: &Value) -> bool {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (as_decimal(lhs), as_decimal(rhs)) {
         return a == b;
     }
     if let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
@@ -259,6 +281,9 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
 /// mix — is a type error the caller surfaces to the user.
 fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
+        return Ok(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (as_decimal(lhs), as_decimal(rhs)) {
         return Ok(a.cmp(&b));
     }
     if let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
@@ -420,6 +445,37 @@ mod tests {
             Expr::lit(2i64),
         );
         assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    fn num(s: &str) -> Value {
+        Value::Numeric(s.parse().unwrap())
+    }
+
+    #[test]
+    fn eval_numeric_exact_equality() {
+        // Trailing-zero scales are equal; numerics compare by value.
+        let eq = Expr::binary(
+            BinaryOperator::Eq,
+            Expr::lit(num("1.10")),
+            Expr::lit(num("1.1")),
+        );
+        assert_eq!(eq.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_numeric_vs_integer_is_exact() {
+        let gt = Expr::binary(BinaryOperator::Gt, Expr::lit(num("2.5")), Expr::lit(2i64));
+        assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_numeric_ordered_comparison() {
+        let lt = Expr::binary(
+            BinaryOperator::Lt,
+            Expr::lit(num("-0.001")),
+            Expr::lit(num("0")),
+        );
+        assert_eq!(lt.eval(&t(vec![])).unwrap(), Value::Bool(true));
     }
 
     fn call(func: ScalarFunc, args: Vec<Expr>) -> Expr {

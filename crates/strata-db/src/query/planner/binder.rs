@@ -22,6 +22,9 @@ use crate::catalog::consts::DEFAULT_PROJECT_NAME;
 use crate::catalog::schema::Schema;
 use crate::catalog::{CatalogError, ResourceKind};
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+
 use crate::storage::temporal;
 use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
@@ -269,6 +272,26 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
                 _ => Value::Float64(n),
             })
         }
+        // Numerics: exact into a numeric column; integers convert in
+        // exactly; numeric → float is allowed (may lose precision).
+        Value::Numeric(d) if matches!(field.ty, T::Numeric) => Ok(Value::Numeric(d)),
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) if matches!(field.ty, T::Numeric) => {
+            let n = match value {
+                Value::Int16(x) => x as i64,
+                Value::Int32(x) => x as i64,
+                Value::Int64(x) => x,
+                _ => unreachable!(),
+            };
+            Ok(Value::Numeric(Decimal::from(n)))
+        }
+        Value::Numeric(d) if matches!(field.ty, T::Float64) => d
+            .to_f64()
+            .map(Value::Float64)
+            .ok_or_else(|| QueryError::type_error("NUMERIC out of range for DOUBLE")),
+        Value::Numeric(d) if matches!(field.ty, T::Float32) => d
+            .to_f32()
+            .map(Value::Float32)
+            .ok_or_else(|| QueryError::type_error("NUMERIC out of range for REAL")),
         other => Err(QueryError::type_error(format!(
             "cannot insert {other:?} into column `{}` of type {:?}",
             field.name.as_str(),
@@ -427,6 +450,14 @@ fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
             Some(p) if p <= 24 => LogicalType::Float32,
             _ => LogicalType::Float64,
         },
+        // Exact decimal. We don't enforce the declared precision/scale yet
+        // (values keep their own scale); the backing decimal caps at ~28
+        // significant digits.
+        DataType::Numeric(_)
+        | DataType::Decimal(_)
+        | DataType::Dec(_)
+        | DataType::BigNumeric(_)
+        | DataType::BigDecimal(_) => LogicalType::Numeric,
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }
@@ -687,10 +718,9 @@ fn single_ident_upper(name: &ObjectName) -> Result<String, QueryError> {
     }
 }
 
-/// Bind a typed string literal such as `DATE '2026-06-13'`. Only `DATE`
-/// is supported today; other temporal literals (`TIME`, `TIMESTAMP`) are
-/// rejected until those types land. The string is parsed and validated
-/// here, so a bad date fails at bind time.
+/// Bind a typed string literal: `DATE '…'`, `TIMESTAMP WITH TIME ZONE '…'`,
+/// or `NUMERIC '…'`. The string is parsed and validated here, so a bad
+/// literal fails at bind time. Other typed strings are unsupported.
 fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
     let as_string = |what: &str| {
         ts.value
@@ -710,6 +740,19 @@ fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
                 .map_err(QueryError::type_error)?;
             Ok(Expr::Literal {
                 value: Value::Timestamp(micros),
+            })
+        }
+        DataType::Numeric(_)
+        | DataType::Decimal(_)
+        | DataType::Dec(_)
+        | DataType::BigNumeric(_)
+        | DataType::BigDecimal(_) => {
+            let s = as_string("NUMERIC")?;
+            let d = s
+                .parse::<Decimal>()
+                .map_err(|_| QueryError::type_error(format!("invalid NUMERIC literal: {s:?}")))?;
+            Ok(Expr::Literal {
+                value: Value::Numeric(d),
             })
         }
         other => Err(QueryError::unsupported(format!("typed literal: {other:?}"))),
@@ -742,6 +785,9 @@ fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryErro
         Expr::Literal {
             value: Value::Float64(f),
         } => Value::Float64(-f),
+        Expr::Literal {
+            value: Value::Numeric(d),
+        } => Value::Numeric(-d),
         other => return Err(QueryError::unsupported(format!("unary minus on {other:?}"))),
     };
     Ok(Expr::Literal { value })

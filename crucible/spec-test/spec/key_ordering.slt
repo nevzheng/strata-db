@@ -96,3 +96,23 @@ SELECT * FROM strata.keyorder.measures
 0 zero
 2.5 pos
 Infinity pos-inf
+
+# --- NUMERIC keys: the custom order-preserving decimal encoding --------
+
+statement ok
+CREATE TABLE strata.keyorder.amounts (n NUMERIC, label TEXT)
+
+# Spans sign, magnitude, and fractional scales — the cases the
+# exponent-then-digits encoding has to get right.
+statement ok
+INSERT INTO strata.keyorder.amounts VALUES (NUMERIC '100', 'hundred'), (NUMERIC '-9.5', 'neg'), (NUMERIC '0.001', 'tiny'), (NUMERIC '0', 'zero'), (NUMERIC '-100', 'neg-hundred'), (NUMERIC '9.5', 'nine-half')
+
+query TT
+SELECT * FROM strata.keyorder.amounts
+----
+-100 neg-hundred
+-9.5 neg
+0 zero
+0.001 tiny
+9.5 nine-half
+100 hundred

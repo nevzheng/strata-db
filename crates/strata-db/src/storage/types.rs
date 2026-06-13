@@ -20,6 +20,10 @@
 //! | `Timestamp` | `i64`    | `TIMESTAMP WITH TIME ZONE` |
 //! | `Float32` | `f32`      | `REAL` / `FLOAT4` |
 //! | `Float64` | `f64`      | `DOUBLE PRECISION` / `FLOAT8` / `FLOAT` |
+//! | `Numeric` | `Decimal`  | `NUMERIC` / `DECIMAL` |
+//!
+//! `Numeric` is exact decimal (backed by `rust_decimal`); its
+//! order-preserving key encoding lives in [`crate::storage::codec`].
 //!
 //! `Date` is a count of days since the Unix epoch (`1970-01-01`, UTC) —
 //! no time, no timezone. `Timestamp` is an absolute instant: microseconds
@@ -51,6 +55,7 @@ pub enum LogicalType {
     Timestamp,
     Float32,
     Float64,
+    Numeric,
 }
 
 /// A single runtime datum carrying both its type tag and the data.
@@ -75,8 +80,11 @@ pub enum Value {
     /// IEEE-754 single — `REAL` / `FLOAT4` (4 bytes).
     Float32(f32),
     /// IEEE-754 double — `DOUBLE PRECISION` / `FLOAT8` / `FLOAT` (8 bytes).
-    /// Inexact; for exact decimals use `NUMERIC` (not yet implemented).
+    /// Inexact; for exact decimals use `Numeric`.
     Float64(f64),
+    /// Exact decimal — `NUMERIC` / `DECIMAL`. See
+    /// [`crate::storage::codec`] for the order-preserving key encoding.
+    Numeric(rust_decimal::Decimal),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is
