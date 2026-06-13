@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::iterator::Scan;
 use crate::{StorageError, memstore::BTreeMapStore};
-use filesystem::{FileBlockStore, Heap, PageCache, TupleLoc, TupleRef};
+use filesystem::{Heap, TupleLoc, TupleRef};
 use lsm::{LevelConfig, Lsm, LsmConfig, MemStore};
 use tracing::{info, instrument};
 
@@ -29,7 +29,7 @@ const HEAP_FRAMES: usize = 1024;
 /// work; for now, treat `flush` as the durability point.
 pub struct StorageEngine<M: MemStore = BTreeMapStore> {
     index: Lsm<M>,
-    heap: Heap<FileBlockStore>,
+    heap: Heap,
 }
 
 impl<M: MemStore> StorageEngine<M> {
@@ -39,7 +39,7 @@ impl<M: MemStore> StorageEngine<M> {
     pub fn new(dir: &Path, mem: M) -> Result<Self, StorageError> {
         Ok(Self {
             index: Lsm::with_memtable(dir, LsmConfig::default(), mem)?,
-            heap: open_heap(dir)?,
+            heap: Heap::open(&dir.join("heap"), HEAP_FRAMES)?,
         })
     }
 
@@ -51,7 +51,7 @@ impl<M: MemStore> StorageEngine<M> {
         };
         Ok(Self {
             index: Lsm::with_memtable(dir, config, mem)?,
-            heap: open_heap(dir)?,
+            heap: Heap::open(&dir.join("heap"), HEAP_FRAMES)?,
         })
     }
 
@@ -87,7 +87,7 @@ impl<M: MemStore> StorageEngine<M> {
     /// Retrieve a zero-copy view of the latest value for `key`, or `None` if
     /// absent or deleted. The view pins its page until dropped; decode out of it
     /// to materialize a value.
-    pub fn get(&self, key: &[u8]) -> Result<Option<TupleRef<FileBlockStore>>, StorageError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<TupleRef>, StorageError> {
         let Some(loc_bytes) = self.index.get(key)? else {
             return Ok(None);
         };
@@ -128,17 +128,6 @@ impl<M: MemStore> StorageEngine<M> {
 }
 
 /// Open the heap under `dir/heap`, behind a journaled page cache.
-fn open_heap(dir: &Path) -> Result<Heap<FileBlockStore>, StorageError> {
-    let heap_dir = dir.join("heap");
-    std::fs::create_dir_all(&heap_dir)?;
-    let cache = PageCache::with_journal(
-        FileBlockStore::open(heap_dir.join("tuples.db"))?,
-        HEAP_FRAMES,
-        heap_dir.join("tuples.journal"),
-    )?;
-    Ok(Heap::new(cache))
-}
-
 pub(crate) fn decode_loc(bytes: &[u8]) -> Result<TupleLoc, StorageError> {
     TupleLoc::decode(bytes)
         .ok_or_else(|| StorageError::Corruption(format!("malformed tuple location ({bytes:?})")))

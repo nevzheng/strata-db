@@ -22,7 +22,8 @@ pub use iterator::{Scan, ScanRow};
 pub use lsm::{KVPair, LevelConfig, LsmConfig, LsmError, MergeIterator, ReadStore};
 
 // Re-export the heap's view types so dependents can name engine read results.
-pub use filesystem::{FileBlockStore, TupleRef, TupleView};
+// They default their block-store backend, so dependents never name it.
+pub use filesystem::{TupleRef, TupleView};
 
 /// The memtable types, kept under a `memstore` path for dependents.
 pub mod memstore {
@@ -121,8 +122,8 @@ mod tests {
         // LSM memtable-full and filesystem pool-exhaustion both land in Exhausted.
         let from_lsm: StorageError = LsmError::from(WriteError::StoreFull).into();
         assert!(from_lsm.is_exhausted());
-        let from_pager: StorageError = filesystem::Error::PoolExhausted(8).into();
-        assert!(from_pager.is_exhausted());
+        let from_pool: StorageError = filesystem::Error::PoolExhausted(8).into();
+        assert!(from_pool.is_exhausted());
 
         // A non-exhaustion error keeps its own variant.
         let internal: StorageError = LsmError::Internal("boom".into()).into();
