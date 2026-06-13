@@ -12,9 +12,10 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
-    DataType, ExactNumberInfo, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName,
-    Query as AstQuery, SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor,
-    TableObject, TableWithJoins, TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
+    DataType, ExactNumberInfo, Expr as AstExpr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery, SchemaName,
+    Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject, TableWithJoins,
+    TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -24,7 +25,7 @@ use crate::query::stages::{AnalyzedQuery, ParsedQuery};
 use crate::storage::temporal;
 use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
-use super::super::expression::{BinaryOperator, Expr};
+use super::super::expression::{BinaryOperator, Expr, ScalarFunc};
 use super::super::logical_plan::{LogicalNode, LogicalPlan};
 use super::super::{QueryContext, QueryError};
 use super::pass::Pass;
@@ -611,8 +612,78 @@ impl BindNode for AstExpr {
             },
             AstExpr::Nested(inner) => inner.bind(binder),
             AstExpr::TypedString(ts) => bind_typed_string(ts),
+            AstExpr::Function(func) => bind_function(func, binder),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
+    }
+}
+
+/// Bind a function call to an [`Expr::Call`]. Only plain scalar calls are
+/// supported — no `FILTER`, `OVER` (window), `DISTINCT`/`ORDER BY` in the
+/// argument list, or named/wildcard arguments.
+fn bind_function(func: &Function, binder: &mut Binder) -> Result<Expr, QueryError> {
+    let name = single_ident_upper(&func.name)?;
+    if func.filter.is_some()
+        || func.over.is_some()
+        || func.null_treatment.is_some()
+        || !func.within_group.is_empty()
+    {
+        return Err(QueryError::unsupported(format!("{name} with a clause")));
+    }
+    let FunctionArguments::List(list) = &func.args else {
+        return Err(QueryError::unsupported(format!("{name} call form")));
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return Err(QueryError::unsupported(format!(
+            "{name} with DISTINCT / ORDER BY"
+        )));
+    }
+
+    let mut args = Vec::with_capacity(list.args.len());
+    for arg in &list.args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+            return Err(QueryError::unsupported(format!("{name} argument form")));
+        };
+        args.push(expr.bind(binder)?);
+    }
+
+    let resolved = resolve_scalar_func(&name, args.len())?;
+    Ok(Expr::Call {
+        func: resolved,
+        args,
+    })
+}
+
+/// Resolve a function name + arity to a scalar function. `MAX`/`MIN` with
+/// two or more arguments are the row-wise `GREATEST`/`LEAST`; the one-arg
+/// aggregate form needs `GROUP BY`, which doesn't exist yet.
+fn resolve_scalar_func(name: &str, argc: usize) -> Result<ScalarFunc, QueryError> {
+    match (name, argc) {
+        ("ABS", 1) => Ok(ScalarFunc::Abs),
+        ("ABS", n) => Err(QueryError::type_error(format!(
+            "ABS takes exactly 1 argument, got {n}"
+        ))),
+        ("GREATEST", n) | ("MAX", n) if n >= 2 => Ok(ScalarFunc::Greatest),
+        ("LEAST", n) | ("MIN", n) if n >= 2 => Ok(ScalarFunc::Least),
+        ("GREATEST", _) => Ok(ScalarFunc::Greatest), // single-arg GREATEST is valid
+        ("LEAST", _) => Ok(ScalarFunc::Least),
+        ("MAX" | "MIN", _) => Err(QueryError::unsupported(format!(
+            "{name} as an aggregate (needs GROUP BY); {name}(a, b, …) is supported"
+        ))),
+        _ => Err(QueryError::unsupported(format!("function {name}"))),
+    }
+}
+
+/// Extract a single, unqualified function name, upper-cased for matching.
+fn single_ident_upper(name: &ObjectName) -> Result<String, QueryError> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(|i| i.value.to_uppercase())
+            .ok_or_else(|| QueryError::unsupported(format!("function name: {name}"))),
+        _ => Err(QueryError::unsupported(format!(
+            "qualified function name: {name}"
+        ))),
     }
 }
 

@@ -29,6 +29,19 @@ pub enum BinaryOperator {
     Or,
 }
 
+/// A built-in scalar function — a row-wise operation on its arguments
+/// (no aggregation across rows). `Greatest`/`Least` back both the
+/// `GREATEST`/`LEAST` names and the multi-argument `MAX`/`MIN` forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ScalarFunc {
+    /// `ABS(x)` — absolute value of a number.
+    Abs,
+    /// `GREATEST(a, b, …)` / `MAX(a, b, …)` — largest non-null argument.
+    Greatest,
+    /// `LEAST(a, b, …)` / `MIN(a, b, …)` — smallest non-null argument.
+    Least,
+}
+
 /// A scalar expression. Each variant is a "basic operation" carrying
 /// its own data.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +58,8 @@ pub enum Expr {
     },
     /// Logical negation.
     Not { input: Box<Expr> },
+    /// A built-in scalar function applied to its arguments.
+    Call { func: ScalarFunc, args: Vec<Expr> },
 }
 
 impl Expr {
@@ -103,8 +118,57 @@ impl Expr {
                 let r = rhs.eval(tuple)?;
                 eval_binary(*op, l, r)
             }
+            Expr::Call { func, args } => eval_call(*func, args, tuple),
         }
     }
+}
+
+fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
+    match func {
+        // The binder guarantees ABS has exactly one argument.
+        ScalarFunc::Abs => eval_abs(args[0].eval(tuple)?),
+        ScalarFunc::Greatest => eval_extreme(args, tuple, true),
+        ScalarFunc::Least => eval_extreme(args, tuple, false),
+    }
+}
+
+/// Absolute value. `NULL` propagates; `i*::MIN` has no positive magnitude
+/// and overflows, surfaced as a type error (matching Postgres).
+fn eval_abs(v: Value) -> Result<Value, QueryError> {
+    let overflow = || QueryError::type_error("ABS argument out of range");
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Int16(n) => n.checked_abs().map(Value::Int16).ok_or_else(overflow),
+        Value::Int32(n) => n.checked_abs().map(Value::Int32).ok_or_else(overflow),
+        Value::Int64(n) => n.checked_abs().map(Value::Int64).ok_or_else(overflow),
+        Value::Float32(f) => Ok(Value::Float32(f.abs())),
+        Value::Float64(f) => Ok(Value::Float64(f.abs())),
+        other => Err(QueryError::type_error(format!(
+            "ABS of non-numeric value {other:?}"
+        ))),
+    }
+}
+
+/// `GREATEST`/`LEAST` over the arguments. Nulls are skipped (Postgres
+/// semantics); all-null yields `NULL`. The winning argument is returned
+/// as-is. Incomparable types surface the `cmp_values` type error.
+fn eval_extreme(args: &[Expr], tuple: &Tuple, greatest: bool) -> Result<Value, QueryError> {
+    let mut best: Option<Value> = None;
+    for arg in args {
+        let v = arg.eval(tuple)?;
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        best = Some(match best {
+            None => v,
+            Some(cur) => {
+                let ord = cmp_values(&cur, &v)?;
+                let take_new = if greatest { ord.is_lt() } else { ord.is_gt() };
+                if take_new { v } else { cur }
+            }
+        });
+    }
+    Ok(best.unwrap_or(Value::Null))
 }
 
 fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, QueryError> {
@@ -356,6 +420,74 @@ mod tests {
             Expr::lit(2i64),
         );
         assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    fn call(func: ScalarFunc, args: Vec<Expr>) -> Expr {
+        Expr::Call { func, args }
+    }
+
+    #[test]
+    fn eval_abs_of_int_and_float() {
+        assert_eq!(
+            call(ScalarFunc::Abs, vec![Expr::lit(-7i64)])
+                .eval(&t(vec![]))
+                .unwrap(),
+            Value::Int64(7)
+        );
+        assert_eq!(
+            call(ScalarFunc::Abs, vec![Expr::lit(Value::Float64(-2.5))])
+                .eval(&t(vec![]))
+                .unwrap(),
+            Value::Float64(2.5)
+        );
+    }
+
+    #[test]
+    fn eval_abs_of_null_is_null() {
+        let e = call(ScalarFunc::Abs, vec![Expr::lit(Value::Null)]);
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn eval_abs_int_min_overflows() {
+        let e = call(ScalarFunc::Abs, vec![Expr::lit(i64::MIN)]);
+        assert!(matches!(e.eval(&t(vec![])), Err(QueryError::Type(_))));
+    }
+
+    #[test]
+    fn eval_greatest_and_least() {
+        let args = || vec![Expr::lit(3i64), Expr::lit(1i64), Expr::lit(2i64)];
+        assert_eq!(
+            call(ScalarFunc::Greatest, args()).eval(&t(vec![])).unwrap(),
+            Value::Int64(3)
+        );
+        assert_eq!(
+            call(ScalarFunc::Least, args()).eval(&t(vec![])).unwrap(),
+            Value::Int64(1)
+        );
+    }
+
+    #[test]
+    fn eval_greatest_skips_nulls_and_coerces() {
+        // NULL is ignored; a float argument wins over smaller integers.
+        let e = call(
+            ScalarFunc::Greatest,
+            vec![
+                Expr::lit(1i64),
+                Expr::lit(Value::Null),
+                Expr::lit(Value::Float64(2.5)),
+            ],
+        );
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Float64(2.5));
+    }
+
+    #[test]
+    fn eval_least_all_null_is_null() {
+        let e = call(
+            ScalarFunc::Least,
+            vec![Expr::lit(Value::Null), Expr::lit(Value::Null)],
+        );
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Null);
     }
 
     #[test]
