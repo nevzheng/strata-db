@@ -107,6 +107,14 @@ pub enum Expr {
     /// Arithmetic negation (`-x`), evaluated per row. (Distinct from
     /// [`Expr::Not`], which is logical negation.)
     Neg { input: Box<Expr> },
+    /// `CASE` — the first branch whose condition is `true` wins; if none,
+    /// `else_result` (or `NULL`). The binder lowers simple `CASE x WHEN v`
+    /// into searched form (`x = v`), so each branch holds a boolean
+    /// condition and a result.
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
 }
 
 impl Expr {
@@ -176,6 +184,21 @@ impl Expr {
                 negated,
             } => eval_like(expr.eval(tuple)?, pattern.eval(tuple)?, *negated),
             Expr::Neg { input } => eval_neg(input.eval(tuple)?),
+            Expr::Case {
+                branches,
+                else_result,
+            } => {
+                for (cond, result) in branches {
+                    // Only a true condition matches; NULL/false skip.
+                    if matches!(cond.eval(tuple)?, Value::Bool(true)) {
+                        return result.eval(tuple);
+                    }
+                }
+                match else_result {
+                    Some(e) => e.eval(tuple),
+                    None => Ok(Value::Null),
+                }
+            }
         }
     }
 }
@@ -1003,6 +1026,30 @@ mod tests {
         };
         assert_eq!(nf(Value::Int64(5), Value::Int64(5)), Value::Null);
         assert_eq!(nf(Value::Int64(5), Value::Int64(6)), Value::Int64(5));
+    }
+
+    #[test]
+    fn eval_case_branches() {
+        // First true branch wins; no match + no else -> NULL.
+        let case = |branches, else_result| {
+            Expr::Case {
+                branches,
+                else_result,
+            }
+            .eval(&t(vec![]))
+            .unwrap()
+        };
+        let t_branch = (Expr::lit(true), Expr::lit("yes"));
+        let f_branch = (Expr::lit(false), Expr::lit("no"));
+        assert_eq!(
+            case(vec![f_branch.clone(), t_branch.clone()], None),
+            Value::Text("yes".into())
+        );
+        assert_eq!(case(vec![f_branch.clone()], None), Value::Null);
+        assert_eq!(
+            case(vec![f_branch], Some(Box::new(Expr::lit("else")))),
+            Value::Text("else".into())
+        );
     }
 
     #[test]

@@ -227,3 +227,30 @@ INSERT INTO strata.func.big VALUES (1, REPEAT('x', 7000))
 # Over the cap is a clear error, not an opaque page failure.
 statement error
 INSERT INTO strata.func.big VALUES (2, REPEAT('x', 9000))
+
+# --- CASE -------------------------------------------------------------
+
+# Searched CASE: first true branch wins.
+query T
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END
+----
+b
+
+# Simple CASE: operand compared to each WHEN value.
+query T
+SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END
+----
+two
+
+# No matching branch and no ELSE -> NULL (seen via COALESCE).
+query T
+SELECT COALESCE(CASE WHEN 1 > 2 THEN 'a' END, 'none')
+----
+none
+
+# CASE over a column.
+query T
+SELECT CASE WHEN v < 0 THEN 'neg' ELSE 'nonneg' END FROM strata.func.signed
+----
+nonneg
+neg

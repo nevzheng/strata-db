@@ -2,9 +2,9 @@
 //! function calls, and typed-string literals.
 
 use sqlparser::ast::{
-    BinaryOperator as AstBinaryOperator, CeilFloorKind, DataType, DateTimeField, Expr as AstExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, TrimWhereField,
-    TypedString, UnaryOperator, Value as AstValue,
+    BinaryOperator as AstBinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField,
+    Expr as AstExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    TrimWhereField, TypedString, UnaryOperator, Value as AstValue,
 };
 
 use rust_decimal::Decimal;
@@ -101,6 +101,12 @@ impl BindNode for AstExpr {
                 trim_what,
                 trim_characters,
             } => bind_trim(expr, trim_where, trim_what, trim_characters, binder),
+            AstExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => bind_case(operand, conditions, else_result, binder),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -222,6 +228,35 @@ fn bind_trim(
     Ok(Expr::Call {
         func,
         args: vec![s, chars],
+    })
+}
+
+/// Bind a `CASE`. A simple `CASE x WHEN v THEN …` is lowered to searched
+/// form by turning each branch condition into `x = v`, so the evaluator
+/// only ever sees boolean conditions.
+fn bind_case(
+    operand: &Option<Box<AstExpr>>,
+    conditions: &[CaseWhen],
+    else_result: &Option<Box<AstExpr>>,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    let operand = operand.as_deref().map(|o| o.bind(binder)).transpose()?;
+    let mut branches = Vec::with_capacity(conditions.len());
+    for when in conditions {
+        let cond = match &operand {
+            Some(op) => Expr::binary(BinaryOperator::Eq, op.clone(), when.condition.bind(binder)?),
+            None => when.condition.bind(binder)?,
+        };
+        branches.push((cond, when.result.bind(binder)?));
+    }
+    let else_result = else_result
+        .as_deref()
+        .map(|e| e.bind(binder))
+        .transpose()?
+        .map(Box::new);
+    Ok(Expr::Case {
+        branches,
+        else_result,
     })
 }
 
