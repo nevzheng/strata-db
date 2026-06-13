@@ -1138,6 +1138,7 @@ dependencies = [
  "fastbloom",
  "itertools 0.14.0",
  "journal",
+ "pager",
  "tempfile",
  "thiserror",
 ]

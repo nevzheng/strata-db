@@ -37,6 +37,9 @@ pub use heap::{Heap, PageTuples, TupleMut, TupleRef, TupleView};
 pub use journal::{PageJournal, PageOp};
 pub use loc::TupleLoc;
 pub use page::{HEADER_LEN, PAGE_SIZE, PageHeader, TuplePage, TuplePageMut, read_text, write_text};
+pub use vfs::codec::{
+    Decode, DecodeError, Encode, get_bytes, get_u8, get_u16, get_u32, get_u64, put_bytes, take,
+};
 pub use vfs::{BLOCK_SIZE, FileVfs, MemVfs, Vfs};
 
 /// Logical identity of a page — stable, unique, and never reused (see the
