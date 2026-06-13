@@ -7,12 +7,10 @@
 
 mod header;
 pub mod text;
-mod tuple;
 pub mod types;
 
 pub use header::{HEADER_LEN, PageHeader, finalize_checksum, verify_checksum};
 pub use text::{read_text, write_text};
-pub use tuple::{TuplePage, TuplePageMut};
 
 /// The size of a page — identical to the block size, since a page *is* a block
 /// with meaning layered on.

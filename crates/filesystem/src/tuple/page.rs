@@ -20,10 +20,10 @@
 //! concern, encoded by the engine and passed in. (The doc's dedicated VarLen
 //! section is an in-place-varchar optimization folded into the opaque blob for
 //! v1; `TEXT` is just a [`PageId`](crate::PageId) pointer inside the blob,
-//! resolved against a [`TextPage`](super::text).)
+//! resolved against a [`TextPage`](crate::page::text).)
 
-use super::header::{HEADER_LEN, PageHeader};
-use super::types::TUPLE_PAGE;
+use crate::page::{HEADER_LEN, PageHeader};
+use crate::page::types::TUPLE_PAGE;
 use crate::error::PageError;
 use crate::{PAGE_SIZE, Result};
 
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn wrong_type_is_rejected() {
         let mut buf = vec![0u8; PAGE_SIZE];
-        PageHeader::new(super::super::types::TEXT_PAGE, 1).write(&mut buf);
+        PageHeader::new(crate::page::types::TEXT_PAGE, 1).write(&mut buf);
         assert!(matches!(
             TuplePage::open(&buf),
             Err(PageError::BadPageType { .. })

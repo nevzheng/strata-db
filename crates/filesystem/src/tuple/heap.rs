@@ -17,7 +17,7 @@
 use std::cell::{Cell, Ref, RefMut};
 
 use crate::error::PageError;
-use crate::page::{TuplePage, TuplePageMut};
+use super::page::{TuplePage, TuplePageMut};
 use crate::{PageCache, PageId, ReadPage, Result, TupleLoc, Vfs, WritePage};
 
 /// A heap of tuples over a page cache.
