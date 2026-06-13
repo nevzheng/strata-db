@@ -165,7 +165,7 @@ fn bind_column(col: &ColumnDef) -> Result<Field, QueryError> {
 
 /// Map a SQL type to one of the engine's [`LogicalType`]s. Unknown or
 /// unsupported types surface as `unsupported`.
-fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
+pub(super) fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
     Ok(match ty {
         DataType::Bool | DataType::Boolean => LogicalType::Bool,
         DataType::SmallInt(_) | DataType::Int2(_) => LogicalType::Int16,

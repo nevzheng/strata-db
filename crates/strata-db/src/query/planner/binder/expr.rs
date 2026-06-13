@@ -107,6 +107,12 @@ impl BindNode for AstExpr {
                 else_result,
                 ..
             } => bind_case(operand, conditions, else_result, binder),
+            AstExpr::Cast {
+                expr, data_type, ..
+            } => Ok(Expr::Cast {
+                input: Box::new(expr.bind(binder)?),
+                target: super::ddl::bind_data_type(data_type)?,
+            }),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
