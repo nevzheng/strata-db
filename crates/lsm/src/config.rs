@@ -39,12 +39,17 @@ impl BloomConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct PageConfig {
     pub page_size_bytes: usize,
+    /// Block-index entries per header shard. Once a table has more blocks than
+    /// this, its index is partitioned into child headers (the root becomes a
+    /// directory) instead of living inline in one unbounded root page.
+    pub blocks_per_chunk: usize,
 }
 
 impl Default for PageConfig {
     fn default() -> Self {
         Self {
             page_size_bytes: 4 * KIB,
+            blocks_per_chunk: 256,
         }
     }
 }

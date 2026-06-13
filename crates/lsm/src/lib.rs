@@ -242,7 +242,7 @@ impl<M: MemStore> Lsm<M> {
                             continue;
                         }
                     };
-                    if !overlaps(&table.header().range, &start, &end) {
+                    if !overlaps(table.range(), &start, &end) {
                         continue;
                     }
                     sources.push(table.scan((start.clone(), end.clone()), max_seq, &self.cache));
