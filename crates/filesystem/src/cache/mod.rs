@@ -81,7 +81,7 @@ impl<V: BlockStore> Inner<V> {
     /// frame is clean and absent from the page table.
     ///
     /// No-steal: a dirty page is never written to the block store here — only in
-    /// [`flush`](Inner::flush), behind the WAL. So we evict a clean frame, and if
+    /// [`flush`](Inner::flush), behind the journal. So we evict a clean frame, and if
     /// none is available we flush first to clean the dirty ones.
     fn victim_frame(&mut self) -> Result<FrameId> {
         if let Some(f) = self.free.pop() {
@@ -204,7 +204,7 @@ impl<V: BlockStore> Inner<V> {
         frame.dirty = true;
     }
 
-    /// Commit all dirty pages durably. With a journal this is a WAL commit:
+    /// Commit all dirty pages durably. This is the journal commit point:
     /// log every after-image plus a `Commit` marker (the durability point),
     /// then write the pages to the block store, sync, and discard the now-redundant log.
     /// A crash before the `Commit` marker rolls the whole flush back on recovery.

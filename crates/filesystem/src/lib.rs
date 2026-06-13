@@ -1,35 +1,39 @@
-//! `filesystem` — strata-db's storage foundation: the block storage and
-//! the primitives that sit on it. Everything between the backing file and the
-//! rest of the engine lives here, exposed as a small set of nouns:
+//! `filesystem` — strata-db's storage foundation: pure storage *mechanism*
+//! (store and fetch bytes), never query *policy*. Everything between the backing
+//! file and the rest of the engine lives here, organized as a small set of
+//! capability modules. Reach for the one that matches what you're doing:
 //!
-//! - **`block`** ([`BlockStore`], [`FileBlockStore`], [`MemBlockStore`], [`journal`]) — raw, fixed-size
-//!   *block* I/O over a backing store, plus the redo [`journal`] that makes its
-//!   writes durable. Nothing above it touches `std::fs`.
-//! - **Codec** ([`Encode`], [`Decode`]) — the on-disk serialization vocabulary,
-//!   shared by page types and the LSM. A sibling of the BlockStore, not part of it.
-//! - **`cache`** — the generic read-through [`Cache`] (memoizes immutable values,
-//!   hands out owned handles) and the [`PageCache`] buffer pool (the mutable,
-//!   pinned, journaled read/write path). Eviction [`policies`] live alongside.
-//! - **`page`** ([`PageHeader`], …) — a block reinterpreted: a 21-byte
-//!   self-describing header (magic, type, CRC32c) plus a typed payload.
-//! - **`tuple`** ([`TuplePage`], [`Heap`], [`TupleLoc`]) — the tuple record
-//!   layer: the slotted page format, the heap access method over it, and the
-//!   address an index stores. The one place with database (record) semantics.
+//! - [`memory`] — [`MemoryPool`] hands out [`Slab`]s (raw, owned byte spans)
+//!   under one global cap. The **execution engine** asks for a `Slab`, imposes a
+//!   view on it (scratch space, a hash table, a heap), and drops it when done.
+//! - [`tuple`] — the record layer: the [`Heap`] access method (open one with
+//!   [`Heap::open`](tuple::Heap::open) — it owns its block store and page cache
+//!   internally), slotted [`TuplePage`]s, and the [`TupleLoc`] an index stores.
+//!   The **storage engine** works with tuples here.
+//! - [`codec`] — the [`Encode`]/[`Decode`] vocabulary. Exposed for whoever owns
+//!   an on-disk format (page types, the LSM); reach for it *when* you serialize.
+//! - [`cache`] — the generic read-through [`Cache`] (immutable memo, owned
+//!   handles) and the [`PageCache`] buffer pool (mutable, pinned, journaled).
+//!   Eviction [`policies`](cache::policies) live alongside. The LSM shares the
+//!   `Cache`; the heap is built on the `PageCache`.
+//! - [`block`] — the [`BlockStore`] device (fixed-size block I/O over a file or
+//!   memory) and its redo [`BlockJournal`]. The bedrock the caches sit on.
+//! - [`page`] — a block reinterpreted as a self-describing typed page.
 //!
-//! The read-through [`Cache`] is the substrate both the engine and the LSM share
-//! for immutable blocks; the [`PageCache`] buffer pool stays the mutable-page
-//! path. A `Buffer` primitive (memory/placement) and a `ScanBuffer` are the next
-//! refactor — both will sit under these caches.
+//! `cache`, `block`, and `page` are plumbing the first three sit on — public so
+//! consumers can wire them, but not the usual entry point. [`MemoryPool`] /
+//! [`Slab`] are the memory primitive (once sketched as `Buffer`); a `ScanBuffer`
+//! adapter and wiring the caches onto the pool are the next steps.
 //!
 //! The v1 caches are single-threaded (`Rc`/`RefCell`); concurrency is deferred.
 
-mod block;
-mod cache;
-mod codec;
+pub mod block;
+pub mod cache;
+pub mod codec;
 mod error;
-mod memory;
+pub mod memory;
 pub mod page;
-mod tuple;
+pub mod tuple;
 
 // Block storage — raw block I/O plus the redo journal that makes its writes
 // durable.

@@ -92,7 +92,7 @@ impl BlockJournal {
     }
 }
 
-/// Frames [`JournalOp`]s into journal records.
+/// The codec that frames [`JournalOp`]s into journal records.
 #[derive(Debug, Default, Clone, Copy)]
 struct PageOpCodec;
 

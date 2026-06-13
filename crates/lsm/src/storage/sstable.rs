@@ -17,7 +17,8 @@
 //! ```text
 //! | block 0 | (pad) | block 1 | ... | child 0 | child 1 | ... | root | root_len (4B) |
 //! ```
-//! (the child shards are absent when the index is inline.)
+//! The `child` shards are present only for large (sharded) tables; an inline
+//! index has none.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
