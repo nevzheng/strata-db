@@ -63,11 +63,13 @@ flowchart TB
     sapi["Storage API"]
     lsm["LSM tree · index"]
     heap["tuple heap · rows"]
-    sst["SSTable block cache"]
-    pc["page cache + VFS"]
+    sst["SSTable caches · headers + blocks"]
+    pc["page cache · buffer pool"]
+    bs["BlockStore · File / Mem"]
+    mem["MemoryPool → Slab · raw memory"]
     tapi --> sapi
     sapi --> lsm --> sst
-    sapi --> heap --> pc
+    sapi --> heap --> pc --> bs
   end
 
   os[("OS file storage")]
@@ -76,7 +78,9 @@ flowchart TB
   volcano --> tapi
   catalog --> tapi
   sst --> os
-  pc --> os
+  bs --> os
+  mem -.-> sst
+  mem -.-> pc
 
   classDef future fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4;
   class compiled future
@@ -97,10 +101,11 @@ flowchart TB
 | **Row / key encoding** | `strata-db` | Turns typed tuples into bytes, with order-preserving keys so range scans fall out of the sort order. |
 | **Table API** | `strata-db` | Row-level insert / get / scan / delete over the storage engine. |
 | **Storage API** | `strata-store` | Composes the LSM index (key → location) over the tuple heap (the bytes) into one store. |
-| **LSM tree** | `lsm` | Journaled memtable that seals into immutable, bloom-filtered SSTables, tracked by a manifest for recovery; own SSTable block cache. |
-| **Tuple heap + page cache** | `pager` | Fixed-size pages over the VFS, with pinning, dirty writeback, and LRU-K eviction; tuples addressed by a compact location. |
-| **Journal (WAL)** | `journal` | A CRC-framed, fsync'd append-only log with replay. Backs both page mutations and the LSM memtable. |
-| **VFS** | `pager` | The bedrock: an abstract block store with file (`FileVfs`) and in-memory (`MemVfs`) backends. |
+| **LSM tree** | `lsm` | Journaled memtable that seals into immutable, bloom-filtered SSTables, tracked by a manifest for recovery. Reads fault SSTable headers — a 2-level partitioned block index — and data blocks through a shared read-through cache. |
+| **Tuple heap + page cache** | `filesystem` | Fixed-size pages over the `BlockStore`, with pinning, dirty writeback, and LRU-K eviction; tuples addressed by a compact location. |
+| **Block storage** | `filesystem` | The bedrock: a `BlockStore` trait with file (`FileBlockStore`) and in-memory (`MemBlockStore`) backends, addressed by an opaque `BlockId`. |
+| **Memory** | `filesystem` | `MemoryPool` — the engine's allocator facade — hands out `Slab`s (raw byte spans) under one global cap; the caches and buffer pool are built to draw from it. |
+| **Journal** | `journal` | A CRC-framed, fsync'd append-only log with replay. Backs both page mutations (`BlockJournal`) and the LSM memtable. |
 
 ## Repository layout
 
@@ -110,7 +115,7 @@ The Cargo workspace mirrors the layered architecture:
 crates/      library crates
   journal      append-only crash-safe log
   lsm          LSM-tree index
-  pager        page cache + VFS (tuple heap)
+  filesystem   storage foundation: memory, block storage, caches, tuple heap
   strata-store storage backend (LSM index over the heap)
   strata-db    SQL engine (planner, executor, catalog)
 bins/        runnable binaries
