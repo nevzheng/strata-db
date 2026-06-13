@@ -150,3 +150,56 @@ SELECT LENGTH('Привет 🦀')
 # Wrong arity is an arity error.
 statement error
 SELECT REPEAT('x')
+
+# --- NULLIF / CONCAT / SUBSTRING / TRIM -------------------------------
+
+# NULLIF(5,5) is NULL — observed via COALESCE to avoid empty rendering.
+query T
+SELECT COALESCE(NULLIF(5, 5), -1)
+----
+-1
+
+query T
+SELECT NULLIF(5, 6)
+----
+5
+
+query T
+SELECT CONCAT('a', 'b', 'c')
+----
+abc
+
+# CONCAT stringifies non-text args and skips NULL.
+query T
+SELECT CONCAT('id=', 7)
+----
+id=7
+
+query T
+SELECT SUBSTRING('hello' FROM 2 FOR 3)
+----
+ell
+
+query T
+SELECT TRIM('  hi  ')
+----
+hi
+
+query T
+SELECT TRIM(LEADING 'x' FROM 'xxhi')
+----
+hi
+
+# --- runtime unary minus on a column ----------------------------------
+
+statement ok
+CREATE TABLE strata.func.signed (id INT, v INT)
+
+statement ok
+INSERT INTO strata.func.signed VALUES (1, 7), (2, -3)
+
+query T
+SELECT -v FROM strata.func.signed
+----
+-7
+3

@@ -59,6 +59,19 @@ pub enum ScalarFunc {
     Upper,
     /// `LOWER(s)` — text lower-cased.
     Lower,
+    /// `NULLIF(a, b)` — `NULL` if `a = b`, else `a`.
+    Nullif,
+    /// `CONCAT(a, b, …)` — args stringified and joined; nulls skipped.
+    Concat,
+    /// `SUBSTRING(s, start, len)` — 1-indexed; the binder supplies
+    /// defaults (`start = 1`, `len = i64::MAX` for "to the end").
+    Substr,
+    /// `TRIM(BOTH chars FROM s)` — trim any of `chars` from both ends.
+    TrimBoth,
+    /// `TRIM(LEADING chars FROM s)`.
+    TrimLeading,
+    /// `TRIM(TRAILING chars FROM s)`.
+    TrimTrailing,
 }
 
 /// A scalar expression. Each variant is a "basic operation" carrying
@@ -89,6 +102,9 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    /// Arithmetic negation (`-x`), evaluated per row. (Distinct from
+    /// [`Expr::Not`], which is logical negation.)
+    Neg { input: Box<Expr> },
 }
 
 impl Expr {
@@ -157,7 +173,24 @@ impl Expr {
                 pattern,
                 negated,
             } => eval_like(expr.eval(tuple)?, pattern.eval(tuple)?, *negated),
+            Expr::Neg { input } => eval_neg(input.eval(tuple)?),
         }
+    }
+}
+
+/// Arithmetic negation. `NULL` propagates; `i*::MIN` overflows to a type
+/// error; non-numeric values are a type error.
+fn eval_neg(v: Value) -> Result<Value, QueryError> {
+    let overflow = || QueryError::type_error("negation out of range");
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Int16(n) => n.checked_neg().map(Value::Int16).ok_or_else(overflow),
+        Value::Int32(n) => n.checked_neg().map(Value::Int32).ok_or_else(overflow),
+        Value::Int64(n) => n.checked_neg().map(Value::Int64).ok_or_else(overflow),
+        Value::Float32(f) => Ok(Value::Float32(-f)),
+        Value::Float64(f) => Ok(Value::Float64(-f)),
+        Value::Numeric(d) => Ok(Value::Numeric(-d)),
+        other => Err(QueryError::type_error(format!("cannot negate {other:?}"))),
     }
 }
 
@@ -220,7 +253,115 @@ fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, Qu
         ScalarFunc::Repeat => eval_repeat(args[0].eval(tuple)?, args[1].eval(tuple)?),
         ScalarFunc::Upper => eval_case(args[0].eval(tuple)?, true),
         ScalarFunc::Lower => eval_case(args[0].eval(tuple)?, false),
+        ScalarFunc::Nullif => {
+            let a = args[0].eval(tuple)?;
+            let b = args[1].eval(tuple)?;
+            Ok(if values_eq(&a, &b) { Value::Null } else { a })
+        }
+        ScalarFunc::Concat => eval_concat(args, tuple),
+        ScalarFunc::Substr => eval_substr(
+            args[0].eval(tuple)?,
+            args[1].eval(tuple)?,
+            args[2].eval(tuple)?,
+        ),
+        ScalarFunc::TrimBoth => eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, true, true),
+        ScalarFunc::TrimLeading => {
+            eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, true, false)
+        }
+        ScalarFunc::TrimTrailing => {
+            eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, false, true)
+        }
     }
+}
+
+/// `CONCAT(a, b, …)` — stringify each non-null argument and join.
+fn eval_concat(args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
+    let mut out = String::new();
+    for arg in args {
+        match arg.eval(tuple)? {
+            Value::Null => {} // Postgres CONCAT skips nulls.
+            v => out.push_str(&concat_str(&v)?),
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+/// Render a value as text for `CONCAT` / `||`. Bytes and JSON aren't
+/// supported here yet.
+fn concat_str(v: &Value) -> Result<String, QueryError> {
+    Ok(match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::Int16(n) => n.to_string(),
+        Value::Int32(n) => n.to_string(),
+        Value::Int64(n) => n.to_string(),
+        Value::Float32(f) => f.to_string(),
+        Value::Float64(f) => f.to_string(),
+        Value::Numeric(d) => d.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Date(d) => crate::storage::temporal::format_date(*d),
+        Value::Timestamp(t) => crate::storage::temporal::format_timestamptz(*t),
+        other => {
+            return Err(QueryError::type_error(format!(
+                "cannot concatenate {other:?}"
+            )));
+        }
+    })
+}
+
+/// `SUBSTRING(s FROM start FOR len)` — 1-indexed; out-of-range bounds
+/// clamp (no error). The binder defaults `start`/`len`, so all three
+/// arrive present. `NULL` in any argument propagates.
+fn eval_substr(s: Value, from: Value, len: Value) -> Result<Value, QueryError> {
+    if matches!(s, Value::Null) || matches!(from, Value::Null) || matches!(len, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(text) = s else {
+        return Err(QueryError::type_error("SUBSTRING expects a text value"));
+    };
+    let start = as_i64(&from)
+        .ok_or_else(|| QueryError::type_error("SUBSTRING start must be an integer"))?;
+    let length = as_i64(&len)
+        .ok_or_else(|| QueryError::type_error("SUBSTRING length must be an integer"))?;
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len() as i64;
+    // The substring covers the 1-indexed half-open range [start, start+len).
+    let from_idx = start.max(1);
+    let to_idx = start.saturating_add(length).min(n + 1);
+    if to_idx <= from_idx {
+        return Ok(Value::Text(String::new()));
+    }
+    Ok(Value::Text(
+        chars[(from_idx - 1) as usize..(to_idx - 1) as usize]
+            .iter()
+            .collect(),
+    ))
+}
+
+/// `TRIM` — strip any character in `chars` from the requested side(s).
+/// `NULL` in either argument propagates.
+fn eval_trim(s: Value, chars: Value, leading: bool, trailing: bool) -> Result<Value, QueryError> {
+    if matches!(s, Value::Null) || matches!(chars, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Value::Text(text), Value::Text(set)) = (s, chars) else {
+        return Err(QueryError::type_error("TRIM expects text values"));
+    };
+    let set: Vec<char> = set.chars().collect();
+    let cs: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    let mut end = cs.len();
+    if leading {
+        while start < end && set.contains(&cs[start]) {
+            start += 1;
+        }
+    }
+    if trailing {
+        while end > start && set.contains(&cs[end - 1]) {
+            end -= 1;
+        }
+    }
+    Ok(Value::Text(cs[start..end].iter().collect()))
 }
 
 #[derive(Clone, Copy)]
@@ -833,6 +974,73 @@ mod tests {
             negated: false,
         };
         assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn eval_neg_on_column() {
+        // -x where x is a column (the case constant-folding couldn't do).
+        let e = Expr::Neg {
+            input: Box::new(Expr::column(0)),
+        };
+        assert_eq!(e.eval(&t(vec![Value::Int32(5)])).unwrap(), Value::Int32(-5));
+        assert_eq!(e.eval(&t(vec![Value::Null])).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn eval_nullif() {
+        let nf = |a, b| {
+            call(ScalarFunc::Nullif, vec![Expr::lit(a), Expr::lit(b)])
+                .eval(&t(vec![]))
+                .unwrap()
+        };
+        assert_eq!(nf(Value::Int64(5), Value::Int64(5)), Value::Null);
+        assert_eq!(nf(Value::Int64(5), Value::Int64(6)), Value::Int64(5));
+    }
+
+    #[test]
+    fn eval_concat_stringifies_and_skips_null() {
+        let e = call(
+            ScalarFunc::Concat,
+            vec![Expr::lit("a"), Expr::lit(Value::Null), Expr::lit(1i64)],
+        );
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Text("a1".into()));
+    }
+
+    #[test]
+    fn eval_substring_one_indexed() {
+        // SUBSTRING('hello' FROM 2 FOR 3) -> 'ell'
+        let e = call(
+            ScalarFunc::Substr,
+            vec![Expr::lit("hello"), Expr::lit(2i64), Expr::lit(3i64)],
+        );
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Text("ell".into()));
+        // No length (i64::MAX sentinel) -> to the end.
+        let e2 = call(
+            ScalarFunc::Substr,
+            vec![Expr::lit("hello"), Expr::lit(3i64), Expr::lit(i64::MAX)],
+        );
+        assert_eq!(e2.eval(&t(vec![])).unwrap(), Value::Text("llo".into()));
+    }
+
+    #[test]
+    fn eval_trim_sides() {
+        let trim = |f, s, c| {
+            call(f, vec![Expr::lit(s), Expr::lit(c)])
+                .eval(&t(vec![]))
+                .unwrap()
+        };
+        assert_eq!(
+            trim(ScalarFunc::TrimBoth, "xxhixx", "x"),
+            Value::Text("hi".into())
+        );
+        assert_eq!(
+            trim(ScalarFunc::TrimLeading, "xxhixx", "x"),
+            Value::Text("hixx".into())
+        );
+        assert_eq!(
+            trim(ScalarFunc::TrimTrailing, "  hi  ", " "),
+            Value::Text("  hi".into())
+        );
     }
 
     #[test]

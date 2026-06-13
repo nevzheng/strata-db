@@ -3,8 +3,8 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, CeilFloorKind, DataType, DateTimeField, Expr as AstExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, TypedString,
-    UnaryOperator, Value as AstValue,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, TrimWhereField,
+    TypedString, UnaryOperator, Value as AstValue,
 };
 
 use rust_decimal::Decimal;
@@ -34,10 +34,11 @@ impl BindNode for AstExpr {
                 UnaryOperator::Not => Ok(Expr::Not {
                     input: Box::new(expr.bind(binder)?),
                 }),
-                // Unary minus folds into a constant integer literal — we
-                // have no runtime arithmetic operator to lower it to, so a
-                // non-constant operand is unsupported.
-                UnaryOperator::Minus => negate_literal(expr, binder),
+                // Runtime arithmetic negation — works on any operand,
+                // not just constant literals.
+                UnaryOperator::Minus => Ok(Expr::Neg {
+                    input: Box::new(expr.bind(binder)?),
+                }),
                 other => Err(QueryError::unsupported(format!("unary op: {other:?}"))),
             },
             AstExpr::Nested(inner) => inner.bind(binder),
@@ -87,6 +88,19 @@ impl BindNode for AstExpr {
                     negated: *negated,
                 })
             }
+            // SUBSTRING / TRIM are their own AST nodes (not `Function`).
+            AstExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => bind_substring(expr, substring_from, substring_for, binder),
+            AstExpr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => bind_trim(expr, trim_where, trim_what, trim_characters, binder),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -159,6 +173,58 @@ fn bind_in_list(
     })
 }
 
+/// `SUBSTRING(s [FROM start] [FOR len])` → a 3-arg `Substr` call with the
+/// SQL defaults filled in: `start = 1`, `len = i64::MAX` ("to the end").
+fn bind_substring(
+    expr: &AstExpr,
+    from: &Option<Box<AstExpr>>,
+    for_: &Option<Box<AstExpr>>,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    let s = expr.bind(binder)?;
+    let start = match from {
+        Some(e) => e.bind(binder)?,
+        None => Expr::lit(1i64),
+    };
+    let len = match for_ {
+        Some(e) => e.bind(binder)?,
+        None => Expr::lit(i64::MAX),
+    };
+    Ok(Expr::Call {
+        func: ScalarFunc::Substr,
+        args: vec![s, start, len],
+    })
+}
+
+/// `TRIM([BOTH|LEADING|TRAILING] [chars] FROM s)` → a 2-arg trim call,
+/// defaulting the side to BOTH and the trim set to a single space. The
+/// dialect-specific `TRIM(s, chars)` characters list isn't supported yet.
+fn bind_trim(
+    expr: &AstExpr,
+    trim_where: &Option<TrimWhereField>,
+    trim_what: &Option<Box<AstExpr>>,
+    trim_characters: &Option<Vec<AstExpr>>,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    if trim_characters.is_some() {
+        return Err(QueryError::unsupported("TRIM(value, characters)"));
+    }
+    let func = match trim_where {
+        None | Some(TrimWhereField::Both) => ScalarFunc::TrimBoth,
+        Some(TrimWhereField::Leading) => ScalarFunc::TrimLeading,
+        Some(TrimWhereField::Trailing) => ScalarFunc::TrimTrailing,
+    };
+    let s = expr.bind(binder)?;
+    let chars = match trim_what {
+        Some(e) => e.bind(binder)?,
+        None => Expr::lit(" "),
+    };
+    Ok(Expr::Call {
+        func,
+        args: vec![s, chars],
+    })
+}
+
 /// Bind a function call to an [`Expr::Call`]. Only plain scalar calls are
 /// supported — no `FILTER`, `OVER` (window), `DISTINCT`/`ORDER BY` in the
 /// argument list, or named/wildcard arguments.
@@ -215,6 +281,11 @@ fn resolve_scalar_func(name: &str, argc: usize) -> Result<ScalarFunc, QueryError
         // not here. ROUND(x, n) (round to n places) isn't supported yet.
         ("ROUND", 1) => Ok(ScalarFunc::Round),
         ("COALESCE", n) if n >= 1 => Ok(ScalarFunc::Coalesce),
+        ("NULLIF", 2) => Ok(ScalarFunc::Nullif),
+        ("NULLIF", n) => Err(QueryError::type_error(format!(
+            "NULLIF takes exactly 2 arguments, got {n}"
+        ))),
+        ("CONCAT", _) => Ok(ScalarFunc::Concat),
         ("LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH", 1) => Ok(ScalarFunc::Length),
         ("REPEAT", 2) => Ok(ScalarFunc::Repeat),
         ("UPPER" | "UCASE", 1) => Ok(ScalarFunc::Upper),
@@ -282,34 +353,6 @@ fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
         }
         other => Err(QueryError::unsupported(format!("typed literal: {other:?}"))),
     }
-}
-
-/// Bind unary minus by negating a constant numeric literal. Only literals
-/// are foldable today; anything else (a column reference) is unsupported
-/// until we grow an arithmetic operator. `i*::MIN` has no positive
-/// magnitude and overflows on negation — that surfaces as a type error
-/// rather than a panic.
-fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryError> {
-    let overflow = || QueryError::type_error("integer literal out of range");
-    let value = match expr.bind(binder)? {
-        Expr::Literal {
-            value: Value::Int16(n),
-        } => Value::Int16(n.checked_neg().ok_or_else(overflow)?),
-        Expr::Literal {
-            value: Value::Int32(n),
-        } => Value::Int32(n.checked_neg().ok_or_else(overflow)?),
-        Expr::Literal {
-            value: Value::Int64(n),
-        } => Value::Int64(n.checked_neg().ok_or_else(overflow)?),
-        Expr::Literal {
-            value: Value::Float64(f),
-        } => Value::Float64(-f),
-        Expr::Literal {
-            value: Value::Numeric(d),
-        } => Value::Numeric(-d),
-        other => return Err(QueryError::unsupported(format!("unary minus on {other:?}"))),
-    };
-    Ok(Expr::Literal { value })
 }
 
 fn bind_value(v: &AstValue) -> Result<Value, QueryError> {
