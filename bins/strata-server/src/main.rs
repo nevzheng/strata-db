@@ -218,6 +218,7 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Text(s) => Some(s.clone()),
         Value::Bytes(b) => Some(format!("\\x{}", hex_encode(b))),
         Value::Json(j) => Some(j.to_string()),
+        Value::Date(d) => Some(strata_db::storage::temporal::format_date(*d)),
     }
 }
 

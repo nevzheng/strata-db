@@ -16,6 +16,11 @@
 //! | `Text`  | `String`     | `TEXT`           |
 //! | `Bytes` | `Vec<u8>`    | `BYTEA`          |
 //! | `Json`  | `serde_json` | `JSON` / `JSONB` |
+//! | `Date`  | `i32`        | `DATE`           |
+//!
+//! `Date` is a count of days since the Unix epoch (`1970-01-01`, UTC) —
+//! no time, no timezone. It shares `i32`'s byte encoding; the calendar
+//! conversions live in [`crate::storage::temporal`].
 //!
 //! Each value has two byte encodings, dispatched on `Value` and backed
 //! by the two codec traits in [`crate::storage::codec`]:
@@ -38,6 +43,7 @@ pub enum LogicalType {
     Text,
     Bytes,
     Json,
+    Date,
 }
 
 /// A single runtime datum carrying both its type tag and the data.
@@ -53,6 +59,9 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
+    /// Days since the Unix epoch (`1970-01-01`, UTC). See
+    /// [`crate::storage::temporal`] for the calendar conversions.
+    Date(i32),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is

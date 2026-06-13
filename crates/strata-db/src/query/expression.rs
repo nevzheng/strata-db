@@ -180,6 +180,9 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
     match (lhs, rhs) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
+        // Dates order by their day count; they don't coerce with
+        // integers (`date < 5` is a type error, not a silent compare).
+        (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),
@@ -279,6 +282,27 @@ mod tests {
         // bool vs int: not coercible, so a type error.
         let expr = Expr::binary(BinaryOperator::Lt, Expr::lit(true), Expr::lit(1i32));
         assert!(matches!(expr.eval(&t(vec![])), Err(QueryError::Type(_))));
+    }
+
+    #[test]
+    fn eval_date_comparison() {
+        // Two dates compare by their day count; no integer coercion.
+        let lhs = Expr::lit(Value::Date(20617)); // 2026-06-13
+        let rhs = Expr::lit(Value::Date(10957)); // 2000-01-01
+        let gt = Expr::binary(BinaryOperator::Gt, lhs.clone(), rhs.clone());
+        assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+        let eq = Expr::binary(BinaryOperator::Eq, lhs.clone(), lhs);
+        assert_eq!(eq.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_date_vs_integer_is_type_error() {
+        let cmp = Expr::binary(
+            BinaryOperator::Lt,
+            Expr::lit(Value::Date(1)),
+            Expr::lit(5i64),
+        );
+        assert!(matches!(cmp.eval(&t(vec![])), Err(QueryError::Type(_))));
     }
 
     #[test]

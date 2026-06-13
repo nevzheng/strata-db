@@ -18,8 +18,13 @@
 //!
 //! Conventions:
 //!
-//! - Integers: little-endian, fixed width. Same bytes in both codecs.
-//! - Bool: one byte, `0x00` / `0x01`. Same in both codecs.
+//! - Integers: fixed width. `ValueCodec` is little-endian (in-row decode
+//!   is positional, so byte order is irrelevant). `KeyCodec` is
+//!   **order-preserving**: the sign bit is flipped and the bytes are
+//!   big-endian, so lex byte-sort matches signed numeric order
+//!   (negatives before positives). The two codecs therefore differ for
+//!   integers.
+//! - Bool: one byte, `0x00` / `0x01`. Same in both codecs (already sorts).
 //! - Text / Bytes / Json: length-prefixed by `ValueCodec`, raw by
 //!   `KeyCodec`.
 //! - `Value::Null` is **not** encoded by either codec — nulls are
@@ -201,9 +206,11 @@ impl ValueCodec for serde_json::Value {
 
 // --- KeyCodec impls ---
 //
-// Fixed-width types reuse the value encoding byte-for-byte. Variable-
-// length types drop the length prefix so lex byte-sort lines up with
-// content sort.
+// Signed integers are encoded order-preserving: flip the sign bit (so
+// two's-complement negatives sort before positives) and emit big-endian
+// (so the most significant byte compares first). Lex byte-sort then
+// matches numeric order. Variable-length types drop the length prefix so
+// lex byte-sort lines up with content sort.
 
 impl KeyCodec for bool {
     fn encode_key(&self, buf: &mut Vec<u8>) {
@@ -213,19 +220,19 @@ impl KeyCodec for bool {
 
 impl KeyCodec for i16 {
     fn encode_key(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_le_bytes());
+        buf.extend_from_slice(&((*self as u16) ^ (1 << 15)).to_be_bytes());
     }
 }
 
 impl KeyCodec for i32 {
     fn encode_key(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_le_bytes());
+        buf.extend_from_slice(&((*self as u32) ^ (1 << 31)).to_be_bytes());
     }
 }
 
 impl KeyCodec for i64 {
     fn encode_key(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_le_bytes());
+        buf.extend_from_slice(&((*self as u64) ^ (1 << 63)).to_be_bytes());
     }
 }
 
@@ -260,6 +267,8 @@ impl Value {
             Value::Text(s) => s.encoded_size(),
             Value::Bytes(b) => b.encoded_size(),
             Value::Json(j) => j.encoded_size(),
+            // Date rides on i32's fixed-width encoding.
+            Value::Date(n) => n.encoded_size(),
         }
     }
 
@@ -277,6 +286,7 @@ impl Value {
             Value::Text(s) => s.encode(buf),
             Value::Bytes(b) => b.encode(buf),
             Value::Json(j) => j.encode(buf),
+            Value::Date(n) => n.encode(buf),
         }
     }
 
@@ -313,6 +323,10 @@ impl Value {
                 j.encode_key(buf);
                 Ok(())
             }
+            Value::Date(n) => {
+                n.encode_key(buf);
+                Ok(())
+            }
         }
     }
 
@@ -327,6 +341,7 @@ impl Value {
             LogicalType::Text => Ok(Value::Text(String::decode(buf)?)),
             LogicalType::Bytes => Ok(Value::Bytes(<Vec<u8>>::decode(buf)?)),
             LogicalType::Json => Ok(Value::Json(serde_json::Value::decode(buf)?)),
+            LogicalType::Date => Ok(Value::Date(i32::decode(buf)?)),
         }
     }
 }
@@ -460,6 +475,44 @@ mod tests {
         let mut cursor: &[u8] = &buf;
         let decoded = Value::decode(LogicalType::Json, &mut cursor).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Key encoding must be order-preserving: for ascending values, the
+    /// encoded byte vectors must be lexicographically ascending too —
+    /// crucially across the negative/positive boundary.
+    fn assert_key_order_preserving<T: KeyCodec + Copy>(ascending: &[T]) {
+        let keys: Vec<Vec<u8>> = ascending
+            .iter()
+            .map(|v| {
+                let mut b = Vec::new();
+                v.encode_key(&mut b);
+                b
+            })
+            .collect();
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1], "keys not ascending: {:?}", pair);
+        }
+    }
+
+    #[test]
+    fn integer_keys_sort_in_numeric_order() {
+        assert_key_order_preserving(&[i16::MIN, -100, -1, 0, 1, 100, i16::MAX]);
+        assert_key_order_preserving(&[i32::MIN, -100, -1, 0, 1, 100, i32::MAX]);
+        assert_key_order_preserving(&[i64::MIN, -100, -1, 0, 1, 100, i64::MAX]);
+    }
+
+    #[test]
+    fn date_keys_sort_chronologically() {
+        // Date rides on i32's key codec, including pre-epoch (negative) days.
+        let mut prev: Option<Vec<u8>> = None;
+        for days in [-1000i32, -1, 0, 1, 20617] {
+            let mut buf = Vec::new();
+            Value::Date(days).encode_key(&mut buf).unwrap();
+            if let Some(p) = &prev {
+                assert!(*p < buf, "date keys not ascending at {days}");
+            }
+            prev = Some(buf);
+        }
     }
 
     #[test]

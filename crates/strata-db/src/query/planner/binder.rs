@@ -14,13 +14,14 @@ use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
     DataType, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery,
     SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Value as AstValue,
+    TableWithJoins, TypedString, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
 use crate::catalog::schema::Schema;
 use crate::catalog::{CatalogError, ResourceKind};
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
+use crate::storage::temporal;
 use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
 use super::super::expression::{BinaryOperator, Expr};
@@ -230,6 +231,7 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
             field.name.as_str()
         ))),
         Value::Bool(b) if matches!(field.ty, T::Bool) => Ok(Value::Bool(b)),
+        Value::Date(d) if matches!(field.ty, T::Date) => Ok(Value::Date(d)),
         Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
         Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
         Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),
@@ -382,6 +384,7 @@ fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
         }
         DataType::Bytea => LogicalType::Bytes,
         DataType::JSON | DataType::JSONB => LogicalType::Json,
+        DataType::Date => LogicalType::Date,
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }
@@ -551,12 +554,60 @@ impl BindNode for AstExpr {
                 UnaryOperator::Not => Ok(Expr::Not {
                     input: Box::new(expr.bind(binder)?),
                 }),
+                // Unary minus folds into a constant integer literal — we
+                // have no runtime arithmetic operator to lower it to, so a
+                // non-constant operand is unsupported.
+                UnaryOperator::Minus => negate_literal(expr, binder),
                 other => Err(QueryError::unsupported(format!("unary op: {other:?}"))),
             },
             AstExpr::Nested(inner) => inner.bind(binder),
+            AstExpr::TypedString(ts) => bind_typed_string(ts),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
+}
+
+/// Bind a typed string literal such as `DATE '2026-06-13'`. Only `DATE`
+/// is supported today; other temporal literals (`TIME`, `TIMESTAMP`) are
+/// rejected until those types land. The string is parsed and validated
+/// here, so a bad date fails at bind time.
+fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
+    match &ts.data_type {
+        DataType::Date => {
+            let s = ts
+                .value
+                .clone()
+                .into_string()
+                .ok_or_else(|| QueryError::type_error("DATE literal must be a string"))?;
+            let days = temporal::parse_date(&s).map_err(QueryError::type_error)?;
+            Ok(Expr::Literal {
+                value: Value::Date(days),
+            })
+        }
+        other => Err(QueryError::unsupported(format!("typed literal: {other:?}"))),
+    }
+}
+
+/// Bind unary minus by negating a constant integer literal. Only integer
+/// literals are foldable today; anything else (a column reference, a
+/// non-integer) is unsupported until we grow an arithmetic operator.
+/// `i*::MIN` has no positive magnitude and overflows on negation — that
+/// surfaces as a type error rather than a panic.
+fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryError> {
+    let overflow = || QueryError::type_error("integer literal out of range");
+    let value = match expr.bind(binder)? {
+        Expr::Literal {
+            value: Value::Int16(n),
+        } => Value::Int16(n.checked_neg().ok_or_else(overflow)?),
+        Expr::Literal {
+            value: Value::Int32(n),
+        } => Value::Int32(n.checked_neg().ok_or_else(overflow)?),
+        Expr::Literal {
+            value: Value::Int64(n),
+        } => Value::Int64(n.checked_neg().ok_or_else(overflow)?),
+        other => return Err(QueryError::unsupported(format!("unary minus on {other:?}"))),
+    };
+    Ok(Expr::Literal { value })
 }
 
 fn bind_value(v: &AstValue) -> Result<Value, QueryError> {
