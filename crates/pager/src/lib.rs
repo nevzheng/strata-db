@@ -31,7 +31,9 @@ mod loc;
 pub mod page;
 mod vfs;
 
-pub use cache::{EvictionPolicy, LruK, PageCache, ReadPage, WritePage};
+pub use cache::{
+    Budget, Cache, Clock, EvictionPolicy, Lfu, Lru, LruK, PageCache, ReadPage, Weight, WritePage,
+};
 pub use error::{PageError, Result};
 pub use heap::{Heap, PageTuples, TupleMut, TupleRef, TupleView};
 pub use journal::{PageJournal, PageOp};

@@ -17,15 +17,17 @@
 //! is a no-op placeholder.
 
 mod eviction;
+mod eviction_policies;
+mod memo;
 
-pub use eviction::{EvictionPolicy, LruK};
+pub use eviction::{EvictionPolicy, FrameId};
+pub use eviction_policies::{Clock, Lfu, Lru, LruK};
+pub use memo::{Budget, Cache, Weight};
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-
-use eviction::FrameId;
 
 use crate::error::PageError;
 use crate::journal::{PageJournal, PageOp};
@@ -69,7 +71,7 @@ struct Inner<V: Vfs> {
     frames: Vec<Frame>,
     table: HashMap<PageId, FrameId>,
     free: Vec<FrameId>,
-    policy: Box<dyn EvictionPolicy>,
+    policy: Box<dyn EvictionPolicy<FrameId>>,
     /// The redo journal. `None` disables journaling (ephemeral/in-memory
     /// stores); `flush` then just writes through to the VFS, with no crash
     /// atomicity beyond what the VFS itself provides.
@@ -271,12 +273,12 @@ impl<V: Vfs> PageCache<V> {
     /// A cache over `vfs` with a pool of `frames` slots and the default LRU-K
     /// (K=2) policy.
     pub fn new(vfs: V, frames: usize) -> Self {
-        Self::with_policy(vfs, frames, Box::new(LruK::new(2)))
+        Self::with_policy(vfs, frames, Box::new(LruK::<FrameId>::new(2)))
     }
 
     /// A cache with an explicit eviction policy — for benchmarking alternatives.
     /// Not journaled (see [`with_journal`](Self::with_journal)).
-    pub fn with_policy(vfs: V, frames: usize, policy: Box<dyn EvictionPolicy>) -> Self {
+    pub fn with_policy(vfs: V, frames: usize, policy: Box<dyn EvictionPolicy<FrameId>>) -> Self {
         Self::build(vfs, frames, policy, None)
     }
 
@@ -291,7 +293,7 @@ impl<V: Vfs> PageCache<V> {
         Ok(Self::build(
             vfs,
             frames,
-            Box::new(LruK::new(2)),
+            Box::new(LruK::<FrameId>::new(2)),
             Some(journal),
         ))
     }
@@ -299,7 +301,7 @@ impl<V: Vfs> PageCache<V> {
     fn build(
         vfs: V,
         frames: usize,
-        policy: Box<dyn EvictionPolicy>,
+        policy: Box<dyn EvictionPolicy<FrameId>>,
         journal: Option<PageJournal>,
     ) -> Self {
         assert!(frames >= 1, "page cache needs at least one frame");
