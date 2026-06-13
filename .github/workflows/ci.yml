@@ -51,5 +51,5 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build -p strata-server
         timeout-minutes: 10
-      - run: cargo run -p spec-test -- spec-test/spec
+      - run: cargo run -p spec-test -- crucible/spec-test/spec
         timeout-minutes: 5

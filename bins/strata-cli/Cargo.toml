@@ -3,9 +3,13 @@ name = "strata-cli"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "strata"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 reedline = "0.47"
-strata-db = { path = "../strata-db" }
+strata-db = { path = "../../crates/strata-db" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
