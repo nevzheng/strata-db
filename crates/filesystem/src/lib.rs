@@ -27,13 +27,17 @@ mod block;
 mod cache;
 mod codec;
 mod error;
+mod memory;
 pub mod page;
 mod tuple;
 
-// Virtual file system — raw block I/O plus the redo journal that makes its
-// writes durable.
+// Block storage — raw block I/O plus the redo journal that makes its writes
+// durable.
 pub use block::journal::{BlockJournal, JournalOp};
 pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
+
+// Memory — the allocator facade and the raw memory unit it hands out.
+pub use memory::{MemoryPool, OutOfMemory, Slab};
 
 // Codec — the on-disk serialization vocabulary (used by page types and the LSM).
 pub use codec::{
