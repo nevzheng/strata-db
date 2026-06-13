@@ -1,0 +1,88 @@
+# Predicate expressions: IS NULL / IS NOT NULL, LIKE / NOT LIKE,
+# IN / NOT IN, BETWEEN / NOT BETWEEN — including 3-valued-logic with NULL.
+#
+# Uses its own `strata.pred` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.pred
+
+statement ok
+CREATE TABLE strata.pred.items (id INT, name TEXT, qty INT)
+
+statement ok
+INSERT INTO strata.pred.items VALUES (1, 'apple', 10), (2, 'banana', 20), (3, 'cherry', NULL), (4, 'apricot', 5)
+
+# --- IS NULL / IS NOT NULL --------------------------------------------
+
+query T
+SELECT id FROM strata.pred.items WHERE qty IS NULL
+----
+3
+
+query T
+SELECT id FROM strata.pred.items WHERE qty IS NOT NULL
+----
+1
+2
+4
+
+# --- LIKE -------------------------------------------------------------
+
+query T
+SELECT id FROM strata.pred.items WHERE name LIKE 'ap%'
+----
+1
+4
+
+# `_` matches exactly one character.
+query T
+SELECT name FROM strata.pred.items WHERE name LIKE 'a__le'
+----
+apple
+
+query T
+SELECT id FROM strata.pred.items WHERE name NOT LIKE 'a%'
+----
+2
+3
+
+# LIKE is case-sensitive.
+query T
+SELECT id FROM strata.pred.items WHERE name LIKE 'AP%'
+----
+
+# --- IN ---------------------------------------------------------------
+
+query T
+SELECT id FROM strata.pred.items WHERE id IN (2, 4)
+----
+2
+4
+
+query T
+SELECT id FROM strata.pred.items WHERE id NOT IN (1, 2)
+----
+3
+4
+
+# A NULL in the list: matches resolve true; non-matches become NULL and
+# are dropped (so only the real match survives).
+query T
+SELECT id FROM strata.pred.items WHERE id IN (2, NULL)
+----
+2
+
+# --- BETWEEN ----------------------------------------------------------
+
+# cherry's qty is NULL → the comparison is NULL → excluded.
+query T
+SELECT id FROM strata.pred.items WHERE qty BETWEEN 5 AND 15
+----
+1
+4
+
+query T
+SELECT id FROM strata.pred.items WHERE id NOT BETWEEN 2 AND 3
+----
+1
+4

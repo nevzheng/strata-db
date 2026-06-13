@@ -79,6 +79,16 @@ pub enum Expr {
     Not { input: Box<Expr> },
     /// A built-in scalar function applied to its arguments.
     Call { func: ScalarFunc, args: Vec<Expr> },
+    /// `x IS NULL` / `x IS NOT NULL` (`negated`). Unlike comparisons,
+    /// this is total — it always returns `true`/`false`, never `NULL`.
+    IsNull { expr: Box<Expr>, negated: bool },
+    /// `s LIKE pattern` / `NOT LIKE` (`negated`). `%` matches any run of
+    /// characters, `_` matches one; `NULL` operands propagate.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
 }
 
 impl Expr {
@@ -138,8 +148,62 @@ impl Expr {
                 eval_binary(*op, l, r)
             }
             Expr::Call { func, args } => eval_call(*func, args, tuple),
+            Expr::IsNull { expr, negated } => {
+                let is_null = matches!(expr.eval(tuple)?, Value::Null);
+                Ok(Value::Bool(is_null ^ negated))
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => eval_like(expr.eval(tuple)?, pattern.eval(tuple)?, *negated),
         }
     }
+}
+
+/// `LIKE` evaluation: text vs text, `NULL` operands propagate, a
+/// non-text operand is a type error.
+fn eval_like(value: Value, pattern: Value, negated: bool) -> Result<Value, QueryError> {
+    match (value, pattern) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(s), Value::Text(p)) => Ok(Value::Bool(like_match(&s, &p) ^ negated)),
+        (l, r) => Err(QueryError::type_error(format!(
+            "LIKE expects text operands, got {l:?} / {r:?}"
+        ))),
+    }
+}
+
+/// SQL `LIKE` wildcard match: `%` matches any run of characters
+/// (including none), `_` matches exactly one. Everything else is literal.
+/// Two-pointer scan with backtracking on the last `%`.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ti, mut pi) = (0, 0);
+    // Position to resume from after the most recent `%`, if any.
+    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            // Mismatch: let the last `%` absorb one more character.
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `%`s in the pattern can match the empty string.
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
@@ -708,6 +772,67 @@ mod tests {
         assert_eq!(up.eval(&t(vec![])).unwrap(), Value::Text("HELLO".into()));
         let lo = call(ScalarFunc::Lower, vec![Expr::lit("Hello")]);
         assert_eq!(lo.eval(&t(vec![])).unwrap(), Value::Text("hello".into()));
+    }
+
+    fn is_null(expr: Expr, negated: bool) -> Expr {
+        Expr::IsNull {
+            expr: Box::new(expr),
+            negated,
+        }
+    }
+
+    #[test]
+    fn eval_is_null_is_total() {
+        // IS NULL never returns NULL — `NULL IS NULL` is true.
+        assert_eq!(
+            is_null(Expr::lit(Value::Null), false)
+                .eval(&t(vec![]))
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            is_null(Expr::lit(1i64), false).eval(&t(vec![])).unwrap(),
+            Value::Bool(false)
+        );
+        // IS NOT NULL
+        assert_eq!(
+            is_null(Expr::lit(1i64), true).eval(&t(vec![])).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    fn like(s: &str, p: &str, negated: bool) -> Expr {
+        Expr::Like {
+            expr: Box::new(Expr::lit(s)),
+            pattern: Box::new(Expr::lit(p)),
+            negated,
+        }
+    }
+
+    #[test]
+    fn eval_like_wildcards() {
+        let m = |s, p| like(s, p, false).eval(&t(vec![])).unwrap();
+        assert_eq!(m("hello", "h%o"), Value::Bool(true));
+        assert_eq!(m("hello", "h_llo"), Value::Bool(true));
+        assert_eq!(m("hello", "h_o"), Value::Bool(false));
+        assert_eq!(m("hello", "%"), Value::Bool(true));
+        assert_eq!(m("hello", "hello"), Value::Bool(true));
+        assert_eq!(m("hello", "Hello"), Value::Bool(false)); // case-sensitive
+        // NOT LIKE
+        assert_eq!(
+            like("hello", "x%", true).eval(&t(vec![])).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn eval_like_null_propagates() {
+        let e = Expr::Like {
+            expr: Box::new(Expr::lit(Value::Null)),
+            pattern: Box::new(Expr::lit("%")),
+            negated: false,
+        };
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Null);
     }
 
     #[test]

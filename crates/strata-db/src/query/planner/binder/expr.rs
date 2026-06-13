@@ -49,6 +49,44 @@ impl BindNode for AstExpr {
             AstExpr::Floor { expr, field } => {
                 bind_ceil_floor(expr, field, ScalarFunc::Floor, binder)
             }
+            // `IS NULL` / `IS NOT NULL` — total predicates (never NULL).
+            AstExpr::IsNull(e) => Ok(Expr::IsNull {
+                expr: Box::new(e.bind(binder)?),
+                negated: false,
+            }),
+            AstExpr::IsNotNull(e) => Ok(Expr::IsNull {
+                expr: Box::new(e.bind(binder)?),
+                negated: true,
+            }),
+            // BETWEEN / IN lower to expressions we already have; the
+            // 3-valued-logic falls out of the comparison + AND/OR/NOT.
+            AstExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => bind_between(expr, low, high, *negated, binder),
+            AstExpr::InList {
+                expr,
+                list,
+                negated,
+            } => bind_in_list(expr, list, *negated, binder),
+            AstExpr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => {
+                if *any || escape_char.is_some() {
+                    return Err(QueryError::unsupported("LIKE ANY / ESCAPE"));
+                }
+                Ok(Expr::Like {
+                    expr: Box::new(expr.bind(binder)?),
+                    pattern: Box::new(pattern.bind(binder)?),
+                    negated: *negated,
+                })
+            }
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -71,6 +109,53 @@ fn bind_ceil_floor(
     Ok(Expr::Call {
         func,
         args: vec![expr.bind(binder)?],
+    })
+}
+
+/// `x BETWEEN low AND high` lowered to `x >= low AND x <= high` (negated
+/// wraps the result in `NOT`). `x` is bound once and cloned into both
+/// bounds.
+fn bind_between(
+    expr: &AstExpr,
+    low: &AstExpr,
+    high: &AstExpr,
+    negated: bool,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    let value = expr.bind(binder)?;
+    let ge = Expr::binary(BinaryOperator::GtEq, value.clone(), low.bind(binder)?);
+    let le = Expr::binary(BinaryOperator::LtEq, value, high.bind(binder)?);
+    let between = Expr::binary(BinaryOperator::And, ge, le);
+    Ok(if negated {
+        Expr::negate(between)
+    } else {
+        between
+    })
+}
+
+/// `x IN (a, b, …)` lowered to `x = a OR x = b OR …`; an empty list is
+/// `false` (so `NOT IN ()` is `true`). NULL semantics match Postgres for
+/// free — the OR-chain of comparisons already does 3-valued logic.
+fn bind_in_list(
+    expr: &AstExpr,
+    list: &[AstExpr],
+    negated: bool,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    let value = expr.bind(binder)?;
+    let mut acc: Option<Expr> = None;
+    for item in list {
+        let eq = Expr::binary(BinaryOperator::Eq, value.clone(), item.bind(binder)?);
+        acc = Some(match acc {
+            None => eq,
+            Some(prev) => Expr::binary(BinaryOperator::Or, prev, eq),
+        });
+    }
+    let in_expr = acc.unwrap_or_else(|| Expr::lit(false));
+    Ok(if negated {
+        Expr::negate(in_expr)
+    } else {
+        in_expr
     })
 }
 
