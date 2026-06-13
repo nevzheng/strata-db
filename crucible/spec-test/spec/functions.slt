@@ -175,6 +175,17 @@ SELECT CONCAT('id=', 7)
 ----
 id=7
 
+# || string concatenation (stringifies, like CONCAT but binary).
+query T
+SELECT 'a' || 'b' || 'c'
+----
+abc
+
+query T
+SELECT 'id=' || 7
+----
+id=7
+
 query T
 SELECT SUBSTRING('hello' FROM 2 FOR 3)
 ----

@@ -30,6 +30,8 @@ pub enum BinaryOperator {
     // Logical
     And,
     Or,
+    // String
+    Concat,
 }
 
 /// A built-in scalar function — a row-wise operation on its arguments
@@ -526,6 +528,12 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
                 "OR expects Bool, got {l:?} / {r:?}"
             ))),
         },
+        // `||`: stringify both sides and join (NULL already handled above).
+        Concat => {
+            let mut s = concat_str(&lhs)?;
+            s.push_str(&concat_str(&rhs)?);
+            Ok(Value::Text(s))
+        }
     }
 }
 
@@ -995,6 +1003,19 @@ mod tests {
         };
         assert_eq!(nf(Value::Int64(5), Value::Int64(5)), Value::Null);
         assert_eq!(nf(Value::Int64(5), Value::Int64(6)), Value::Int64(5));
+    }
+
+    #[test]
+    fn eval_string_concat_operator() {
+        let e = Expr::binary(BinaryOperator::Concat, Expr::lit("a"), Expr::lit("b"));
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Text("ab".into()));
+        // NULL propagates.
+        let n = Expr::binary(
+            BinaryOperator::Concat,
+            Expr::lit("a"),
+            Expr::lit(Value::Null),
+        );
+        assert_eq!(n.eval(&t(vec![])).unwrap(), Value::Null);
     }
 
     #[test]
