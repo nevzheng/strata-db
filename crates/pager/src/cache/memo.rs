@@ -60,11 +60,7 @@ where
     /// Return the handle for `key`, loading and caching it on a miss. The
     /// returned handle is **owned** (a clone), so once this returns the caller
     /// no longer borrows the cache.
-    pub fn get_or_load<E>(
-        &self,
-        key: K,
-        load: impl FnOnce() -> Result<V, E>,
-    ) -> Result<V, E> {
+    pub fn get_or_load<E>(&self, key: K, load: impl FnOnce() -> Result<V, E>) -> Result<V, E> {
         if let Some(v) = self.entries.borrow().get(&key).cloned() {
             self.policy.borrow_mut().record_access(key);
             return Ok(v);
@@ -171,7 +167,10 @@ mod tests {
             Ok::<_, ()>(vec![0])
         })
         .unwrap();
-        assert!(reloaded.get(), "the LRU entry (key 0) should have been evicted");
+        assert!(
+            reloaded.get(),
+            "the LRU entry (key 0) should have been evicted"
+        );
     }
 
     #[test]

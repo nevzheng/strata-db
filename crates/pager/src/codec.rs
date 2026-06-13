@@ -95,6 +95,9 @@ mod tests {
     #[test]
     fn short_input_is_eof() {
         let mut cursor = &[0u8; 2][..];
-        assert!(matches!(get_u32(&mut cursor), Err(DecodeError::UnexpectedEof)));
+        assert!(matches!(
+            get_u32(&mut cursor),
+            Err(DecodeError::UnexpectedEof)
+        ));
     }
 }
