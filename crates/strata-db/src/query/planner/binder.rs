@@ -11,11 +11,12 @@
 //!   [`BuildLogical`](super::pass::BuildLogical) downstream.
 
 use sqlparser::ast::{
-    BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
-    DataType, ExactNumberInfo, Expr as AstExpr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery, SchemaName,
-    Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject, TableWithJoins,
-    TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
+    BinaryOperator as AstBinaryOperator, CeilFloorKind, ColumnDef, ColumnOption,
+    CreateTable as AstCreateTable, DataType, DateTimeField, ExactNumberInfo, Expr as AstExpr,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Insert,
+    ObjectName, Query as AstQuery, SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement,
+    TableFactor, TableObject, TableWithJoins, TimezoneInfo, TypedString, UnaryOperator,
+    Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -644,9 +645,35 @@ impl BindNode for AstExpr {
             AstExpr::Nested(inner) => inner.bind(binder),
             AstExpr::TypedString(ts) => bind_typed_string(ts),
             AstExpr::Function(func) => bind_function(func, binder),
+            // sqlparser models CEIL/FLOOR as their own nodes (they accept
+            // `CEIL(x TO field)`), so they don't arrive as `Function`.
+            AstExpr::Ceil { expr, field } => bind_ceil_floor(expr, field, ScalarFunc::Ceil, binder),
+            AstExpr::Floor { expr, field } => {
+                bind_ceil_floor(expr, field, ScalarFunc::Floor, binder)
+            }
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
+}
+
+/// Bind plain `CEIL(x)` / `FLOOR(x)`. The `TO field` and scale forms
+/// (`CEIL(x TO HOUR)`, `CEIL(x, 2)`) aren't supported yet.
+fn bind_ceil_floor(
+    expr: &AstExpr,
+    field: &CeilFloorKind,
+    func: ScalarFunc,
+    binder: &mut Binder,
+) -> Result<Expr, QueryError> {
+    if !matches!(
+        field,
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+    ) {
+        return Err(QueryError::unsupported("CEIL/FLOOR with TO / scale"));
+    }
+    Ok(Expr::Call {
+        func,
+        args: vec![expr.bind(binder)?],
+    })
 }
 
 /// Bind a function call to an [`Expr::Call`]. Only plain scalar calls are
@@ -700,6 +727,21 @@ fn resolve_scalar_func(name: &str, argc: usize) -> Result<ScalarFunc, QueryError
         ("LEAST", _) => Ok(ScalarFunc::Least),
         ("MAX" | "MIN", _) => Err(QueryError::unsupported(format!(
             "{name} as an aggregate (needs GROUP BY); {name}(a, b, …) is supported"
+        ))),
+        // CEIL/FLOOR arrive as their own AST nodes (see `bind_ceil_floor`),
+        // not here. ROUND(x, n) (round to n places) isn't supported yet.
+        ("ROUND", 1) => Ok(ScalarFunc::Round),
+        ("COALESCE", n) if n >= 1 => Ok(ScalarFunc::Coalesce),
+        ("LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH", 1) => Ok(ScalarFunc::Length),
+        ("REPEAT", 2) => Ok(ScalarFunc::Repeat),
+        ("UPPER" | "UCASE", 1) => Ok(ScalarFunc::Upper),
+        ("LOWER" | "LCASE", 1) => Ok(ScalarFunc::Lower),
+        // Recognized names with the wrong arity get a clear arity error.
+        ("ROUND" | "LENGTH" | "UPPER" | "LOWER", n) => Err(QueryError::type_error(format!(
+            "{name} takes exactly 1 argument, got {n}"
+        ))),
+        ("REPEAT", n) => Err(QueryError::type_error(format!(
+            "REPEAT takes exactly 2 arguments, got {n}"
         ))),
         _ => Err(QueryError::unsupported(format!("function {name}"))),
     }

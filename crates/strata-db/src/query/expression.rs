@@ -43,6 +43,22 @@ pub enum ScalarFunc {
     Greatest,
     /// `LEAST(a, b, …)` / `MIN(a, b, …)` — smallest non-null argument.
     Least,
+    /// `CEIL(x)` — round a number up to the nearest integer value.
+    Ceil,
+    /// `FLOOR(x)` — round a number down to the nearest integer value.
+    Floor,
+    /// `ROUND(x)` — round a number to the nearest integer value.
+    Round,
+    /// `COALESCE(a, b, …)` — the first non-null argument (or null).
+    Coalesce,
+    /// `LENGTH(s)` — number of characters in a text value.
+    Length,
+    /// `REPEAT(s, n)` — `s` concatenated `n` times.
+    Repeat,
+    /// `UPPER(s)` — text upper-cased.
+    Upper,
+    /// `LOWER(s)` — text lower-cased.
+    Lower,
 }
 
 /// A scalar expression. Each variant is a "basic operation" carrying
@@ -127,11 +143,104 @@ impl Expr {
 }
 
 fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
+    // The binder validates arity, so the fixed-arity arms index safely.
     match func {
-        // The binder guarantees ABS has exactly one argument.
         ScalarFunc::Abs => eval_abs(args[0].eval(tuple)?),
         ScalarFunc::Greatest => eval_extreme(args, tuple, true),
         ScalarFunc::Least => eval_extreme(args, tuple, false),
+        ScalarFunc::Ceil => eval_round(args[0].eval(tuple)?, Rounding::Ceil),
+        ScalarFunc::Floor => eval_round(args[0].eval(tuple)?, Rounding::Floor),
+        ScalarFunc::Round => eval_round(args[0].eval(tuple)?, Rounding::Nearest),
+        ScalarFunc::Coalesce => eval_coalesce(args, tuple),
+        ScalarFunc::Length => eval_length(args[0].eval(tuple)?),
+        ScalarFunc::Repeat => eval_repeat(args[0].eval(tuple)?, args[1].eval(tuple)?),
+        ScalarFunc::Upper => eval_case(args[0].eval(tuple)?, true),
+        ScalarFunc::Lower => eval_case(args[0].eval(tuple)?, false),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Rounding {
+    Ceil,
+    Floor,
+    Nearest,
+}
+
+/// Round to a whole number. Integers pass through (already whole); floats
+/// and numerics round in their own type; `NULL` propagates.
+fn eval_round(v: Value, mode: Rounding) -> Result<Value, QueryError> {
+    let f64_round = |f: f64| match mode {
+        Rounding::Ceil => f.ceil(),
+        Rounding::Floor => f.floor(),
+        Rounding::Nearest => f.round(),
+    };
+    let dec_round = |d: Decimal| match mode {
+        Rounding::Ceil => d.ceil(),
+        Rounding::Floor => d.floor(),
+        Rounding::Nearest => d.round(),
+    };
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) => Ok(v),
+        Value::Float32(f) => Ok(Value::Float32(f64_round(f as f64) as f32)),
+        Value::Float64(f) => Ok(Value::Float64(f64_round(f))),
+        Value::Numeric(d) => Ok(Value::Numeric(dec_round(d))),
+        other => Err(QueryError::type_error(format!(
+            "rounding a non-numeric value {other:?}"
+        ))),
+    }
+}
+
+/// First non-null argument, or `NULL` if all are null.
+fn eval_coalesce(args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
+    for arg in args {
+        let v = arg.eval(tuple)?;
+        if !matches!(v, Value::Null) {
+            return Ok(v);
+        }
+    }
+    Ok(Value::Null)
+}
+
+/// Character count of a text value (`NULL` propagates).
+fn eval_length(v: Value) -> Result<Value, QueryError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Text(s) => Ok(Value::Int64(s.chars().count() as i64)),
+        other => Err(QueryError::type_error(format!(
+            "LENGTH of non-text value {other:?}"
+        ))),
+    }
+}
+
+/// `REPEAT(s, n)` — `s` repeated `n` times; a non-positive `n` yields the
+/// empty string. Either argument `NULL` propagates.
+fn eval_repeat(s: Value, n: Value) -> Result<Value, QueryError> {
+    if matches!(s, Value::Null) || matches!(n, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Text(text) = s else {
+        return Err(QueryError::type_error(
+            "REPEAT expects a text first argument",
+        ));
+    };
+    let count =
+        as_i64(&n).ok_or_else(|| QueryError::type_error("REPEAT count must be an integer"))?;
+    Ok(Value::Text(text.repeat(count.max(0) as usize)))
+}
+
+/// Upper/lower-case a text value (`NULL` propagates).
+fn eval_case(v: Value, upper: bool) -> Result<Value, QueryError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Text(s) => Ok(Value::Text(if upper {
+            s.to_uppercase()
+        } else {
+            s.to_lowercase()
+        })),
+        other => Err(QueryError::type_error(format!(
+            "case folding a non-text value {other:?}"
+        ))),
     }
 }
 
@@ -544,6 +653,61 @@ mod tests {
             vec![Expr::lit(Value::Null), Expr::lit(Value::Null)],
         );
         assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn eval_round_family() {
+        let f = |func, v| call(func, vec![Expr::lit(v)]).eval(&t(vec![])).unwrap();
+        assert_eq!(
+            f(ScalarFunc::Ceil, Value::Float64(2.1)),
+            Value::Float64(3.0)
+        );
+        assert_eq!(
+            f(ScalarFunc::Floor, Value::Float64(2.9)),
+            Value::Float64(2.0)
+        );
+        assert_eq!(
+            f(ScalarFunc::Round, Value::Float64(2.4)),
+            Value::Float64(2.0)
+        );
+        assert_eq!(f(ScalarFunc::Ceil, num("2.1")), num("3"));
+        // Integers are already whole — passed through unchanged.
+        assert_eq!(f(ScalarFunc::Floor, Value::Int64(7)), Value::Int64(7));
+    }
+
+    #[test]
+    fn eval_coalesce_first_non_null() {
+        let e = call(
+            ScalarFunc::Coalesce,
+            vec![
+                Expr::lit(Value::Null),
+                Expr::lit(Value::Null),
+                Expr::lit(3i64),
+                Expr::lit(4i64),
+            ],
+        );
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Int64(3));
+    }
+
+    #[test]
+    fn eval_length_counts_characters() {
+        // "Привет 🦀" is 8 Unicode scalar values, not bytes.
+        let e = call(ScalarFunc::Length, vec![Expr::lit("Привет 🦀")]);
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Int64(8));
+    }
+
+    #[test]
+    fn eval_repeat_concatenates() {
+        let e = call(ScalarFunc::Repeat, vec![Expr::lit("ab"), Expr::lit(3i64)]);
+        assert_eq!(e.eval(&t(vec![])).unwrap(), Value::Text("ababab".into()));
+    }
+
+    #[test]
+    fn eval_upper_lower() {
+        let up = call(ScalarFunc::Upper, vec![Expr::lit("Hello")]);
+        assert_eq!(up.eval(&t(vec![])).unwrap(), Value::Text("HELLO".into()));
+        let lo = call(ScalarFunc::Lower, vec![Expr::lit("Hello")]);
+        assert_eq!(lo.eval(&t(vec![])).unwrap(), Value::Text("hello".into()));
     }
 
     #[test]
