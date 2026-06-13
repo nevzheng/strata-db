@@ -2,9 +2,9 @@
 //!
 //! The shared serialization vocabulary for the storage layer: page types, the
 //! LSM's SSTable structures, and anything else that round-trips bytes go
-//! through these. It is a *sibling* of the [`Vfs`](crate::Vfs) byte boundary,
-//! not part of it — the `Vfs` trait still knows nothing about encoding; this is
-//! just the layer that turns typed values into the bytes a `Vfs` stores.
+//! through these. It is a *sibling* of the [`BlockStore`](crate::BlockStore) byte boundary,
+//! not part of it — the `BlockStore` trait still knows nothing about encoding; this is
+//! just the layer that turns typed values into the bytes a `BlockStore` stores.
 
 use thiserror::Error;
 

@@ -1,10 +1,13 @@
-//! End-to-end tests for the pager: the cache over a real file VFS, eviction
+//! End-to-end tests for the filesystem: the cache over a real file VFS, eviction
 //! under a small pool, and the two page types round-tripping through it.
 
-use pager::page::finalize_checksum;
-use pager::page::types::TUPLE_PAGE;
-use pager::{FileVfs, MemVfs, PAGE_SIZE, PageCache, PageHeader, PageId, TuplePage, TuplePageMut};
-use pager::{PageJournal, PageOp, read_text, write_text};
+use filesystem::page::finalize_checksum;
+use filesystem::page::types::TUPLE_PAGE;
+use filesystem::{
+    BlockId, FileBlockStore, MemBlockStore, PAGE_SIZE, PageCache, PageHeader, TuplePage,
+    TuplePageMut,
+};
+use filesystem::{BlockJournal, JournalOp, read_text, write_text};
 
 /// Allocate a page, write it, flush, drop the whole cache, reopen the file, and
 /// read the page back — the durability path end to end.
@@ -14,7 +17,7 @@ fn page_survives_flush_and_reopen() {
     let path = dir.path().join("store.db");
 
     let id = {
-        let cache = PageCache::new(FileVfs::open(&path).unwrap(), 8);
+        let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 8);
         let (id, page) = cache.allocate().unwrap();
         page.write_header(&PageHeader::new(TUPLE_PAGE, 1));
         page.payload_mut()[..5].copy_from_slice(b"hello");
@@ -24,7 +27,7 @@ fn page_survives_flush_and_reopen() {
     };
 
     // Fresh cache + freshly reopened file: the page must come back from disk.
-    let cache = PageCache::new(FileVfs::open(&path).unwrap(), 8);
+    let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 8);
     let page = cache.read(id).unwrap();
     assert_eq!(page.header().unwrap().page_type, TUPLE_PAGE);
     assert_eq!(&page.payload()[..5], b"hello");
@@ -37,12 +40,12 @@ fn ids_are_not_reused_across_reopen() {
     let path = dir.path().join("store.db");
 
     let first = {
-        let cache = PageCache::new(FileVfs::open(&path).unwrap(), 4);
+        let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 4);
         let (id, _page) = cache.allocate().unwrap();
         cache.flush().unwrap();
         id
     };
-    let cache = PageCache::new(FileVfs::open(&path).unwrap(), 4);
+    let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 4);
     let (second, _page) = cache.allocate().unwrap();
     assert_ne!(first, second, "reopened store reissued a live id");
 }
@@ -51,7 +54,7 @@ fn ids_are_not_reused_across_reopen() {
 /// reload them on demand, with the data intact.
 #[test]
 fn eviction_preserves_data_under_small_pool() {
-    let cache = PageCache::new(MemVfs::new(), 4);
+    let cache = PageCache::new(MemBlockStore::new(), 4);
 
     // Write 32 single-tuple pages through a 4-frame pool.
     let mut ids = Vec::new();
@@ -79,7 +82,7 @@ fn eviction_preserves_data_under_small_pool() {
 /// A writer and a reader cannot hold the same page at once.
 #[test]
 fn write_excludes_concurrent_read() {
-    let cache = PageCache::new(MemVfs::new(), 4);
+    let cache = PageCache::new(MemBlockStore::new(), 4);
     let (id, writer) = cache.allocate().unwrap();
     writer.write_header(&PageHeader::new(TUPLE_PAGE, 1));
 
@@ -98,7 +101,7 @@ fn write_excludes_concurrent_read() {
 /// by a pool too small to hold the whole chain at once.
 #[test]
 fn text_chain_roundtrips_through_cache() {
-    let cache = PageCache::new(MemVfs::new(), 3);
+    let cache = PageCache::new(MemBlockStore::new(), 3);
     let value: String = ('a'..='z').cycle().take(50_000).collect();
     let head = write_text(&cache, &value).unwrap();
     cache.flush().unwrap();
@@ -115,7 +118,8 @@ fn journaled_flush_survives_reopen() {
 
     let id = {
         let cache =
-            PageCache::with_journal(FileVfs::open(&vfs_path).unwrap(), 8, &journal_path).unwrap();
+            PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
+                .unwrap();
         let (id, page) = cache.allocate().unwrap();
         page.write_header(&PageHeader::new(TUPLE_PAGE, 1));
         page.payload_mut()[..3].copy_from_slice(b"hey");
@@ -124,8 +128,8 @@ fn journaled_flush_survives_reopen() {
         id
     };
 
-    let cache =
-        PageCache::with_journal(FileVfs::open(&vfs_path).unwrap(), 8, &journal_path).unwrap();
+    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
+        .unwrap();
     let page = cache.read(id).unwrap();
     assert_eq!(&page.payload()[..3], b"hey");
 }
@@ -151,21 +155,21 @@ fn recovery_replays_committed_write_the_vfs_never_had() {
 
     // Pre-seed the journal with that committed write. The VFS stays untouched.
     {
-        let mut journal = PageJournal::open(&journal_path).unwrap();
+        let mut journal = BlockJournal::open(&journal_path).unwrap();
         journal
-            .append(&PageOp::Write {
+            .append(&JournalOp::Write {
                 page_id: 1,
                 image: image.clone(),
             })
             .unwrap();
-        journal.append(&PageOp::Commit).unwrap();
+        journal.append(&JournalOp::Commit).unwrap();
     }
 
-    let cache =
-        PageCache::with_journal(FileVfs::open(&vfs_path).unwrap(), 8, &journal_path).unwrap();
+    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
+        .unwrap();
 
     // The page is back, sourced purely from the journal.
-    let page = cache.read(PageId(1)).unwrap();
+    let page = cache.read(BlockId(1)).unwrap();
     let buf = page.bytes();
     let tp = TuplePage::open(&buf).unwrap();
     assert_eq!(tp.get(0), Some(&b"recovered"[..]));
@@ -174,7 +178,7 @@ fn recovery_replays_committed_write_the_vfs_never_had() {
 
     // And the allocator skips the recovered id rather than reusing it.
     let (next, _page) = cache.allocate().unwrap();
-    assert_eq!(next, PageId(2));
+    assert_eq!(next, BlockId(2));
 }
 
 /// Writes after the last commit marker are a torn flush and must be discarded.
@@ -193,18 +197,18 @@ fn recovery_discards_uncommitted_writes() {
 
     // A write with no following commit — an interrupted flush.
     {
-        let mut journal = PageJournal::open(&journal_path).unwrap();
+        let mut journal = BlockJournal::open(&journal_path).unwrap();
         journal
-            .append(&PageOp::Write { page_id: 1, image })
+            .append(&JournalOp::Write { page_id: 1, image })
             .unwrap();
     }
 
-    let cache =
-        PageCache::with_journal(FileVfs::open(&vfs_path).unwrap(), 8, &journal_path).unwrap();
+    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
+        .unwrap();
 
     // Page 1 was never committed, so it isn't there...
-    assert!(cache.read(PageId(1)).is_err());
+    assert!(cache.read(BlockId(1)).is_err());
     // ...and its id was never consumed, so the next allocation reuses it.
     let (next, _page) = cache.allocate().unwrap();
-    assert_eq!(next, PageId(1));
+    assert_eq!(next, BlockId(1));
 }

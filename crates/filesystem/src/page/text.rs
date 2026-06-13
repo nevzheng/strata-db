@@ -1,5 +1,5 @@
 //! The TextPage — storage for unbounded `TEXT` values, referenced by a
-//! [`PageId`] pointer from a tuple.
+//! [`BlockId`] pointer from a tuple.
 //!
 //! ```text
 //! off          field
@@ -17,8 +17,8 @@
 
 use super::header::{HEADER_LEN, PageHeader};
 use super::types::TEXT_PAGE;
-use crate::error::PageError;
-use crate::{PAGE_SIZE, PageCache, PageId, Result, Vfs};
+use crate::error::Error;
+use crate::{BlockId, BlockStore, PAGE_SIZE, PageCache, Result};
 
 const FORMAT_VERSION: u16 = 1;
 
@@ -31,9 +31,9 @@ const CONTENT_OFFSET: usize = HEADER_LEN + 18; // 39
 pub const CONTENT_CAPACITY: usize = PAGE_SIZE - CONTENT_OFFSET;
 
 /// Write `s` as a chain of TextPages through `cache`, returning the head
-/// [`PageId`] — the pointer a tuple stores. The pages are dirty in the cache;
+/// [`BlockId`] — the pointer a tuple stores. The pages are dirty in the cache;
 /// they reach disk on [`flush`](PageCache::flush).
-pub fn write_text<V: Vfs>(cache: &PageCache<V>, s: &str) -> Result<PageId> {
+pub fn write_text<V: BlockStore>(cache: &PageCache<V>, s: &str) -> Result<BlockId> {
     let bytes = s.as_bytes();
     // An empty value still needs one page so the pointer resolves to something.
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
@@ -46,7 +46,7 @@ pub fn write_text<V: Vfs>(cache: &PageCache<V>, s: &str) -> Result<PageId> {
     // Allocate back-to-front: each page links to the one already allocated
     // after it, so we never have to revisit a page to patch its `next` pointer.
     let mut next = 0u64;
-    let mut head = PageId(0);
+    let mut head = BlockId(0);
     for (i, chunk) in chunks.iter().enumerate().rev() {
         let (id, page) = cache.allocate()?;
         {
@@ -62,7 +62,7 @@ pub fn write_text<V: Vfs>(cache: &PageCache<V>, s: &str) -> Result<PageId> {
 }
 
 /// Read back the `TEXT` value whose chain begins at `head`.
-pub fn read_text<V: Vfs>(cache: &PageCache<V>, head: PageId) -> Result<String> {
+pub fn read_text<V: BlockStore>(cache: &PageCache<V>, head: BlockId) -> Result<String> {
     let mut out = Vec::new();
     let mut cur = head;
     loop {
@@ -71,7 +71,7 @@ pub fn read_text<V: Vfs>(cache: &PageCache<V>, head: PageId) -> Result<String> {
 
         let header = PageHeader::parse(&buf)?;
         if header.page_type != TEXT_PAGE {
-            return Err(PageError::BadPageType {
+            return Err(Error::BadPageType {
                 expected: TEXT_PAGE,
                 got: header.page_type,
             });
@@ -85,7 +85,7 @@ pub fn read_text<V: Vfs>(cache: &PageCache<V>, head: PageId) -> Result<String> {
         if next == 0 {
             break;
         }
-        cur = PageId(next);
+        cur = BlockId(next);
     }
     Ok(String::from_utf8(out)?)
 }
@@ -117,18 +117,18 @@ fn put_u16(buf: &mut [u8], off: usize, v: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemVfs;
+    use crate::MemBlockStore;
 
     #[test]
     fn single_page_roundtrip() {
-        let cache = PageCache::new(MemVfs::new(), 4);
+        let cache = PageCache::new(MemBlockStore::new(), 4);
         let id = write_text(&cache, "hello, world").unwrap();
         assert_eq!(read_text(&cache, id).unwrap(), "hello, world");
     }
 
     #[test]
     fn empty_string_roundtrip() {
-        let cache = PageCache::new(MemVfs::new(), 4);
+        let cache = PageCache::new(MemBlockStore::new(), 4);
         let id = write_text(&cache, "").unwrap();
         assert_eq!(read_text(&cache, id).unwrap(), "");
     }
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn long_value_chains_across_pages() {
         // A tiny pool forces dirty chain pages to be written back and re-read.
-        let cache = PageCache::new(MemVfs::new(), 2);
+        let cache = PageCache::new(MemBlockStore::new(), 2);
         let big = "λ".repeat(CONTENT_CAPACITY); // multibyte, so splits fall mid-codepoint
         let id = write_text(&cache, &big).unwrap();
         assert_eq!(read_text(&cache, id).unwrap(), big);

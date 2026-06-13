@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::iterator::Scan;
 use crate::{StorageError, memstore::BTreeMapStore};
+use filesystem::{FileBlockStore, Heap, PageCache, TupleLoc, TupleRef};
 use lsm::{LevelConfig, Lsm, LsmConfig, MemStore};
-use pager::{FileVfs, Heap, PageCache, TupleLoc, TupleRef};
 use tracing::{info, instrument};
 
 /// Frames in the heap's buffer pool. 1024 × 8 KiB ≈ 8 MiB. A tuning knob.
@@ -29,7 +29,7 @@ const HEAP_FRAMES: usize = 1024;
 /// work; for now, treat `flush` as the durability point.
 pub struct StorageEngine<M: MemStore = BTreeMapStore> {
     index: Lsm<M>,
-    heap: Heap<FileVfs>,
+    heap: Heap<FileBlockStore>,
 }
 
 impl<M: MemStore> StorageEngine<M> {
@@ -87,7 +87,7 @@ impl<M: MemStore> StorageEngine<M> {
     /// Retrieve a zero-copy view of the latest value for `key`, or `None` if
     /// absent or deleted. The view pins its page until dropped; decode out of it
     /// to materialize a value.
-    pub fn get(&self, key: &[u8]) -> Result<Option<TupleRef<FileVfs>>, StorageError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<TupleRef<FileBlockStore>>, StorageError> {
         let Some(loc_bytes) = self.index.get(key)? else {
             return Ok(None);
         };
@@ -128,11 +128,11 @@ impl<M: MemStore> StorageEngine<M> {
 }
 
 /// Open the heap under `dir/heap`, behind a journaled page cache.
-fn open_heap(dir: &Path) -> Result<Heap<FileVfs>, StorageError> {
+fn open_heap(dir: &Path) -> Result<Heap<FileBlockStore>, StorageError> {
     let heap_dir = dir.join("heap");
     std::fs::create_dir_all(&heap_dir)?;
     let cache = PageCache::with_journal(
-        FileVfs::open(heap_dir.join("tuples.db"))?,
+        FileBlockStore::open(heap_dir.join("tuples.db"))?,
         HEAP_FRAMES,
         heap_dir.join("tuples.journal"),
     )?;

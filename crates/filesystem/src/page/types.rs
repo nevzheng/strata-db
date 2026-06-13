@@ -1,7 +1,7 @@
 //! The page-type registry — the well-known `page_type` values stamped into a
 //! page header.
 //!
-//! The Storage Foundations design envisions a central registry the VFS owns,
+//! The Storage Foundations design envisions a central registry the block store owns,
 //! with ranges reserved for application-specific types. For v1 the well-known
 //! types are these constants; a runtime registry can come later without
 //! changing the on-disk meaning of these numbers.

@@ -694,6 +694,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filesystem"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "journal",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1136,9 +1146,9 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "fastbloom",
+ "filesystem",
  "itertools 0.14.0",
  "journal",
- "pager",
  "tempfile",
  "thiserror",
 ]
@@ -1258,16 +1268,6 @@ name = "owo-colors"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
-
-[[package]]
-name = "pager"
-version = "0.1.0"
-dependencies = [
- "crc32c",
- "journal",
- "tempfile",
- "thiserror",
-]
 
 [[package]]
 name = "parking_lot"
@@ -2111,9 +2111,9 @@ dependencies = [
 name = "strata-store"
 version = "0.1.0"
 dependencies = [
+ "filesystem",
  "itertools 0.14.0",
  "lsm",
- "pager",
  "tempfile",
  "thiserror",
  "tracing",

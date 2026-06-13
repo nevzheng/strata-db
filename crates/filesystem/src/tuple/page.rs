@@ -12,19 +12,19 @@
 //!              tuple data, packed upward from the bottom
 //! ```
 //!
-//! A tuple's stable logical identity is `(PageId, slot_id)`: `slot_id` is the
+//! A tuple's stable logical identity is `(BlockId, slot_id)`: `slot_id` is the
 //! index into the slot array and never changes for the tuple's lifetime, which
 //! is what makes it usable by indexes and any future MVCC chain.
 //!
 //! The page stores **opaque tuple bytes** — field layout is the schema's
 //! concern, encoded by the engine and passed in. (The doc's dedicated VarLen
 //! section is an in-place-varchar optimization folded into the opaque blob for
-//! v1; `TEXT` is just a [`PageId`](crate::PageId) pointer inside the blob,
-//! resolved against a [`TextPage`](super::text).)
+//! v1; `TEXT` is just a [`BlockId`](crate::BlockId) pointer inside the blob,
+//! resolved against a [`TextPage`](crate::page::text).)
 
-use super::header::{HEADER_LEN, PageHeader};
-use super::types::TUPLE_PAGE;
-use crate::error::PageError;
+use crate::error::Error;
+use crate::page::types::TUPLE_PAGE;
+use crate::page::{HEADER_LEN, PageHeader};
 use crate::{PAGE_SIZE, Result};
 
 const FORMAT_VERSION: u16 = 1;
@@ -56,7 +56,7 @@ impl<'a> TuplePage<'a> {
     pub fn open(buf: &'a [u8]) -> Result<Self> {
         let header = PageHeader::parse(buf)?;
         if header.page_type != TUPLE_PAGE {
-            return Err(PageError::BadPageType {
+            return Err(Error::BadPageType {
                 expected: TUPLE_PAGE,
                 got: header.page_type,
             });
@@ -98,7 +98,7 @@ impl<'a> TuplePageMut<'a> {
     pub fn open(buf: &'a mut [u8]) -> Result<Self> {
         let header = PageHeader::parse(buf)?;
         if header.page_type != TUPLE_PAGE {
-            return Err(PageError::BadPageType {
+            return Err(Error::BadPageType {
                 expected: TUPLE_PAGE,
                 got: header.page_type,
             });
@@ -242,10 +242,10 @@ mod tests {
     #[test]
     fn wrong_type_is_rejected() {
         let mut buf = vec![0u8; PAGE_SIZE];
-        PageHeader::new(super::super::types::TEXT_PAGE, 1).write(&mut buf);
+        PageHeader::new(crate::page::types::TEXT_PAGE, 1).write(&mut buf);
         assert!(matches!(
             TuplePage::open(&buf),
-            Err(PageError::BadPageType { .. })
+            Err(Error::BadPageType { .. })
         ));
     }
 }

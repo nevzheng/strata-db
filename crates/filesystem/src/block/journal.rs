@@ -1,13 +1,13 @@
 //! The page journal — what the cache logs and how it's framed.
 //!
-//! The pager runs a **redo journal** with **no-steal** semantics: a dirty page
-//! is never written to the VFS outside [`flush`](crate::PageCache::flush), and a
-//! flush logs the after-image of every dirty page plus a [`Commit`](PageOp::Commit)
-//! marker *before* touching the VFS. Recovery replays the after-images of the
+//! The page cache runs a **redo journal** with **no-steal** semantics: a dirty page
+//! is never written to the block store outside [`flush`](crate::PageCache::flush), and a
+//! flush logs the after-image of every dirty page plus a [`Commit`](JournalOp::Commit)
+//! marker *before* touching the block store. Recovery replays the after-images of the
 //! last fully-committed batch, so a crash mid-flush is atomic: all of that
 //! flush's pages come back, or none do.
 //!
-//! [`PageJournal`] wraps the generic [`journal`] crate (framing, CRC, crash-safe
+//! [`BlockJournal`] wraps the generic [`journal`] crate (framing, CRC, crash-safe
 //! replay live there) with the page record type:
 //!
 //! ```text
@@ -35,7 +35,7 @@ const TAG_COMMIT: u8 = 2;
 
 /// One record in the page journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageOp {
+pub enum JournalOp {
     /// The full after-image of a page, to be redone on recovery.
     Write {
         /// The page this image belongs to.
@@ -49,13 +49,13 @@ pub enum PageOp {
     Commit,
 }
 
-/// The page cache's redo journal: an append-only log of [`PageOp`]s with
+/// The page cache's redo journal: an append-only log of [`JournalOp`]s with
 /// crash-safe replay. A thin, typed wrapper over the generic journal.
-pub struct PageJournal {
+pub struct BlockJournal {
     inner: Journal<PageOpCodec>,
 }
 
-impl PageJournal {
+impl BlockJournal {
     /// Open (creating if needed) the journal at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -68,9 +68,9 @@ impl PageJournal {
     /// A journal write is the durability point: if we cannot record a
     /// page image, there is no safe way to proceed — continuing would
     /// risk applying changes we can never recover. So a failure here is
-    /// **fail-stop** (panic), unlike pager/LSM allocation exhaustion,
+    /// **fail-stop** (panic), unlike page-cache/LSM allocation exhaustion,
     /// which fails the write but lets reads continue.
-    pub fn append(&mut self, op: &PageOp) -> Result<()> {
+    pub fn append(&mut self, op: &JournalOp) -> Result<()> {
         self.inner.append(op).unwrap_or_else(|e| {
             panic!("page journal append failed; cannot guarantee durability: {e}")
         });
@@ -78,39 +78,39 @@ impl PageJournal {
     }
 
     /// Read back every durably-recorded op in append order.
-    pub fn replay(&self) -> Result<Vec<PageOp>> {
+    pub fn replay(&self) -> Result<Vec<JournalOp>> {
         Ok(self
             .inner
             .replay()?
             .collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Discard all records — call once they have been applied durably to the VFS.
+    /// Discard all records — call once they have been applied durably to the block store.
     pub fn truncate(&mut self) -> Result<()> {
         self.inner.truncate()?;
         Ok(())
     }
 }
 
-/// Frames [`PageOp`]s into journal records.
+/// Frames [`JournalOp`]s into journal records.
 #[derive(Debug, Default, Clone, Copy)]
 struct PageOpCodec;
 
 impl Codec for PageOpCodec {
-    type Record = PageOp;
+    type Record = JournalOp;
 
-    fn encode(&self, record: &PageOp, buf: &mut Vec<u8>) {
+    fn encode(&self, record: &JournalOp, buf: &mut Vec<u8>) {
         match record {
-            PageOp::Write { page_id, image } => {
+            JournalOp::Write { page_id, image } => {
                 buf.push(TAG_WRITE);
                 buf.extend_from_slice(&page_id.to_be_bytes());
                 buf.extend_from_slice(image);
             }
-            PageOp::Commit => buf.push(TAG_COMMIT),
+            JournalOp::Commit => buf.push(TAG_COMMIT),
         }
     }
 
-    fn decode(&self, bytes: &[u8]) -> std::result::Result<PageOp, JournalError> {
+    fn decode(&self, bytes: &[u8]) -> std::result::Result<JournalOp, JournalError> {
         match bytes.first() {
             Some(&TAG_WRITE) => {
                 if bytes.len() < 9 {
@@ -120,12 +120,12 @@ impl Codec for PageOpCodec {
                     )));
                 }
                 let page_id = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-                Ok(PageOp::Write {
+                Ok(JournalOp::Write {
                     page_id,
                     image: bytes[9..].to_vec(),
                 })
             }
-            Some(&TAG_COMMIT) => Ok(PageOp::Commit),
+            Some(&TAG_COMMIT) => Ok(JournalOp::Commit),
             other => Err(JournalError::Decode(format!(
                 "unknown record tag: {other:?}"
             ))),
@@ -137,7 +137,7 @@ impl Codec for PageOpCodec {
 mod tests {
     use super::*;
 
-    fn roundtrip(op: &PageOp) -> PageOp {
+    fn roundtrip(op: &JournalOp) -> JournalOp {
         let codec = PageOpCodec;
         let mut buf = Vec::new();
         codec.encode(op, &mut buf);
@@ -146,12 +146,12 @@ mod tests {
 
     #[test]
     fn write_and_commit_roundtrip() {
-        let w = PageOp::Write {
+        let w = JournalOp::Write {
             page_id: 42,
             image: vec![7u8; 100],
         };
         assert_eq!(roundtrip(&w), w);
-        assert_eq!(roundtrip(&PageOp::Commit), PageOp::Commit);
+        assert_eq!(roundtrip(&JournalOp::Commit), JournalOp::Commit);
     }
 
     #[test]

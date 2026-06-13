@@ -1,18 +1,18 @@
 //! [`TupleLoc`] — the physical address of a tuple in the page heap.
 //!
-//! A tuple's logical identity is `(PageId, slot_id)`: which page holds it and
+//! A tuple's logical identity is `(BlockId, slot_id)`: which page holds it and
 //! which slot within that page (see [`TuplePage`](crate::TuplePage)). The slot
 //! id is stable for the tuple's lifetime, so a `TupleLoc` is a durable pointer —
 //! it's what an index (the LSM) stores as the value for a row key, and what the
 //! heap resolves back to tuple bytes.
 
-use crate::PageId;
+use crate::BlockId;
 
 /// Where a tuple lives: a page and a slot within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TupleLoc {
     /// The page holding the tuple.
-    pub page_id: PageId,
+    pub page_id: BlockId,
     /// The slot index within that page.
     pub slot_id: u16,
 }
@@ -22,7 +22,7 @@ impl TupleLoc {
     pub const ENCODED_LEN: usize = 10;
 
     /// A location for `slot_id` on `page_id`.
-    pub fn new(page_id: PageId, slot_id: u16) -> Self {
+    pub fn new(page_id: BlockId, slot_id: u16) -> Self {
         Self { page_id, slot_id }
     }
 
@@ -41,7 +41,7 @@ impl TupleLoc {
             return None;
         }
         Some(Self {
-            page_id: PageId(u64::from_be_bytes(bytes[0..8].try_into().unwrap())),
+            page_id: BlockId(u64::from_be_bytes(bytes[0..8].try_into().unwrap())),
             slot_id: u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
         })
     }
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let loc = TupleLoc::new(PageId(0x0102_0304_0506_0708), 0xBEEF);
+        let loc = TupleLoc::new(BlockId(0x0102_0304_0506_0708), 0xBEEF);
         let bytes = loc.encode();
         assert_eq!(bytes.len(), TupleLoc::ENCODED_LEN);
         assert_eq!(TupleLoc::decode(&bytes), Some(loc));
