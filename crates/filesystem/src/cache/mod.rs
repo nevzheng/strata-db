@@ -26,11 +26,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::error::PageError;
 use crate::cache::policies::{EvictionPolicy, FrameId, LruK};
-use crate::vfs::journal::{PageJournal, PageOp};
+use crate::error::PageError;
 use crate::page::{finalize_checksum, verify_checksum};
-use crate::policies::{EvictionPolicy, FrameId, LruK};
+use crate::vfs::journal::{PageJournal, PageOp};
 use crate::{HEADER_LEN, PAGE_SIZE, PageHeader, PageId, Result, Vfs};
 
 /// A frame's page-sized buffer. Shared (`Rc`) so a handle can keep reading the

@@ -3,7 +3,9 @@
 
 use filesystem::page::finalize_checksum;
 use filesystem::page::types::TUPLE_PAGE;
-use filesystem::{FileVfs, MemVfs, PAGE_SIZE, PageCache, PageHeader, PageId, TuplePage, TuplePageMut};
+use filesystem::{
+    FileVfs, MemVfs, PAGE_SIZE, PageCache, PageHeader, PageId, TuplePage, TuplePageMut,
+};
 use filesystem::{PageJournal, PageOp, read_text, write_text};
 
 /// Allocate a page, write it, flush, drop the whole cache, reopen the file, and

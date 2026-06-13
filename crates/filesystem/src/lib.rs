@@ -49,7 +49,9 @@ pub use cache::{Budget, Cache, PageCache, ReadPage, Weight, WritePage};
 pub use page::{HEADER_LEN, PAGE_SIZE, PageHeader, read_text, write_text};
 
 // Tuples — the tuple page format, the heap over it, and the tuple address.
-pub use tuple::{Heap, PageTuples, TupleLoc, TupleMut, TuplePage, TuplePageMut, TupleRef, TupleView};
+pub use tuple::{
+    Heap, PageTuples, TupleLoc, TupleMut, TuplePage, TuplePageMut, TupleRef, TupleView,
+};
 
 // Errors.
 pub use error::{PageError, Result};

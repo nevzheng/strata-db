@@ -10,8 +10,8 @@
 //! a page that holds no referenced data. (A dedicated `Sequencer` generalizing
 //! this is deferred; for v1 the VFS is the allocator.)
 
-pub mod journal;
 mod file;
+pub mod journal;
 mod mem;
 
 pub use file::FileVfs;

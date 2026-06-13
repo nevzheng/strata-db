@@ -8,8 +8,8 @@
 //! [`ScanRow`] borrows that held page, this is a lending iterator: finish with a
 //! row before pulling the next.
 
-use lsm::KVPair;
 use filesystem::{FileVfs, Heap, PageTuples, TupleView};
+use lsm::KVPair;
 
 use crate::StorageError;
 use crate::engine::decode_loc;

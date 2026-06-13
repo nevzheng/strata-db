@@ -22,9 +22,9 @@
 //! v1; `TEXT` is just a [`PageId`](crate::PageId) pointer inside the blob,
 //! resolved against a [`TextPage`](crate::page::text).)
 
-use crate::page::{HEADER_LEN, PageHeader};
-use crate::page::types::TUPLE_PAGE;
 use crate::error::PageError;
+use crate::page::types::TUPLE_PAGE;
+use crate::page::{HEADER_LEN, PageHeader};
 use crate::{PAGE_SIZE, Result};
 
 const FORMAT_VERSION: u16 = 1;
