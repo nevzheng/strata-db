@@ -3,33 +3,41 @@
 //! Headers and data blocks are cached separately: a table has one header
 //! (keyed by [`SsTableId`]) and many data blocks (keyed by [`PageId`]). Both
 //! are read-through; on a miss the caller's loader reads from disk and the
-//! cache memoizes the result. Single-threaded (`RefCell`).
+//! cache memoizes the result. Single-threaded.
+//!
+//! Internally this is two independent [`pager::Cache`] instances sharing one
+//! generic read-through implementation — one for headers, one for blocks.
 //!
 //! The [`PageCacheConfig`] gives the size budget ([`SizeConfig`]) and eviction
-//! policy ([`CachePolicy`]); when an insert pushes the cache over budget,
-//! entries are evicted accordingly. `prefetch_*` are no-ops for now.
+//! policy ([`CachePolicy`]); when an insert pushes a cache over budget, entries
+//! are evicted accordingly. `prefetch_*` are no-ops for now.
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::io;
 
 use super::page::{Page, PageId};
 use crate::SsTableId;
 use crate::config::{CachePolicy, PageCacheConfig, SizeConfig};
 
-/// A cached page plus the logical time it was last touched (for LRU).
-#[derive(Debug)]
-struct Cached {
-    page: Page,
-    tick: u64,
+impl pager::Weight for Page {
+    fn weight(&self) -> usize {
+        self.bytes().len()
+    }
 }
 
-#[derive(Debug)]
+/// Translate the LSM-facing [`SizeConfig`] into a [`pager::Budget`].
+fn budget(size: SizeConfig) -> pager::Budget {
+    match size {
+        SizeConfig::Unbounded => pager::Budget::Unbounded,
+        SizeConfig::Pages(n) => pager::Budget::Entries(n),
+        SizeConfig::Bytes(n) => pager::Budget::Bytes(n),
+    }
+}
+
 pub struct SstPageCache {
-    headers: RefCell<HashMap<SsTableId, Cached>>,
-    blocks: RefCell<HashMap<PageId, Cached>>,
-    clock: Cell<u64>,
-    bytes: Cell<usize>,
+    /// Table headers, keyed by [`SsTableId`].
+    headers: pager::Cache<SsTableId, Page, pager::Lru<SsTableId>>,
+    /// Data blocks, keyed by [`PageId`].
+    blocks: pager::Cache<PageId, Page, pager::Lru<PageId>>,
     config: PageCacheConfig,
 }
 
@@ -40,12 +48,25 @@ impl Default for SstPageCache {
 }
 
 impl SstPageCache {
+    /// Build the cache from `config`.
+    ///
+    /// Headers and blocks are separate caches, and each is given the full
+    /// configured budget *independently* — the budget is now per-cache, not a
+    /// single shared pool. This is deliberate: a large block scan can churn the
+    /// block cache without evicting hot headers (and vice versa), since the two
+    /// no longer compete for one budget.
     pub fn new(config: PageCacheConfig) -> Self {
+        // One `match` per cache because the two policies are distinct types
+        // (`Lru<SsTableId>` vs `Lru<PageId>`); a shared closure can't return both.
+        let headers = match config.policy {
+            CachePolicy::Lru => pager::Cache::new(budget(config.size), pager::Lru::new()),
+        };
+        let blocks = match config.policy {
+            CachePolicy::Lru => pager::Cache::new(budget(config.size), pager::Lru::new()),
+        };
         Self {
-            headers: RefCell::new(HashMap::new()),
-            blocks: RefCell::new(HashMap::new()),
-            clock: Cell::new(0),
-            bytes: Cell::new(0),
+            headers,
+            blocks,
             config,
         }
     }
@@ -61,25 +82,7 @@ impl SstPageCache {
         id: SsTableId,
         load: impl FnOnce() -> io::Result<Page>,
     ) -> io::Result<Page> {
-        {
-            let mut headers = self.headers.borrow_mut();
-            if let Some(cached) = headers.get_mut(&id) {
-                cached.tick = self.next_tick();
-                return Ok(cached.page.clone());
-            }
-        }
-        let page = load()?;
-        let tick = self.next_tick();
-        self.add_bytes(page.bytes().len());
-        self.headers.borrow_mut().insert(
-            id,
-            Cached {
-                page: page.clone(),
-                tick,
-            },
-        );
-        self.evict_to_budget();
-        Ok(page)
+        self.headers.get_or_load(id, load)
     }
 
     /// Return the cached data block for `id`, or load it via `load` and cache it.
@@ -88,25 +91,7 @@ impl SstPageCache {
         id: PageId,
         load: impl FnOnce() -> io::Result<Page>,
     ) -> io::Result<Page> {
-        {
-            let mut blocks = self.blocks.borrow_mut();
-            if let Some(cached) = blocks.get_mut(&id) {
-                cached.tick = self.next_tick();
-                return Ok(cached.page.clone());
-            }
-        }
-        let page = load()?;
-        let tick = self.next_tick();
-        self.add_bytes(page.bytes().len());
-        self.blocks.borrow_mut().insert(
-            id,
-            Cached {
-                page: page.clone(),
-                tick,
-            },
-        );
-        self.evict_to_budget();
-        Ok(page)
+        self.blocks.get_or_load(id, load)
     }
 
     /// Hint that a table's header will be needed soon. No-op for now.
@@ -117,7 +102,7 @@ impl SstPageCache {
 
     /// Total pages cached (headers + data blocks).
     pub fn len(&self) -> usize {
-        self.headers.borrow().len() + self.blocks.borrow().len()
+        self.headers.len() + self.blocks.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -126,71 +111,8 @@ impl SstPageCache {
 
     /// Drop everything cached.
     pub fn clear(&self) {
-        self.headers.borrow_mut().clear();
-        self.blocks.borrow_mut().clear();
-        self.bytes.set(0);
-    }
-
-    fn next_tick(&self) -> u64 {
-        let t = self.clock.get() + 1;
-        self.clock.set(t);
-        t
-    }
-
-    fn add_bytes(&self, n: usize) {
-        self.bytes.set(self.bytes.get() + n);
-    }
-
-    fn over_budget(&self) -> bool {
-        match self.config.size {
-            SizeConfig::Unbounded => false,
-            SizeConfig::Pages(max) => self.len() > max,
-            SizeConfig::Bytes(max) => self.bytes.get() > max,
-        }
-    }
-
-    /// Evict entries until back within budget, per [`CachePolicy`].
-    fn evict_to_budget(&self) {
-        while self.over_budget() {
-            if !self.evict_one() {
-                break; // nothing left to evict
-            }
-        }
-    }
-
-    /// Evict a single entry; returns `false` if the cache is empty.
-    fn evict_one(&self) -> bool {
-        match self.config.policy {
-            CachePolicy::Lru => self.evict_lru(),
-        }
-    }
-
-    /// Remove the least-recently-used entry across both maps.
-    fn evict_lru(&self) -> bool {
-        let mut headers = self.headers.borrow_mut();
-        let mut blocks = self.blocks.borrow_mut();
-        let oldest_header = headers
-            .iter()
-            .min_by_key(|(_, c)| c.tick)
-            .map(|(k, c)| (*k, c.tick));
-        let oldest_block = blocks
-            .iter()
-            .min_by_key(|(_, c)| c.tick)
-            .map(|(k, c)| (*k, c.tick));
-
-        let evicted = match (oldest_header, oldest_block) {
-            (Some((hk, ht)), Some((_, bt))) if ht <= bt => headers.remove(&hk),
-            (Some((hk, _)), None) => headers.remove(&hk),
-            (_, Some((bk, _))) => blocks.remove(&bk),
-            (None, None) => None,
-        };
-        match evicted {
-            Some(cached) => {
-                self.bytes.set(self.bytes.get() - cached.page.bytes().len());
-                true
-            }
-            None => false,
-        }
+        self.headers.clear();
+        self.blocks.clear();
     }
 }
 
@@ -239,6 +161,8 @@ mod tests {
 
     #[test]
     fn evicts_lru_when_over_budget() {
+        // Budgets are now per-cache, so `Pages(2)` caps the block cache at two
+        // blocks on its own — independent of any headers.
         let cache = SstPageCache::new(PageCacheConfig {
             size: SizeConfig::Pages(2),
             policy: CachePolicy::Lru,
@@ -261,6 +185,30 @@ mod tests {
             reloaded.get(),
             "least-recently-used block should have been evicted"
         );
+    }
+
+    #[test]
+    fn header_budget_is_independent_of_blocks() {
+        // With per-cache budgets, filling the block cache past its `Pages(2)`
+        // budget must not evict a header: the two caches don't share a pool.
+        let cache = SstPageCache::new(PageCacheConfig {
+            size: SizeConfig::Pages(2),
+            policy: CachePolicy::Lru,
+        });
+        let header_loads = Cell::new(0);
+        let header_load = || {
+            header_loads.set(header_loads.get() + 1);
+            Ok(page(8))
+        };
+        cache.fetch_header(SsTableId(1), header_load).unwrap();
+
+        // Churn the block cache well past its budget.
+        for i in 0..10 {
+            cache.fetch_block(block_id(1, i), || Ok(page(8))).unwrap();
+        }
+        // The header is still cached — fetching it again does not reload.
+        cache.fetch_header(SsTableId(1), header_load).unwrap();
+        assert_eq!(header_loads.get(), 1, "block churn must not evict headers");
     }
 
     #[test]
