@@ -14,7 +14,7 @@ use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
     DataType, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery,
     SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
-    TableWithJoins, TypedString, UnaryOperator, Value as AstValue,
+    TableWithJoins, TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -232,6 +232,7 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
         ))),
         Value::Bool(b) if matches!(field.ty, T::Bool) => Ok(Value::Bool(b)),
         Value::Date(d) if matches!(field.ty, T::Date) => Ok(Value::Date(d)),
+        Value::Timestamp(t) if matches!(field.ty, T::Timestamp) => Ok(Value::Timestamp(t)),
         Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
         Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
         Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),
@@ -385,6 +386,14 @@ fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
         DataType::Bytea => LogicalType::Bytes,
         DataType::JSON | DataType::JSONB => LogicalType::Json,
         DataType::Date => LogicalType::Date,
+        // Only the time-zone-aware variant is supported; bare `TIMESTAMP`
+        // (`WITHOUT TIME ZONE`) is a distinct type we don't model yet.
+        DataType::Timestamp(_, tz) if is_tz_aware(tz) => LogicalType::Timestamp,
+        DataType::Timestamp(_, _) => {
+            return Err(QueryError::unsupported(
+                "TIMESTAMP WITHOUT TIME ZONE (use TIMESTAMP WITH TIME ZONE)",
+            ));
+        }
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }
@@ -572,20 +581,34 @@ impl BindNode for AstExpr {
 /// rejected until those types land. The string is parsed and validated
 /// here, so a bad date fails at bind time.
 fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
+    let as_string = |what: &str| {
+        ts.value
+            .clone()
+            .into_string()
+            .ok_or_else(|| QueryError::type_error(format!("{what} literal must be a string")))
+    };
     match &ts.data_type {
         DataType::Date => {
-            let s = ts
-                .value
-                .clone()
-                .into_string()
-                .ok_or_else(|| QueryError::type_error("DATE literal must be a string"))?;
-            let days = temporal::parse_date(&s).map_err(QueryError::type_error)?;
+            let days = temporal::parse_date(&as_string("DATE")?).map_err(QueryError::type_error)?;
             Ok(Expr::Literal {
                 value: Value::Date(days),
             })
         }
+        DataType::Timestamp(_, tz) if is_tz_aware(tz) => {
+            let micros = temporal::parse_timestamptz(&as_string("TIMESTAMP")?)
+                .map_err(QueryError::type_error)?;
+            Ok(Expr::Literal {
+                value: Value::Timestamp(micros),
+            })
+        }
         other => Err(QueryError::unsupported(format!("typed literal: {other:?}"))),
     }
+}
+
+/// Whether a SQL `TIMESTAMP`/`TIME` carries a time zone — the only
+/// timestamp flavor we model (stored as a UTC instant).
+fn is_tz_aware(tz: &TimezoneInfo) -> bool {
+    matches!(tz, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
 }
 
 /// Bind unary minus by negating a constant integer literal. Only integer

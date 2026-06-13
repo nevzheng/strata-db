@@ -100,3 +100,64 @@ query T
 SELECT id FROM strata.types.events WHERE id = 5
 ----
 5
+
+# =====================================================================
+# TIMESTAMP WITH TIME ZONE — absolute instant, stored/rendered as UTC
+# =====================================================================
+
+# --- typed literals (offset honored, rendered as UTC +00:00) ----------
+
+query T
+SELECT TIMESTAMP WITH TIME ZONE '2026-06-13 14:30:00+00'
+----
+2026-06-13 14:30:00+00:00
+
+# A literal with no offset is interpreted as UTC.
+query T
+SELECT TIMESTAMPTZ '2026-06-13 14:30:00'
+----
+2026-06-13 14:30:00+00:00
+
+# +02:00 normalizes to the same instant two hours earlier in UTC.
+query T
+SELECT TIMESTAMPTZ '2026-06-13 14:30:00+02' = TIMESTAMPTZ '2026-06-13 12:30:00+00'
+----
+t
+
+query T
+SELECT TIMESTAMPTZ '2026-06-13 14:30:01+00' > TIMESTAMPTZ '2026-06-13 14:30:00+00'
+----
+t
+
+# Bare TIMESTAMP (WITHOUT TIME ZONE) is not modeled yet.
+statement error
+SELECT TIMESTAMP '2026-06-13 14:30:00'
+
+# Invalid timestamps are rejected at bind time.
+statement error
+SELECT TIMESTAMPTZ '2026-13-01 00:00:00+00'
+
+# --- TIMESTAMPTZ column through DDL / DML -----------------------------
+
+statement ok
+CREATE TABLE strata.types.logs (id INT, at TIMESTAMPTZ)
+
+statement ok
+INSERT INTO strata.types.logs VALUES (1, TIMESTAMPTZ '2026-06-13 14:30:00+02'), (2, TIMESTAMPTZ '1970-01-01 00:00:00+00')
+
+# Stored as UTC: id 1's +02 literal comes back two hours earlier.
+query TT
+SELECT * FROM strata.types.logs
+----
+1 2026-06-13 12:30:00+00:00
+2 1970-01-01 00:00:00+00:00
+
+# Filter on a TIMESTAMPTZ column with a typed literal.
+query T
+SELECT id FROM strata.types.logs WHERE at = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+----
+2
+
+# Wrong type into a TIMESTAMPTZ column is rejected.
+statement error
+INSERT INTO strata.types.logs VALUES (3, 123)

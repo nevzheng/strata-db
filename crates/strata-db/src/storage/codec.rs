@@ -267,8 +267,9 @@ impl Value {
             Value::Text(s) => s.encoded_size(),
             Value::Bytes(b) => b.encoded_size(),
             Value::Json(j) => j.encoded_size(),
-            // Date rides on i32's fixed-width encoding.
+            // Date / Timestamp ride on i32 / i64's fixed-width encodings.
             Value::Date(n) => n.encoded_size(),
+            Value::Timestamp(n) => n.encoded_size(),
         }
     }
 
@@ -287,6 +288,7 @@ impl Value {
             Value::Bytes(b) => b.encode(buf),
             Value::Json(j) => j.encode(buf),
             Value::Date(n) => n.encode(buf),
+            Value::Timestamp(n) => n.encode(buf),
         }
     }
 
@@ -327,6 +329,10 @@ impl Value {
                 n.encode_key(buf);
                 Ok(())
             }
+            Value::Timestamp(n) => {
+                n.encode_key(buf);
+                Ok(())
+            }
         }
     }
 
@@ -342,6 +348,7 @@ impl Value {
             LogicalType::Bytes => Ok(Value::Bytes(<Vec<u8>>::decode(buf)?)),
             LogicalType::Json => Ok(Value::Json(serde_json::Value::decode(buf)?)),
             LogicalType::Date => Ok(Value::Date(i32::decode(buf)?)),
+            LogicalType::Timestamp => Ok(Value::Timestamp(i64::decode(buf)?)),
         }
     }
 }

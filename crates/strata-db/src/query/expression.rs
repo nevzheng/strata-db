@@ -180,9 +180,10 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
     match (lhs, rhs) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        // Dates order by their day count; they don't coerce with
-        // integers (`date < 5` is a type error, not a silent compare).
+        // Dates / timestamps order by their integer count; they don't
+        // coerce with plain integers (`date < 5` is a type error).
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
+        (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),
@@ -303,6 +304,14 @@ mod tests {
             Expr::lit(5i64),
         );
         assert!(matches!(cmp.eval(&t(vec![])), Err(QueryError::Type(_))));
+    }
+
+    #[test]
+    fn eval_timestamp_comparison() {
+        let later = Expr::lit(Value::Timestamp(1_000_000));
+        let earlier = Expr::lit(Value::Timestamp(0));
+        let gt = Expr::binary(BinaryOperator::Gt, later, earlier);
+        assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
     }
 
     #[test]
