@@ -236,3 +236,62 @@ query T
 SELECT id FROM strata.types.measures WHERE id = 4
 ----
 4
+
+# =====================================================================
+# TIME — microseconds since midnight (without time zone)
+# =====================================================================
+
+query T
+SELECT TIME '14:30:00'
+----
+14:30:00
+
+query T
+SELECT TIME '14:30:00' < TIME '15:00:00'
+----
+t
+
+statement ok
+CREATE TABLE strata.types.clock (id INT, at TIME)
+
+statement ok
+INSERT INTO strata.types.clock VALUES (1, TIME '09:00:00'), (2, TIME '17:30:00')
+
+query TT
+SELECT * FROM strata.types.clock
+----
+1 09:00:00
+2 17:30:00
+
+query T
+SELECT CAST('23:59:59' AS TIME)
+----
+23:59:59
+
+# =====================================================================
+# UUID — 16 bytes, ordered by byte value
+# =====================================================================
+
+query T
+SELECT UUID '550e8400-e29b-41d4-a716-446655440000'
+----
+550e8400-e29b-41d4-a716-446655440000
+
+statement ok
+CREATE TABLE strata.types.ids (id UUID, label TEXT)
+
+# UUID primary key sorts by byte value (raw-bytes order-preserving key).
+statement ok
+INSERT INTO strata.types.ids VALUES (UUID 'ffffffff-ffff-ffff-ffff-ffffffffffff', 'z'), (UUID '00000000-0000-0000-0000-000000000001', 'a')
+
+query TT
+SELECT * FROM strata.types.ids
+----
+00000000-0000-0000-0000-000000000001 a
+ffffffff-ffff-ffff-ffff-ffffffffffff z
+
+# CAST text -> uuid normalizes the formatting (lower-case).
+query T
+SELECT CAST('550E8400-E29B-41D4-A716-446655440000' AS UUID)
+----
+550e8400-e29b-41d4-a716-446655440000

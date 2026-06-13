@@ -93,6 +93,8 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
         Value::Bool(b) if matches!(field.ty, T::Bool) => Ok(Value::Bool(b)),
         Value::Date(d) if matches!(field.ty, T::Date) => Ok(Value::Date(d)),
         Value::Timestamp(t) if matches!(field.ty, T::Timestamp) => Ok(Value::Timestamp(t)),
+        Value::Time(t) if matches!(field.ty, T::Time) => Ok(Value::Time(t)),
+        Value::Uuid(u) if matches!(field.ty, T::Uuid) => Ok(Value::Uuid(u)),
         Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
         Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
         Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),

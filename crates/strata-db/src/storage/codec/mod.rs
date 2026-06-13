@@ -44,6 +44,7 @@ mod scalar;
 mod text;
 
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use crate::storage::types::{LogicalType, Value};
 
@@ -103,6 +104,8 @@ impl Value {
             Value::Float32(f) => f.encoded_size(),
             Value::Float64(f) => f.encoded_size(),
             Value::Numeric(d) => d.encoded_size(),
+            Value::Time(n) => n.encoded_size(),
+            Value::Uuid(u) => u.encoded_size(),
         }
     }
 
@@ -125,6 +128,8 @@ impl Value {
             Value::Float32(f) => f.encode(buf),
             Value::Float64(f) => f.encode(buf),
             Value::Numeric(d) => d.encode(buf),
+            Value::Time(n) => n.encode(buf),
+            Value::Uuid(u) => u.encode(buf),
         }
     }
 
@@ -145,6 +150,8 @@ impl Value {
             Value::Float32(f) => f.encode_key(buf),
             Value::Float64(f) => f.encode_key(buf),
             Value::Numeric(d) => d.encode_key(buf),
+            Value::Time(n) => n.encode_key(buf),
+            Value::Uuid(u) => u.encode_key(buf),
         }
         Ok(())
     }
@@ -165,6 +172,8 @@ impl Value {
             LogicalType::Float32 => Ok(Value::Float32(f32::decode(buf)?)),
             LogicalType::Float64 => Ok(Value::Float64(f64::decode(buf)?)),
             LogicalType::Numeric => Ok(Value::Numeric(Decimal::decode(buf)?)),
+            LogicalType::Time => Ok(Value::Time(i64::decode(buf)?)),
+            LogicalType::Uuid => Ok(Value::Uuid(Uuid::decode(buf)?)),
         }
     }
 }

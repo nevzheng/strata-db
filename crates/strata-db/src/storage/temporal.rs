@@ -13,7 +13,7 @@
 //! lean on `chrono` for the calendar math: parsing, leap-year-aware
 //! validation, and formatting.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 
 /// The Unix epoch as a civil date — the zero point for `Value::Date`.
 fn epoch() -> NaiveDate {
@@ -83,6 +83,25 @@ pub fn format_timestamptz(micros: i64) -> String {
         .expect("timestamp micros in range")
         .format("%Y-%m-%d %H:%M:%S%:z")
         .to_string()
+}
+
+/// Parse a SQL `TIME` body — `HH:MM:SS[.ffffff]` — into microseconds
+/// since midnight (`TIME WITHOUT TIME ZONE`).
+pub fn parse_time(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let invalid = || format!("invalid TIME literal: {s:?}");
+    let t = NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
+        .map_err(|_| invalid())?;
+    Ok(t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000)
+}
+
+/// Render microseconds-since-midnight as `HH:MM:SS`. Sub-second precision
+/// is preserved in storage but not shown.
+pub fn format_time(micros: i64) -> String {
+    let secs = micros.div_euclid(1_000_000);
+    let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 #[cfg(test)]
@@ -171,5 +190,13 @@ mod tests {
     fn timestamptz_rejects_invalid() {
         assert!(parse_timestamptz("not a timestamp").is_err());
         assert!(parse_timestamptz("2026-13-01 00:00:00+00").is_err());
+    }
+
+    #[test]
+    fn time_parse_and_format() {
+        assert_eq!(parse_time("00:00:00").unwrap(), 0);
+        assert_eq!(parse_time("14:30:00").unwrap(), 52_200_000_000);
+        assert_eq!(format_time(parse_time("23:59:59").unwrap()), "23:59:59");
+        assert!(parse_time("nope").is_err());
     }
 }

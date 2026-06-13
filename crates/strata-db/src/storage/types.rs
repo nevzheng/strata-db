@@ -21,6 +21,8 @@
 //! | `Float32` | `f32`      | `REAL` / `FLOAT4` |
 //! | `Float64` | `f64`      | `DOUBLE PRECISION` / `FLOAT8` / `FLOAT` |
 //! | `Numeric` | `Decimal`  | `NUMERIC` / `DECIMAL` |
+//! | `Time`  | `i64`        | `TIME` (without time zone) |
+//! | `Uuid`  | `uuid::Uuid` | `UUID` |
 //!
 //! `Numeric` is exact decimal (backed by `rust_decimal`); its
 //! order-preserving key encoding lives in [`crate::storage::codec`].
@@ -56,6 +58,8 @@ pub enum LogicalType {
     Float32,
     Float64,
     Numeric,
+    Time,
+    Uuid,
 }
 
 /// A single runtime datum carrying both its type tag and the data.
@@ -85,6 +89,10 @@ pub enum Value {
     /// Exact decimal — `NUMERIC` / `DECIMAL`. See
     /// [`crate::storage::codec`] for the order-preserving key encoding.
     Numeric(rust_decimal::Decimal),
+    /// Microseconds since midnight — `TIME` (without time zone).
+    Time(i64),
+    /// A `UUID` (16 bytes); orders by byte value, like Postgres.
+    Uuid(uuid::Uuid),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is

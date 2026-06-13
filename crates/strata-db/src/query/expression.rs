@@ -11,6 +11,7 @@
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use uuid::Uuid;
 
 use crate::storage::types::{LogicalType, Tuple, Value};
 
@@ -230,7 +231,29 @@ fn eval_cast(v: Value, target: LogicalType) -> Result<Value, QueryError> {
         T::Bytes => cast_to_bytes(v),
         T::Date => cast_to_date(&v),
         T::Timestamp => cast_to_timestamp(&v),
+        T::Time => cast_to_time(&v),
+        T::Uuid => cast_to_uuid(&v),
         T::Json => cast_to_json(&v),
+    }
+}
+
+fn cast_to_time(v: &Value) -> Result<Value, QueryError> {
+    match v {
+        Value::Time(t) => Ok(Value::Time(*t)),
+        Value::Text(s) => crate::storage::temporal::parse_time(s.trim())
+            .map(Value::Time)
+            .map_err(QueryError::type_error),
+        other => Err(cast_err(other, "time")),
+    }
+}
+
+fn cast_to_uuid(v: &Value) -> Result<Value, QueryError> {
+    match v {
+        Value::Uuid(u) => Ok(Value::Uuid(*u)),
+        Value::Text(s) => Uuid::parse_str(s.trim())
+            .map(Value::Uuid)
+            .map_err(|_| cast_err(v, "uuid")),
+        other => Err(cast_err(other, "uuid")),
     }
 }
 
@@ -487,6 +510,8 @@ fn concat_str(v: &Value) -> Result<String, QueryError> {
         Value::Text(s) => s.clone(),
         Value::Date(d) => crate::storage::temporal::format_date(*d),
         Value::Timestamp(t) => crate::storage::temporal::format_timestamptz(*t),
+        Value::Time(t) => crate::storage::temporal::format_time(*t),
+        Value::Uuid(u) => u.to_string(),
         other => {
             return Err(QueryError::type_error(format!(
                 "cannot concatenate {other:?}"
@@ -798,10 +823,12 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
     match (lhs, rhs) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        // Dates / timestamps order by their integer count; they don't
-        // coerce with plain integers (`date < 5` is a type error).
+        // Dates / timestamps / times order by their integer count; they
+        // don't coerce with plain integers (`date < 5` is a type error).
         (Value::Date(a), Value::Date(b)) => Ok(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
+        (Value::Time(a), Value::Time(b)) => Ok(a.cmp(b)),
+        (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
         (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),

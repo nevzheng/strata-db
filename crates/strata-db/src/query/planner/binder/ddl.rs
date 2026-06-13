@@ -204,6 +204,12 @@ pub(super) fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
         | DataType::Dec(_)
         | DataType::BigNumeric(_)
         | DataType::BigDecimal(_) => LogicalType::Numeric,
+        // TIME (without time zone) only; TIMETZ isn't modeled.
+        DataType::Time(_, tz) if is_tz_aware(tz) => {
+            return Err(QueryError::unsupported("TIME WITH TIME ZONE"));
+        }
+        DataType::Time(_, _) => LogicalType::Time,
+        DataType::Uuid => LogicalType::Uuid,
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }

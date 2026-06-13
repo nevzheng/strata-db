@@ -7,6 +7,8 @@
 //! IEEE-754 total-order transform. Lex byte-sort then matches numeric
 //! order across the negative/positive boundary.
 
+use uuid::Uuid;
+
 use super::{DecodeError, KeyCodec, ValueCodec, take};
 
 impl ValueCodec for bool {
@@ -103,6 +105,21 @@ impl ValueCodec for f64 {
     }
 }
 
+impl ValueCodec for Uuid {
+    fn encoded_size(&self) -> usize {
+        16
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.as_bytes());
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = take(buf, 16)?;
+        Ok(Uuid::from_bytes(bytes.try_into().unwrap()))
+    }
+}
+
 // --- KeyCodec: order-preserving ---
 
 impl KeyCodec for bool {
@@ -148,5 +165,12 @@ impl KeyCodec for f64 {
         let bits = self.to_bits();
         let mask = (bits >> 63).wrapping_neg() | (1 << 63);
         buf.extend_from_slice(&(bits ^ mask).to_be_bytes());
+    }
+}
+
+impl KeyCodec for Uuid {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        // Raw 16 bytes already sort like Postgres orders uuids.
+        buf.extend_from_slice(self.as_bytes());
     }
 }

@@ -8,6 +8,7 @@ use sqlparser::ast::{
 };
 
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use crate::query::QueryError;
 use crate::query::expression::{BinaryOperator, Expr, ScalarFunc};
@@ -390,6 +391,24 @@ fn bind_typed_string(ts: &TypedString) -> Result<Expr, QueryError> {
                 .map_err(|_| QueryError::type_error(format!("invalid NUMERIC literal: {s:?}")))?;
             Ok(Expr::Literal {
                 value: Value::Numeric(d),
+            })
+        }
+        DataType::Time(_, tz) if is_tz_aware(tz) => {
+            Err(QueryError::unsupported("TIME WITH TIME ZONE literal"))
+        }
+        DataType::Time(_, _) => {
+            let micros =
+                temporal::parse_time(&as_string("TIME")?).map_err(QueryError::type_error)?;
+            Ok(Expr::Literal {
+                value: Value::Time(micros),
+            })
+        }
+        DataType::Uuid => {
+            let s = as_string("UUID")?;
+            let u = Uuid::parse_str(s.trim())
+                .map_err(|_| QueryError::type_error(format!("invalid UUID literal: {s:?}")))?;
+            Ok(Expr::Literal {
+                value: Value::Uuid(u),
             })
         }
         other => Err(QueryError::unsupported(format!("typed literal: {other:?}"))),
