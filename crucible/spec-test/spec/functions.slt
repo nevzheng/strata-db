@@ -203,3 +203,16 @@ SELECT -v FROM strata.func.signed
 ----
 -7
 3
+
+# --- value size guard (until page-span overflow lands) ----------------
+
+statement ok
+CREATE TABLE strata.func.big (id INT, body TEXT)
+
+# Under the cap stores fine.
+statement ok
+INSERT INTO strata.func.big VALUES (1, REPEAT('x', 7000))
+
+# Over the cap is a clear error, not an opaque page failure.
+statement error
+INSERT INTO strata.func.big VALUES (2, REPEAT('x', 9000))

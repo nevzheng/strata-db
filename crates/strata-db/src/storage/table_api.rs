@@ -30,6 +30,35 @@ use crate::storage::types::{Tuple, Value};
 
 pub type Predicate = Box<dyn Fn(&Tuple) -> bool>;
 
+/// Largest inline `TEXT` / `BYTES` value we accept, until page-spanning
+/// (overflow pages) lands. A storage page is 8 KiB; we cap a single
+/// value comfortably under that so the rest of the row still fits.
+/// Oversized values get a clear error here instead of an opaque failure
+/// down at the page layer. Tunable — raise or remove once overflow pages
+/// exist.
+pub const MAX_TEXT_SIZE: usize = 8000;
+
+/// Largest `ARRAY` element count, same rationale (no page-span yet).
+/// Used once the `ARRAY` type lands.
+pub const MAX_ARRAY_SIZE: usize = 1024;
+
+/// Reject a value that's too large to store inline. Only the
+/// variable-length types can exceed the cap.
+fn check_value_size(value: &Value) -> Result<(), QueryError> {
+    let len = match value {
+        Value::Text(s) => s.len(),
+        Value::Bytes(b) => b.len(),
+        _ => return Ok(()),
+    };
+    if len > MAX_TEXT_SIZE {
+        return Err(QueryError::unsupported(format!(
+            "value of {len} bytes exceeds the {MAX_TEXT_SIZE}-byte limit \
+             (large values need page-span support, not implemented yet)"
+        )));
+    }
+    Ok(())
+}
+
 pub struct ScanOptions {
     pub range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     pub predicate: Option<Predicate>,
@@ -229,6 +258,9 @@ impl<'engine> TableWriter<'engine> {
     pub fn put(&mut self, tuple: &Tuple) -> Result<(), QueryError> {
         if tuple.values.is_empty() {
             return Err(QueryError::Internal("cannot insert empty tuple".into()));
+        }
+        for value in &tuple.values {
+            check_value_size(value)?;
         }
         let mut user_key = Vec::new();
         tuple.values[0].encode_key(&mut user_key)?;
