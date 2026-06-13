@@ -1,21 +1,18 @@
 //! The page cache — the read path for on-disk SSTable data.
 //!
-//! Headers and data blocks are cached separately: a table has one header
-//! (keyed by [`SsTableId`]) and many data blocks (keyed by [`PageId`]). Both
-//! are read-through; on a miss the caller's loader reads from disk and the
-//! cache memoizes the result. Single-threaded.
-//!
-//! Internally this is two independent [`filesystem::Cache`] instances sharing one
-//! generic read-through implementation — one for headers, one for blocks.
-//!
-//! The [`PageCacheConfig`] gives the size budget ([`SizeConfig`]) and eviction
-//! policy ([`CachePolicy`]); when an insert pushes a cache over budget, entries
-//! are evicted accordingly. `prefetch_*` are no-ops for now.
+//! This is a thin facade over two [`filesystem::Cache`] instances: one for
+//! header pages (keyed by [`HeaderId`] — every table's root and child chunks)
+//! and one for data blocks (keyed by [`PageId`]). The read-through,
+//! memoization, eviction, and budget machinery all live once in
+//! `filesystem::Cache` and are tested there; the only thing this layer adds is
+//! the *split itself* — two caches with **independent** budgets, so churning
+//! blocks can't evict hot headers (and vice versa) — plus the typed `fetch_*`
+//! methods and the [`PageCacheConfig`] → [`filesystem::Budget`] adapter.
+//! `prefetch_*` are no-ops for now. Single-threaded.
 
 use std::io;
 
-use super::page::{Page, PageId};
-use crate::SsTableId;
+use super::page::{HeaderId, Page, PageId};
 use crate::config::{CachePolicy, PageCacheConfig, SizeConfig};
 
 impl filesystem::Weight for Page {
@@ -34,9 +31,11 @@ fn budget(size: SizeConfig) -> filesystem::Budget {
 }
 
 pub struct SstPageCache {
-    /// Table headers, keyed by [`SsTableId`].
-    headers: filesystem::Cache<SsTableId, Page, filesystem::policies::Lru<SsTableId>>,
-    /// Data blocks, keyed by [`PageId`].
+    /// Header pages — roots and child chunks of every table — keyed by
+    /// [`HeaderId`]. One shared cache, so a large table's chunks and a small
+    /// table's root coexist and compete for the same budget.
+    headers: filesystem::Cache<HeaderId, Page, filesystem::policies::Lru<HeaderId>>,
+    /// Data blocks of every table, keyed by [`PageId`].
     blocks: filesystem::Cache<PageId, Page, filesystem::policies::Lru<PageId>>,
     config: PageCacheConfig,
 }
@@ -80,10 +79,11 @@ impl SstPageCache {
         self.config
     }
 
-    /// Return the cached header for `id`, or load it via `load` and cache it.
+    /// Return the cached header page for `id` (a root or a child chunk), or
+    /// load it via `load` and cache it.
     pub fn fetch_header(
         &self,
-        id: SsTableId,
+        id: HeaderId,
         load: impl FnOnce() -> io::Result<Page>,
     ) -> io::Result<Page> {
         self.headers.get_or_load(id, load)
@@ -98,8 +98,8 @@ impl SstPageCache {
         self.blocks.get_or_load(id, load)
     }
 
-    /// Hint that a table's header will be needed soon. No-op for now.
-    pub fn prefetch_header(&self, _id: SsTableId) {}
+    /// Hint that a header page will be needed soon. No-op for now.
+    pub fn prefetch_header(&self, _id: HeaderId) {}
 
     /// Hint that a data block will be needed soon. No-op for now.
     pub fn prefetch_block(&self, _id: PageId) {}
@@ -123,13 +123,18 @@ impl SstPageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SsTableId;
     use std::cell::Cell;
 
-    fn block_id(sst: u64, page: u32) -> PageId {
+    fn block_id(sst: u64, offset: u64) -> PageId {
         PageId {
             table: SsTableId(sst),
-            page_index: page,
+            offset,
         }
+    }
+
+    fn root_id(sst: u64) -> HeaderId {
+        HeaderId::Root(SsTableId(sst))
     }
 
     fn page(n: usize) -> Page {
@@ -137,58 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn block_loads_on_miss_then_hits_cache() {
-        let cache = SstPageCache::default();
-        let id = block_id(7, 0);
-        let loads = Cell::new(0);
-        let load = || {
-            loads.set(loads.get() + 1);
-            Ok(page(8))
-        };
-
-        cache.fetch_block(id, load).unwrap();
-        cache.fetch_block(id, load).unwrap();
-        assert_eq!(loads.get(), 1, "second fetch must hit the cache");
-    }
-
-    #[test]
     fn headers_and_blocks_are_separate() {
         let cache = SstPageCache::default();
-        cache.fetch_header(SsTableId(1), || Ok(page(8))).unwrap();
+        cache.fetch_header(root_id(1), || Ok(page(8))).unwrap();
         cache.fetch_block(block_id(1, 0), || Ok(page(8))).unwrap();
         assert_eq!(cache.len(), 2);
 
-        cache.prefetch_header(SsTableId(2));
+        cache.prefetch_header(root_id(2));
         cache.prefetch_block(block_id(2, 0));
         assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn evicts_lru_when_over_budget() {
-        // Budgets are now per-cache, so `Pages(2)` caps the block cache at two
-        // blocks on its own — independent of any headers.
-        let cache = SstPageCache::new(PageCacheConfig {
-            size: SizeConfig::Pages(2),
-            policy: CachePolicy::Lru,
-        });
-        cache.fetch_block(block_id(1, 0), || Ok(page(8))).unwrap();
-        cache.fetch_block(block_id(1, 1), || Ok(page(8))).unwrap();
-        // Third insert is over budget → the LRU (block 0) is evicted.
-        cache.fetch_block(block_id(1, 2), || Ok(page(8))).unwrap();
-        assert_eq!(cache.len(), 2);
-
-        // Block 0 was evicted, so fetching it runs the loader again.
-        let reloaded = Cell::new(false);
-        cache
-            .fetch_block(block_id(1, 0), || {
-                reloaded.set(true);
-                Ok(page(8))
-            })
-            .unwrap();
-        assert!(
-            reloaded.get(),
-            "least-recently-used block should have been evicted"
-        );
     }
 
     #[test]
@@ -204,26 +166,14 @@ mod tests {
             header_loads.set(header_loads.get() + 1);
             Ok(page(8))
         };
-        cache.fetch_header(SsTableId(1), header_load).unwrap();
+        cache.fetch_header(root_id(1), header_load).unwrap();
 
         // Churn the block cache well past its budget.
-        for i in 0..10 {
+        for i in 0..10u64 {
             cache.fetch_block(block_id(1, i), || Ok(page(8))).unwrap();
         }
         // The header is still cached — fetching it again does not reload.
-        cache.fetch_header(SsTableId(1), header_load).unwrap();
+        cache.fetch_header(root_id(1), header_load).unwrap();
         assert_eq!(header_loads.get(), 1, "block churn must not evict headers");
-    }
-
-    #[test]
-    fn unbounded_never_evicts() {
-        let cache = SstPageCache::new(PageCacheConfig {
-            size: SizeConfig::Unbounded,
-            policy: CachePolicy::Lru,
-        });
-        for i in 0..100 {
-            cache.fetch_block(block_id(1, i), || Ok(page(8))).unwrap();
-        }
-        assert_eq!(cache.len(), 100);
     }
 }
