@@ -4,12 +4,12 @@
 //! Resolving an index scan (key → tuple location) into tuple bytes means a heap
 //! fetch per row. To avoid a fresh page handle per row, [`Scan`] keeps the
 //! *current* page pinned and reuses it for consecutive rows that live on it —
-//! one [`pager::ReadPage`] per page, not per tuple. Because each yielded
+//! one [`filesystem::ReadPage`] per page, not per tuple. Because each yielded
 //! [`ScanRow`] borrows that held page, this is a lending iterator: finish with a
 //! row before pulling the next.
 
 use lsm::KVPair;
-use pager::{FileVfs, Heap, PageTuples, TupleView};
+use filesystem::{FileVfs, Heap, PageTuples, TupleView};
 
 use crate::StorageError;
 use crate::engine::decode_loc;

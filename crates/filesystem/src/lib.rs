@@ -1,6 +1,6 @@
-//! `pager` — strata-db's storage foundation: the virtual file system and the
-//! primitives that sit on it. Everything between the backing file and the rest
-//! of the engine lives here, exposed as a small set of nouns:
+//! `filesystem` — strata-db's storage foundation: the virtual file system and
+//! the primitives that sit on it. Everything between the backing file and the
+//! rest of the engine lives here, exposed as a small set of nouns:
 //!
 //! - **Vfs** ([`Vfs`], [`FileVfs`], [`MemVfs`]) — raw, fixed-size *block* I/O
 //!   over a backing store. Nothing above it touches `std::fs`. Knows nothing
@@ -10,8 +10,10 @@
 //! - **Caches** — the generic read-through [`Cache`] (memoizes immutable values,
 //!   hands out owned handles) and the [`PageCache`] buffer pool (the mutable,
 //!   pinned, journaled read/write path for the heap).
-//! - **Policies** ([`Lru`], [`LruK`], [`Clock`], [`Lfu`]) — pluggable
-//!   [`EvictionPolicy`], shared by both caches.
+//! - **Policies** ([`policies`]) — the [`EvictionPolicy`](policies::EvictionPolicy)
+//!   contract and a menu of impls ([`Lru`](policies::Lru),
+//!   [`LruK`](policies::LruK), [`Clock`](policies::Clock),
+//!   [`Lfu`](policies::Lfu)), shared by both caches.
 //! - **Pages** ([`PageHeader`], [`TuplePage`], …) — a block reinterpreted: a
 //!   21-byte self-describing header (magic, type, CRC32c) plus a typed payload.
 //! - **Heap** ([`Heap`]) — tuple storage over the buffer pool.
@@ -30,7 +32,7 @@ mod heap;
 pub mod journal;
 mod loc;
 pub mod page;
-mod policies;
+pub mod policies;
 mod vfs;
 
 // Virtual file system — raw, fixed-size block I/O over a backing store.
@@ -44,8 +46,8 @@ pub use codec::{
 // Caches & buffers — the read/write paths over a Vfs.
 pub use cache::{Budget, Cache, PageCache, ReadPage, Weight, WritePage};
 
-// Eviction policies — pluggable, shared by the buffer pool and the read-through cache.
-pub use policies::{Clock, EvictionPolicy, Lfu, Lru, LruK};
+// Eviction policies live in their own namespace, shared by the buffer pool and
+// the read-through cache: `filesystem::policies::{EvictionPolicy, Lru, LruK, Clock, Lfu}`.
 
 // Pages — typed views over a block.
 pub use page::{HEADER_LEN, PAGE_SIZE, PageHeader, TuplePage, TuplePageMut, read_text, write_text};

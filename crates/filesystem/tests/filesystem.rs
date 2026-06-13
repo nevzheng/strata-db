@@ -1,10 +1,10 @@
-//! End-to-end tests for the pager: the cache over a real file VFS, eviction
+//! End-to-end tests for the filesystem: the cache over a real file VFS, eviction
 //! under a small pool, and the two page types round-tripping through it.
 
-use pager::page::finalize_checksum;
-use pager::page::types::TUPLE_PAGE;
-use pager::{FileVfs, MemVfs, PAGE_SIZE, PageCache, PageHeader, PageId, TuplePage, TuplePageMut};
-use pager::{PageJournal, PageOp, read_text, write_text};
+use filesystem::page::finalize_checksum;
+use filesystem::page::types::TUPLE_PAGE;
+use filesystem::{FileVfs, MemVfs, PAGE_SIZE, PageCache, PageHeader, PageId, TuplePage, TuplePageMut};
+use filesystem::{PageJournal, PageOp, read_text, write_text};
 
 /// Allocate a page, write it, flush, drop the whole cache, reopen the file, and
 /// read the page back — the durability path end to end.

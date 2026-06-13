@@ -5,7 +5,7 @@
 //! are read-through; on a miss the caller's loader reads from disk and the
 //! cache memoizes the result. Single-threaded.
 //!
-//! Internally this is two independent [`pager::Cache`] instances sharing one
+//! Internally this is two independent [`filesystem::Cache`] instances sharing one
 //! generic read-through implementation — one for headers, one for blocks.
 //!
 //! The [`PageCacheConfig`] gives the size budget ([`SizeConfig`]) and eviction
@@ -18,26 +18,26 @@ use super::page::{Page, PageId};
 use crate::SsTableId;
 use crate::config::{CachePolicy, PageCacheConfig, SizeConfig};
 
-impl pager::Weight for Page {
+impl filesystem::Weight for Page {
     fn weight(&self) -> usize {
         self.bytes().len()
     }
 }
 
-/// Translate the LSM-facing [`SizeConfig`] into a [`pager::Budget`].
-fn budget(size: SizeConfig) -> pager::Budget {
+/// Translate the LSM-facing [`SizeConfig`] into a [`filesystem::Budget`].
+fn budget(size: SizeConfig) -> filesystem::Budget {
     match size {
-        SizeConfig::Unbounded => pager::Budget::Unbounded,
-        SizeConfig::Pages(n) => pager::Budget::Entries(n),
-        SizeConfig::Bytes(n) => pager::Budget::Bytes(n),
+        SizeConfig::Unbounded => filesystem::Budget::Unbounded,
+        SizeConfig::Pages(n) => filesystem::Budget::Entries(n),
+        SizeConfig::Bytes(n) => filesystem::Budget::Bytes(n),
     }
 }
 
 pub struct SstPageCache {
     /// Table headers, keyed by [`SsTableId`].
-    headers: pager::Cache<SsTableId, Page, pager::Lru<SsTableId>>,
+    headers: filesystem::Cache<SsTableId, Page, filesystem::policies::Lru<SsTableId>>,
     /// Data blocks, keyed by [`PageId`].
-    blocks: pager::Cache<PageId, Page, pager::Lru<PageId>>,
+    blocks: filesystem::Cache<PageId, Page, filesystem::policies::Lru<PageId>>,
     config: PageCacheConfig,
 }
 
@@ -59,10 +59,10 @@ impl SstPageCache {
         // One `match` per cache because the two policies are distinct types
         // (`Lru<SsTableId>` vs `Lru<PageId>`); a shared closure can't return both.
         let headers = match config.policy {
-            CachePolicy::Lru => pager::Cache::new(budget(config.size), pager::Lru::new()),
+            CachePolicy::Lru => filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new()),
         };
         let blocks = match config.policy {
-            CachePolicy::Lru => pager::Cache::new(budget(config.size), pager::Lru::new()),
+            CachePolicy::Lru => filesystem::Cache::new(budget(config.size), filesystem::policies::Lru::new()),
         };
         Self {
             headers,

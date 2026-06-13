@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::iterator::Scan;
 use crate::{StorageError, memstore::BTreeMapStore};
 use lsm::{LevelConfig, Lsm, LsmConfig, MemStore};
-use pager::{FileVfs, Heap, PageCache, TupleLoc, TupleRef};
+use filesystem::{FileVfs, Heap, PageCache, TupleLoc, TupleRef};
 use tracing::{info, instrument};
 
 /// Frames in the heap's buffer pool. 1024 × 8 KiB ≈ 8 MiB. A tuning knob.

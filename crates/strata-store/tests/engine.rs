@@ -1,4 +1,4 @@
-//! Integration tests over the `lsm`-index + pager-heap engine: put / get /
+//! Integration tests over the `lsm`-index + filesystem-heap engine: put / get /
 //! delete / scan, manual flush, and recovery across reopen.
 //!
 //! Note: compaction is still manual (`flush` is explicit); there's no automatic
