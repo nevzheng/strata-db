@@ -12,9 +12,9 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, ColumnDef, ColumnOption, CreateTable as AstCreateTable,
-    DataType, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName, Query as AstQuery,
-    SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
-    TableWithJoins, TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
+    DataType, ExactNumberInfo, Expr as AstExpr, GroupByExpr, Ident, Insert, ObjectName,
+    Query as AstQuery, SchemaName, Select, SelectItem, SetExpr, SqlOption, Statement, TableFactor,
+    TableObject, TableWithJoins, TimezoneInfo, TypedString, UnaryOperator, Value as AstValue,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -247,6 +247,27 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
             };
             fit_int(n, field)
         }
+        // Floats: exact-type passes; cross-width and int→float convert
+        // (REAL narrows from DOUBLE/int, possibly to ±inf — same as SQL
+        // assignment). Float→int is not implicit; it needs an explicit cast.
+        Value::Float64(f) if matches!(field.ty, T::Float64) => Ok(Value::Float64(f)),
+        Value::Float64(f) if matches!(field.ty, T::Float32) => Ok(Value::Float32(f as f32)),
+        Value::Float32(f) if matches!(field.ty, T::Float32) => Ok(Value::Float32(f)),
+        Value::Float32(f) if matches!(field.ty, T::Float64) => Ok(Value::Float64(f as f64)),
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_)
+            if matches!(field.ty, T::Float32 | T::Float64) =>
+        {
+            let n = match value {
+                Value::Int16(x) => x as f64,
+                Value::Int32(x) => x as f64,
+                Value::Int64(x) => x as f64,
+                _ => unreachable!(),
+            };
+            Ok(match field.ty {
+                T::Float32 => Value::Float32(n as f32),
+                _ => Value::Float64(n),
+            })
+        }
         other => Err(QueryError::type_error(format!(
             "cannot insert {other:?} into column `{}` of type {:?}",
             field.name.as_str(),
@@ -394,8 +415,27 @@ fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
                 "TIMESTAMP WITHOUT TIME ZONE (use TIMESTAMP WITH TIME ZONE)",
             ));
         }
+        // Postgres float sizing: REAL / FLOAT4 are 4-byte; DOUBLE
+        // PRECISION / FLOAT8 are 8-byte; bare FLOAT is double precision.
+        // FLOAT(p) is single precision for p ≤ 24, double otherwise.
+        DataType::Real | DataType::Float4 | DataType::Float32 => LogicalType::Float32,
+        DataType::DoublePrecision | DataType::Double(_) | DataType::Float8 | DataType::Float64 => {
+            LogicalType::Float64
+        }
+        DataType::Float(info) => match float_precision(info) {
+            Some(p) if p <= 24 => LogicalType::Float32,
+            _ => LogicalType::Float64,
+        },
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
+}
+
+/// The declared precision of a SQL `FLOAT(p)`, if any.
+fn float_precision(info: &ExactNumberInfo) -> Option<u64> {
+    match info {
+        ExactNumberInfo::None => None,
+        ExactNumberInfo::Precision(p) | ExactNumberInfo::PrecisionAndScale(p, _) => Some(*p),
+    }
 }
 
 /// Split a `project.dataset.table` object name into its three parts.
@@ -611,11 +651,11 @@ fn is_tz_aware(tz: &TimezoneInfo) -> bool {
     matches!(tz, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
 }
 
-/// Bind unary minus by negating a constant integer literal. Only integer
-/// literals are foldable today; anything else (a column reference, a
-/// non-integer) is unsupported until we grow an arithmetic operator.
-/// `i*::MIN` has no positive magnitude and overflows on negation — that
-/// surfaces as a type error rather than a panic.
+/// Bind unary minus by negating a constant numeric literal. Only literals
+/// are foldable today; anything else (a column reference) is unsupported
+/// until we grow an arithmetic operator. `i*::MIN` has no positive
+/// magnitude and overflows on negation — that surfaces as a type error
+/// rather than a panic.
 fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryError> {
     let overflow = || QueryError::type_error("integer literal out of range");
     let value = match expr.bind(binder)? {
@@ -628,6 +668,9 @@ fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryErro
         Expr::Literal {
             value: Value::Int64(n),
         } => Value::Int64(n.checked_neg().ok_or_else(overflow)?),
+        Expr::Literal {
+            value: Value::Float64(f),
+        } => Value::Float64(-f),
         other => return Err(QueryError::unsupported(format!("unary minus on {other:?}"))),
     };
     Ok(Expr::Literal { value })
@@ -635,10 +678,18 @@ fn negate_literal(expr: &AstExpr, binder: &mut Binder) -> Result<Expr, QueryErro
 
 fn bind_value(v: &AstValue) -> Result<Value, QueryError> {
     match v {
-        AstValue::Number(s, _) => s
-            .parse::<i64>()
-            .map(Value::Int64)
-            .map_err(|_| QueryError::Internal(format!("bad numeric literal: {s}"))),
+        // Integers bind as Int64; a literal with a fractional part or
+        // exponent (or one too large for i64) binds as Float64. (Real
+        // Postgres makes `1.5` NUMERIC, but we have no NUMERIC type yet.)
+        AstValue::Number(s, _) => {
+            if let Ok(n) = s.parse::<i64>() {
+                Ok(Value::Int64(n))
+            } else if let Ok(f) = s.parse::<f64>() {
+                Ok(Value::Float64(f))
+            } else {
+                Err(QueryError::Internal(format!("bad numeric literal: {s}")))
+            }
+        }
         AstValue::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
         AstValue::Boolean(b) => Ok(Value::Bool(*b)),
         AstValue::Null => Ok(Value::Null),

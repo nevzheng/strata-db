@@ -220,6 +220,35 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Json(j) => Some(j.to_string()),
         Value::Date(d) => Some(strata_db::storage::temporal::format_date(*d)),
         Value::Timestamp(t) => Some(strata_db::storage::temporal::format_timestamptz(*t)),
+        // Render each at its native width so the shortest round-tripping
+        // form is preserved (widening an f32 to f64 would lengthen it).
+        Value::Float32(f) => Some(float_text(
+            f.is_finite(),
+            f.is_nan(),
+            *f >= 0.0,
+            f.to_string(),
+        )),
+        Value::Float64(f) => Some(float_text(
+            f.is_finite(),
+            f.is_nan(),
+            *f >= 0.0,
+            f.to_string(),
+        )),
+    }
+}
+
+/// Render a float in Postgres style: finite values use the shortest
+/// round-tripping form (`finite_repr`), non-finite use `Infinity` /
+/// `-Infinity` / `NaN`.
+fn float_text(finite: bool, is_nan: bool, nonneg: bool, finite_repr: String) -> String {
+    if finite {
+        finite_repr
+    } else if is_nan {
+        "NaN".into()
+    } else if nonneg {
+        "Infinity".into()
+    } else {
+        "-Infinity".into()
     }
 }
 

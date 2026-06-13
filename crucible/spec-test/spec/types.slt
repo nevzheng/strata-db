@@ -161,3 +161,78 @@ SELECT id FROM strata.types.logs WHERE at = TIMESTAMPTZ '1970-01-01 00:00:00+00'
 # Wrong type into a TIMESTAMPTZ column is rejected.
 statement error
 INSERT INTO strata.types.logs VALUES (3, 123)
+
+# =====================================================================
+# FLOAT — REAL (f32, 4 bytes) and DOUBLE PRECISION (f64, 8 bytes)
+# =====================================================================
+
+# --- literals ---------------------------------------------------------
+
+query T
+SELECT 1.5
+----
+1.5
+
+# Exponent notation binds as a float.
+query T
+SELECT 1e3
+----
+1000
+
+query T
+SELECT -2.25
+----
+-2.25
+
+# --- comparisons (float/float and float/int coercion) -----------------
+
+query T
+SELECT 1.5 < 2.5
+----
+t
+
+query T
+SELECT 2.5 > 2
+----
+t
+
+# Float vs text is a type error.
+statement error
+SELECT 1.5 < 'x'
+
+# --- REAL vs DOUBLE columns: the size difference is observable --------
+
+statement ok
+CREATE TABLE strata.types.measures (id INT, r REAL, d DOUBLE PRECISION)
+
+# The same literal keeps full precision in DOUBLE but rounds to ~7
+# significant digits in REAL (4-byte f32).
+statement ok
+INSERT INTO strata.types.measures VALUES (1, 1.23456789012345, 1.23456789012345)
+
+query TTT
+SELECT * FROM strata.types.measures
+----
+1 1.2345679 1.23456789012345
+
+# Integers coerce into a float column.
+statement ok
+INSERT INTO strata.types.measures VALUES (2, 5, 5)
+
+query TT
+SELECT r, d FROM strata.types.measures WHERE id = 2
+----
+5 5
+
+# A non-numeric value into a float column is rejected.
+statement error
+INSERT INTO strata.types.measures VALUES (3, 'nope', 1.0)
+
+# NULL is accepted in a nullable float column.
+statement ok
+INSERT INTO strata.types.measures VALUES (4, NULL, NULL)
+
+query T
+SELECT id FROM strata.types.measures WHERE id = 4
+----
+4

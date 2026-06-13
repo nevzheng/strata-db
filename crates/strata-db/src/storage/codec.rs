@@ -143,6 +143,36 @@ impl ValueCodec for i64 {
     }
 }
 
+impl ValueCodec for f32 {
+    fn encoded_size(&self) -> usize {
+        4
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = take(buf, 4)?;
+        Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+}
+
+impl ValueCodec for f64 {
+    fn encoded_size(&self) -> usize {
+        8
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = take(buf, 8)?;
+        Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+}
+
 impl ValueCodec for String {
     fn encoded_size(&self) -> usize {
         4 + self.len()
@@ -236,6 +266,27 @@ impl KeyCodec for i64 {
     }
 }
 
+impl KeyCodec for f32 {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        // IEEE-754 total-order transform (see the f64 impl), 32-bit width.
+        let bits = self.to_bits();
+        let mask = (bits >> 31).wrapping_neg() | (1 << 31);
+        buf.extend_from_slice(&(bits ^ mask).to_be_bytes());
+    }
+}
+
+impl KeyCodec for f64 {
+    fn encode_key(&self, buf: &mut Vec<u8>) {
+        // IEEE-754 total-order transform: for negatives flip every bit
+        // (incl. the sign), for non-negatives flip only the sign bit;
+        // then big-endian. Result sorts -inf < … < +inf (NaN at the top),
+        // matching numeric order under lex byte compare.
+        let bits = self.to_bits();
+        let mask = (bits >> 63).wrapping_neg() | (1 << 63);
+        buf.extend_from_slice(&(bits ^ mask).to_be_bytes());
+    }
+}
+
 impl KeyCodec for String {
     fn encode_key(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self.as_bytes());
@@ -270,6 +321,8 @@ impl Value {
             // Date / Timestamp ride on i32 / i64's fixed-width encodings.
             Value::Date(n) => n.encoded_size(),
             Value::Timestamp(n) => n.encoded_size(),
+            Value::Float32(f) => f.encoded_size(),
+            Value::Float64(f) => f.encoded_size(),
         }
     }
 
@@ -289,6 +342,8 @@ impl Value {
             Value::Json(j) => j.encode(buf),
             Value::Date(n) => n.encode(buf),
             Value::Timestamp(n) => n.encode(buf),
+            Value::Float32(f) => f.encode(buf),
+            Value::Float64(f) => f.encode(buf),
         }
     }
 
@@ -333,6 +388,14 @@ impl Value {
                 n.encode_key(buf);
                 Ok(())
             }
+            Value::Float32(f) => {
+                f.encode_key(buf);
+                Ok(())
+            }
+            Value::Float64(f) => {
+                f.encode_key(buf);
+                Ok(())
+            }
         }
     }
 
@@ -349,6 +412,8 @@ impl Value {
             LogicalType::Json => Ok(Value::Json(serde_json::Value::decode(buf)?)),
             LogicalType::Date => Ok(Value::Date(i32::decode(buf)?)),
             LogicalType::Timestamp => Ok(Value::Timestamp(i64::decode(buf)?)),
+            LogicalType::Float32 => Ok(Value::Float32(f32::decode(buf)?)),
+            LogicalType::Float64 => Ok(Value::Float64(f64::decode(buf)?)),
         }
     }
 }
@@ -506,6 +571,31 @@ mod tests {
         assert_key_order_preserving(&[i16::MIN, -100, -1, 0, 1, 100, i16::MAX]);
         assert_key_order_preserving(&[i32::MIN, -100, -1, 0, 1, 100, i32::MAX]);
         assert_key_order_preserving(&[i64::MIN, -100, -1, 0, 1, 100, i64::MAX]);
+    }
+
+    #[test]
+    fn float_keys_sort_in_numeric_order() {
+        // Order-preserving across sign, signed zero, and the infinities.
+        assert_key_order_preserving(&[
+            f64::NEG_INFINITY,
+            -100.5,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            100.5,
+            f64::INFINITY,
+        ]);
+        assert_key_order_preserving(&[
+            f32::NEG_INFINITY,
+            -100.5f32,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            100.5,
+            f32::INFINITY,
+        ]);
     }
 
     #[test]

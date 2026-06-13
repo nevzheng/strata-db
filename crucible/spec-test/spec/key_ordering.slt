@@ -77,3 +77,22 @@ SELECT * FROM strata.keyorder.instants
 1969-07-20 20:17:00+00:00 moon
 1970-01-01 00:00:00+00:00 epoch
 2026-06-13 14:30:00+00:00 future
+
+# --- DOUBLE keys: order-preserving across sign and the infinities -----
+
+statement ok
+CREATE TABLE strata.keyorder.measures (x DOUBLE PRECISION, label TEXT)
+
+# An overflowing literal (1e400) lands on ±Infinity — handy for the ends.
+statement ok
+INSERT INTO strata.keyorder.measures VALUES (2.5, 'pos'), (-100.0, 'neg-hundred'), (0.0, 'zero'), (-1e400, 'neg-inf'), (1e400, 'pos-inf'), (-0.5, 'neg-half')
+
+query TT
+SELECT * FROM strata.keyorder.measures
+----
+-Infinity neg-inf
+-100 neg-hundred
+-0.5 neg-half
+0 zero
+2.5 pos
+Infinity pos-inf

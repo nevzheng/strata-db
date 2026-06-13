@@ -18,6 +18,8 @@
 //! | `Json`  | `serde_json` | `JSON` / `JSONB` |
 //! | `Date`  | `i32`        | `DATE`           |
 //! | `Timestamp` | `i64`    | `TIMESTAMP WITH TIME ZONE` |
+//! | `Float32` | `f32`      | `REAL` / `FLOAT4` |
+//! | `Float64` | `f64`      | `DOUBLE PRECISION` / `FLOAT8` / `FLOAT` |
 //!
 //! `Date` is a count of days since the Unix epoch (`1970-01-01`, UTC) —
 //! no time, no timezone. `Timestamp` is an absolute instant: microseconds
@@ -47,6 +49,8 @@ pub enum LogicalType {
     Json,
     Date,
     Timestamp,
+    Float32,
+    Float64,
 }
 
 /// A single runtime datum carrying both its type tag and the data.
@@ -68,6 +72,11 @@ pub enum Value {
     /// Microseconds since the Unix epoch, UTC — an absolute instant
     /// (`TIMESTAMP WITH TIME ZONE`). See [`crate::storage::temporal`].
     Timestamp(i64),
+    /// IEEE-754 single — `REAL` / `FLOAT4` (4 bytes).
+    Float32(f32),
+    /// IEEE-754 double — `DOUBLE PRECISION` / `FLOAT8` / `FLOAT` (8 bytes).
+    /// Inexact; for exact decimals use `NUMERIC` (not yet implemented).
+    Float64(f64),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is

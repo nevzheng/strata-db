@@ -159,23 +159,46 @@ fn as_i64(v: &Value) -> Option<i64> {
     }
 }
 
-/// Equality with numeric coercion: any two integers compare by value
-/// regardless of width; otherwise fall back to structural equality
-/// (`Text == Text`, `Bytes == Bytes`, mismatched types → not equal).
-fn values_eq(lhs: &Value, rhs: &Value) -> bool {
-    match (as_i64(lhs), as_i64(rhs)) {
-        (Some(a), Some(b)) => a == b,
-        _ => lhs == rhs,
+/// The value of `v` as `f64`, if it is any numeric type (integer or
+/// float). Lets a float coerce across the numeric types — a float
+/// against an integer literal, or `REAL` against `DOUBLE`.
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int16(n) => Some(*n as f64),
+        Value::Int32(n) => Some(*n as f64),
+        Value::Int64(n) => Some(*n as f64),
+        Value::Float32(f) => Some(*f as f64),
+        Value::Float64(f) => Some(*f),
+        _ => None,
     }
 }
 
+/// Equality with numeric coercion: two integers compare by value
+/// regardless of width; a float against any number compares as `f64`
+/// (`total_cmp`, so `NaN == NaN`); otherwise fall back to structural
+/// equality (`Text == Text`, mismatched types → not equal).
+fn values_eq(lhs: &Value, rhs: &Value) -> bool {
+    if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
+        return a.total_cmp(&b).is_eq();
+    }
+    lhs == rhs
+}
+
 /// Total order for ordered comparisons. Integers compare across widths
-/// (coerced to `i64`); same-typed bools and text compare directly.
-/// Anything else — including a non-numeric vs numeric mix — is a type
-/// error the caller surfaces to the user.
+/// (coerced to `i64`); a float against any number compares as `f64` via
+/// `total_cmp` (consistent with the float key encoding — `NaN` sorts
+/// highest, and `-0.0` < `0.0`); same-typed bools / text / dates /
+/// timestamps compare directly. Anything else — a non-numeric vs numeric
+/// mix — is a type error the caller surfaces to the user.
 fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
         return Ok(a.cmp(&b));
+    }
+    if let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
+        return Ok(a.total_cmp(&b));
     }
     match (lhs, rhs) {
         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
@@ -312,6 +335,38 @@ mod tests {
         let earlier = Expr::lit(Value::Timestamp(0));
         let gt = Expr::binary(BinaryOperator::Gt, later, earlier);
         assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_float_comparison() {
+        let lt = Expr::binary(
+            BinaryOperator::Lt,
+            Expr::lit(Value::Float64(1.5)),
+            Expr::lit(Value::Float64(2.5)),
+        );
+        assert_eq!(lt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_float_coerces_with_integer() {
+        // A float column against an integer literal compares numerically.
+        let gt = Expr::binary(
+            BinaryOperator::Gt,
+            Expr::lit(Value::Float64(2.5)),
+            Expr::lit(2i64),
+        );
+        assert_eq!(gt.eval(&t(vec![])).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_float_widths_compare_equal() {
+        // REAL 1.5 equals DOUBLE 1.5 (f32 widens exactly to f64).
+        let eq = Expr::binary(
+            BinaryOperator::Eq,
+            Expr::lit(Value::Float32(1.5)),
+            Expr::lit(Value::Float64(1.5)),
+        );
+        assert_eq!(eq.eval(&t(vec![])).unwrap(), Value::Bool(true));
     }
 
     #[test]
