@@ -8,7 +8,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 pgwire = "0.40"
-strata-db = { path = "../strata-db" }
+strata-db = { path = "../../crates/strata-db" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

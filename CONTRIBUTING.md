@@ -33,7 +33,7 @@ Rust workspace, 2024 edition. Hooks run via husky (`npm install` once).
 ```bash
 cargo build
 cargo test
-cargo run -p spec-test -- spec-test/spec                                  # SQL spec suite
+cargo run -p spec-test -- crucible/spec-test/spec                        # SQL spec suite
 cargo run -p strata-server -- --listen 127.0.0.1:5433 --data-dir ./strata-data
 cargo run -p strata-cli -- --port 5433                                    # or any pgwire client
 ```

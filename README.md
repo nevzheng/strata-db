@@ -102,6 +102,29 @@ flowchart TB
 | **Journal (WAL)** | `journal` | A CRC-framed, fsync'd append-only log with replay. Backs both page mutations and the LSM memtable. |
 | **VFS** | `pager` | The bedrock: an abstract block store with file (`FileVfs`) and in-memory (`MemVfs`) backends. |
 
+## Repository layout
+
+The Cargo workspace mirrors the layered architecture:
+
+```
+crates/      library crates
+  journal      append-only crash-safe log
+  lsm          LSM-tree index
+  pager        page cache + VFS (tuple heap)
+  strata-store storage backend (LSM index over the heap)
+  strata-db    SQL engine (planner, executor, catalog)
+bins/        runnable binaries
+  strata-server  pgwire server
+  strata-cli     interactive client (binary name: `strata`)
+crucible/    correctness & performance validation
+  spec-test    E2E wire-protocol SQL tests (sqllogictest)
+  bench/       benchmarking (TBD)
+```
+
+`crucible/` holds the project's validation harnesses: `spec-test` drives the
+server end-to-end over the Postgres wire protocol, and `bench/` (planned) will
+house performance benchmarks.
+
 ## Try it
 
 Needs a recent Rust toolchain (2024 edition).

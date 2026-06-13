@@ -1,3 +1,7 @@
 [workspace]
-members = ["journal", "lsm", "pager", "strata-store", "strata-db", "strata-cli", "strata-server", "spec-test"]
+members = [
+    "crates/*",
+    "bins/*",
+    "crucible/*",
+]
 resolver = "3"
