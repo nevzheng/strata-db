@@ -51,6 +51,11 @@ pub enum LogicalNode {
         input: Box<LogicalNode>,
         count: usize,
     },
+    /// Skip the first `count` rows of `input` (SQL `OFFSET`).
+    Offset {
+        input: Box<LogicalNode>,
+        count: usize,
+    },
     /// Source node for `INSERT INTO t VALUES (..)`.
     Values { rows: Vec<Tuple> },
     Insert {

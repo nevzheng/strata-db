@@ -184,10 +184,11 @@ fn run_query(db: &Db, sql: &str) -> Result<Vec<StatementResult>, QueryError> {
 /// The binder wraps every SELECT in a `Project`, so column count is the
 /// projection arity. Write plans (Insert/Delete) don't return rows.
 fn output_columns(root: &PlanNode) -> usize {
-    if let PlanNode::Project { expressions, .. } = root {
-        expressions.len()
-    } else {
-        0
+    match root {
+        PlanNode::Project { expressions, .. } => expressions.len(),
+        // LIMIT / OFFSET wrap the projection; look through them.
+        PlanNode::Limit { input, .. } | PlanNode::Offset { input, .. } => output_columns(input),
+        _ => 0,
     }
 }
 

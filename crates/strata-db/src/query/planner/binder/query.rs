@@ -2,14 +2,15 @@
 //! projection list.
 
 use sqlparser::ast::{
-    GroupByExpr, Query as AstQuery, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
+    Expr as AstExpr, GroupByExpr, LimitClause, Query as AstQuery, Select, SelectItem, SetExpr,
+    TableFactor, TableWithJoins,
 };
 
 use crate::catalog::schema::Schema;
 use crate::query::QueryError;
 use crate::query::expression::Expr;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
-use crate::storage::types::Tuple;
+use crate::storage::types::{Tuple, Value};
 
 use super::{BindNode, Binder, three_part_name};
 
@@ -17,14 +18,71 @@ impl BindNode for AstQuery {
     type Output = LogicalPlan;
 
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
+        // ORDER BY / FETCH would change the result; reject rather than
+        // silently ignore them.
+        if self.order_by.is_some() {
+            return Err(QueryError::unsupported("ORDER BY"));
+        }
+        if self.fetch.is_some() {
+            return Err(QueryError::unsupported("FETCH"));
+        }
+
         let SetExpr::Select(select) = self.body.as_ref() else {
             return Err(QueryError::unsupported(format!(
                 "query body: {:?}",
                 self.body
             )));
         };
-        Ok(LogicalPlan::new(select.bind(binder)?))
+        let mut node = select.bind(binder)?;
+
+        // `LIMIT k OFFSET n` (Postgres): skip n rows, then take k. Apply
+        // OFFSET first so it sits closest to the input.
+        if let Some(clause) = &self.limit_clause {
+            let LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } = clause
+            else {
+                return Err(QueryError::unsupported("`LIMIT offset, count`"));
+            };
+            if !limit_by.is_empty() {
+                return Err(QueryError::unsupported("LIMIT BY"));
+            }
+            if let Some(offset) = offset {
+                let count = bind_count(&offset.value, binder, "OFFSET")?;
+                node = LogicalNode::Offset {
+                    input: Box::new(node),
+                    count,
+                };
+            }
+            if let Some(limit) = limit {
+                let count = bind_count(limit, binder, "LIMIT")?;
+                node = LogicalNode::Limit {
+                    input: Box::new(node),
+                    count,
+                };
+            }
+        }
+
+        Ok(LogicalPlan::new(node))
     }
+}
+
+/// Evaluate a `LIMIT` / `OFFSET` expression to a non-negative row count.
+/// It binds with no scope, so it must be a constant integer.
+fn bind_count(expr: &AstExpr, binder: &mut Binder, what: &str) -> Result<usize, QueryError> {
+    let n = match expr.bind(binder)?.eval(&Tuple { values: vec![] })? {
+        Value::Int16(n) => i64::from(n),
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        other => {
+            return Err(QueryError::type_error(format!(
+                "{what} expects an integer, got {other:?}"
+            )));
+        }
+    };
+    usize::try_from(n).map_err(|_| QueryError::type_error(format!("{what} must be non-negative")))
 }
 
 // --- SELECT body: FROM + WHERE + projection --------------------------------

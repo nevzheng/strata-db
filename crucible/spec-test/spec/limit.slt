@@ -1,0 +1,52 @@
+# LIMIT / OFFSET (Postgres style): OFFSET skips n rows from the front,
+# LIMIT caps at k. Rows scan back in primary-key (column 0) order.
+#
+# Uses its own `strata.lim` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.lim
+
+statement ok
+CREATE TABLE strata.lim.nums (n INT, label TEXT)
+
+statement ok
+INSERT INTO strata.lim.nums VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+
+# LIMIT caps the count.
+query T
+SELECT n FROM strata.lim.nums LIMIT 2
+----
+1
+2
+
+# OFFSET skips from the front.
+query T
+SELECT n FROM strata.lim.nums OFFSET 3
+----
+4
+5
+
+# LIMIT k OFFSET n: skip n, then take k.
+query T
+SELECT n FROM strata.lim.nums LIMIT 2 OFFSET 1
+----
+2
+3
+
+# LIMIT 0 yields nothing.
+query T
+SELECT n FROM strata.lim.nums LIMIT 0
+----
+
+# OFFSET past the end yields nothing.
+query T
+SELECT n FROM strata.lim.nums OFFSET 10
+----
+
+# A negative LIMIT is a bind-time error.
+statement error
+SELECT n FROM strata.lim.nums LIMIT -1
+
+# ORDER BY is rejected, not silently ignored.
+statement error
+SELECT n FROM strata.lim.nums ORDER BY n

@@ -70,6 +70,10 @@ impl LowerNode for LogicalNode {
                 input: Box::new(input.lower()),
                 count: *count,
             },
+            LogicalNode::Offset { input, count } => PlanNode::Offset {
+                input: Box::new(input.lower()),
+                count: *count,
+            },
             LogicalNode::Values { rows } => PlanNode::Values { rows: rows.clone() },
             LogicalNode::Insert { table, input } => PlanNode::Insert {
                 table: table.clone(),

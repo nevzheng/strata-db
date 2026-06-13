@@ -50,6 +50,8 @@ pub enum PlanNode {
     },
     /// Yield at most `count` rows from `input`, then stop.
     Limit { input: Box<PlanNode>, count: usize },
+    /// Skip the first `count` rows of `input` (SQL `OFFSET`).
+    Offset { input: Box<PlanNode>, count: usize },
     /// Yield each tuple in `rows` then stop. Source node for things
     /// like `INSERT INTO t VALUES (..)`.
     Values { rows: Vec<Tuple> },
