@@ -11,11 +11,16 @@
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use uuid::Uuid;
 
 use crate::storage::types::{LogicalType, Tuple, Value};
 
 use super::QueryError;
+
+mod cast;
+mod function;
+
+use cast::eval_cast;
+use function::{concat_str, eval_call, eval_like};
 
 /// Binary operators. These are the *constants* of the expression
 /// language — the verbs that combine two sub-expressions into one.
@@ -225,199 +230,6 @@ impl Expr {
     }
 }
 
-/// `CAST`/`::` conversion. `NULL` casts to `NULL` for any target. Each
-/// target accepts the sources that convert sensibly; anything else is a
-/// type error. Float/numeric → integer rounds; out-of-range narrowing is
-/// an error.
-fn eval_cast(v: Value, target: &LogicalType) -> Result<Value, QueryError> {
-    use LogicalType as T;
-    if matches!(v, Value::Null) {
-        return Ok(Value::Null);
-    }
-    match target {
-        T::Bool => cast_to_bool(v),
-        T::Int16 => fit_int_cast(cast_to_i64(&v)?, i16::try_from, Value::Int16),
-        T::Int32 => fit_int_cast(cast_to_i64(&v)?, i32::try_from, Value::Int32),
-        T::Int64 => Ok(Value::Int64(cast_to_i64(&v)?)),
-        T::Float32 => Ok(Value::Float32(cast_to_f64(&v)? as f32)),
-        T::Float64 => Ok(Value::Float64(cast_to_f64(&v)?)),
-        T::Numeric => cast_to_numeric(&v),
-        T::Text => Ok(Value::Text(cast_to_text(&v)?)),
-        T::Bytes => cast_to_bytes(v),
-        T::Date => cast_to_date(&v),
-        T::Timestamp => cast_to_timestamp(&v),
-        T::Time => cast_to_time(&v),
-        T::Uuid => cast_to_uuid(&v),
-        T::Interval => cast_to_interval(&v),
-        T::Json => cast_to_json(&v),
-        // No text->array parsing yet; only an array passes through.
-        T::Array(_) => match v {
-            arr @ Value::Array(_) => Ok(arr),
-            other => Err(cast_err(&other, "array")),
-        },
-    }
-}
-
-fn cast_to_interval(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Interval(i) => Ok(Value::Interval(*i)),
-        Value::Text(s) => crate::storage::temporal::parse_interval(s.trim())
-            .map(Value::Interval)
-            .map_err(QueryError::type_error),
-        other => Err(cast_err(other, "interval")),
-    }
-}
-
-fn cast_to_time(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Time(t) => Ok(Value::Time(*t)),
-        Value::Text(s) => crate::storage::temporal::parse_time(s.trim())
-            .map(Value::Time)
-            .map_err(QueryError::type_error),
-        other => Err(cast_err(other, "time")),
-    }
-}
-
-fn cast_to_uuid(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Uuid(u) => Ok(Value::Uuid(*u)),
-        Value::Text(s) => Uuid::parse_str(s.trim())
-            .map(Value::Uuid)
-            .map_err(|_| cast_err(v, "uuid")),
-        other => Err(cast_err(other, "uuid")),
-    }
-}
-
-fn cast_err(v: &Value, target: &str) -> QueryError {
-    QueryError::type_error(format!("cannot cast {v:?} to {target}"))
-}
-
-/// Narrow a cast `i64` into a smaller integer, erroring on overflow.
-fn fit_int_cast<I, E>(
-    n: i64,
-    try_from: fn(i64) -> Result<I, E>,
-    wrap: fn(I) -> Value,
-) -> Result<Value, QueryError> {
-    try_from(n)
-        .map(wrap)
-        .map_err(|_| QueryError::type_error(format!("value {n} out of range for target integer")))
-}
-
-fn cast_to_i64(v: &Value) -> Result<i64, QueryError> {
-    match v {
-        Value::Int16(n) => Ok(*n as i64),
-        Value::Int32(n) => Ok(*n as i64),
-        Value::Int64(n) => Ok(*n),
-        Value::Bool(b) => Ok(*b as i64),
-        Value::Float32(f) => Ok(f.round() as i64),
-        Value::Float64(f) => Ok(f.round() as i64),
-        Value::Numeric(d) => d.round().to_i64().ok_or_else(|| cast_err(v, "integer")),
-        Value::Text(s) => s.trim().parse::<i64>().map_err(|_| cast_err(v, "integer")),
-        other => Err(cast_err(other, "integer")),
-    }
-}
-
-fn cast_to_f64(v: &Value) -> Result<f64, QueryError> {
-    match v {
-        Value::Int16(n) => Ok(*n as f64),
-        Value::Int32(n) => Ok(*n as f64),
-        Value::Int64(n) => Ok(*n as f64),
-        Value::Float32(f) => Ok(*f as f64),
-        Value::Float64(f) => Ok(*f),
-        Value::Numeric(d) => d.to_f64().ok_or_else(|| cast_err(v, "float")),
-        Value::Text(s) => s.trim().parse::<f64>().map_err(|_| cast_err(v, "float")),
-        other => Err(cast_err(other, "float")),
-    }
-}
-
-fn cast_to_numeric(v: &Value) -> Result<Value, QueryError> {
-    let d = match v {
-        Value::Int16(n) => Decimal::from(*n),
-        Value::Int32(n) => Decimal::from(*n),
-        Value::Int64(n) => Decimal::from(*n),
-        Value::Numeric(d) => *d,
-        Value::Float32(f) => Decimal::from_f32_retain(*f).ok_or_else(|| cast_err(v, "numeric"))?,
-        Value::Float64(f) => Decimal::from_f64_retain(*f).ok_or_else(|| cast_err(v, "numeric"))?,
-        Value::Text(s) => s.trim().parse().map_err(|_| cast_err(v, "numeric"))?,
-        other => return Err(cast_err(other, "numeric")),
-    };
-    Ok(Value::Numeric(d))
-}
-
-fn cast_to_bool(v: Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Bool(b) => Ok(Value::Bool(b)),
-        Value::Int16(n) => Ok(Value::Bool(n != 0)),
-        Value::Int32(n) => Ok(Value::Bool(n != 0)),
-        Value::Int64(n) => Ok(Value::Bool(n != 0)),
-        Value::Text(ref s) => match s.trim().to_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Value::Bool(true)),
-            "false" | "f" | "no" | "n" | "off" | "0" => Ok(Value::Bool(false)),
-            _ => Err(cast_err(&v, "boolean")),
-        },
-        other => Err(cast_err(&other, "boolean")),
-    }
-}
-
-fn cast_to_text(v: &Value) -> Result<String, QueryError> {
-    match v {
-        Value::Bytes(b) => Ok(format!(
-            "\\x{}",
-            b.iter().fold(String::new(), |mut s, byte| {
-                s.push_str(&format!("{byte:02x}"));
-                s
-            })
-        )),
-        Value::Json(j) => Ok(j.to_string()),
-        // concat_str covers bool / numerics / text / date / timestamp.
-        other => concat_str(other),
-    }
-}
-
-fn cast_to_bytes(v: Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Bytes(b) => Ok(Value::Bytes(b)),
-        Value::Text(s) => Ok(Value::Bytes(s.into_bytes())),
-        other => Err(cast_err(&other, "bytes")),
-    }
-}
-
-const MICROS_PER_DAY: i64 = 86_400_000_000;
-
-fn cast_to_date(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Date(d) => Ok(Value::Date(*d)),
-        Value::Text(s) => crate::storage::temporal::parse_date(s.trim())
-            .map(Value::Date)
-            .map_err(QueryError::type_error),
-        // Drop the time of day (floor toward earlier days for negatives).
-        Value::Timestamp(t) => Ok(Value::Date(t.div_euclid(MICROS_PER_DAY) as i32)),
-        other => Err(cast_err(other, "date")),
-    }
-}
-
-fn cast_to_timestamp(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Timestamp(t) => Ok(Value::Timestamp(*t)),
-        Value::Text(s) => crate::storage::temporal::parse_timestamptz(s.trim())
-            .map(Value::Timestamp)
-            .map_err(QueryError::type_error),
-        // Midnight UTC of the date.
-        Value::Date(d) => Ok(Value::Timestamp(*d as i64 * MICROS_PER_DAY)),
-        other => Err(cast_err(other, "timestamp")),
-    }
-}
-
-fn cast_to_json(v: &Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Json(j) => Ok(Value::Json(j.clone())),
-        Value::Text(s) => serde_json::from_str(s)
-            .map(Value::Json)
-            .map_err(|_| cast_err(v, "json")),
-        other => Err(cast_err(other, "json")),
-    }
-}
-
 /// Arithmetic negation. `NULL` propagates; `i*::MIN` overflows to a type
 /// error; non-numeric values are a type error.
 fn eval_neg(v: Value) -> Result<Value, QueryError> {
@@ -432,313 +244,6 @@ fn eval_neg(v: Value) -> Result<Value, QueryError> {
         Value::Numeric(d) => Ok(Value::Numeric(-d)),
         other => Err(QueryError::type_error(format!("cannot negate {other:?}"))),
     }
-}
-
-/// `LIKE` evaluation: text vs text, `NULL` operands propagate, a
-/// non-text operand is a type error.
-fn eval_like(value: Value, pattern: Value, negated: bool) -> Result<Value, QueryError> {
-    match (value, pattern) {
-        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        (Value::Text(s), Value::Text(p)) => Ok(Value::Bool(like_match(&s, &p) ^ negated)),
-        (l, r) => Err(QueryError::type_error(format!(
-            "LIKE expects text operands, got {l:?} / {r:?}"
-        ))),
-    }
-}
-
-/// SQL `LIKE` wildcard match: `%` matches any run of characters
-/// (including none), `_` matches exactly one. Everything else is literal.
-/// Two-pointer scan with backtracking on the last `%`.
-fn like_match(text: &str, pattern: &str) -> bool {
-    let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
-    let (mut ti, mut pi) = (0, 0);
-    // Position to resume from after the most recent `%`, if any.
-    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
-            ti += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
-            star_pi = Some(pi);
-            star_ti = ti;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            // Mismatch: let the last `%` absorb one more character.
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    // Trailing `%`s in the pattern can match the empty string.
-    while pi < p.len() && p[pi] == '%' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
-fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
-    // The binder validates arity, so the fixed-arity arms index safely.
-    match func {
-        ScalarFunc::Abs => eval_abs(args[0].eval(tuple)?),
-        ScalarFunc::Greatest => eval_extreme(args, tuple, true),
-        ScalarFunc::Least => eval_extreme(args, tuple, false),
-        ScalarFunc::Ceil => eval_round(args[0].eval(tuple)?, Rounding::Ceil),
-        ScalarFunc::Floor => eval_round(args[0].eval(tuple)?, Rounding::Floor),
-        ScalarFunc::Round => eval_round(args[0].eval(tuple)?, Rounding::Nearest),
-        ScalarFunc::Coalesce => eval_coalesce(args, tuple),
-        ScalarFunc::Length => eval_length(args[0].eval(tuple)?),
-        ScalarFunc::Repeat => eval_repeat(args[0].eval(tuple)?, args[1].eval(tuple)?),
-        ScalarFunc::Upper => eval_case(args[0].eval(tuple)?, true),
-        ScalarFunc::Lower => eval_case(args[0].eval(tuple)?, false),
-        ScalarFunc::Nullif => eval_nullif(args[0].eval(tuple)?, args[1].eval(tuple)?),
-        ScalarFunc::Concat => eval_concat(args, tuple),
-        ScalarFunc::Substr => eval_substr(
-            args[0].eval(tuple)?,
-            args[1].eval(tuple)?,
-            args[2].eval(tuple)?,
-        ),
-        ScalarFunc::TrimBoth => eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, true, true),
-        ScalarFunc::TrimLeading => {
-            eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, true, false)
-        }
-        ScalarFunc::TrimTrailing => {
-            eval_trim(args[0].eval(tuple)?, args[1].eval(tuple)?, false, true)
-        }
-    }
-}
-
-/// `CONCAT(a, b, …)` — stringify each non-null argument and join.
-fn eval_concat(args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
-    let mut out = String::new();
-    for arg in args {
-        match arg.eval(tuple)? {
-            Value::Null => {} // Postgres CONCAT skips nulls.
-            v => out.push_str(&concat_str(&v)?),
-        }
-    }
-    Ok(Value::Text(out))
-}
-
-/// Render a value as text for `CONCAT` / `||`. Bytes and JSON aren't
-/// supported here yet.
-fn concat_str(v: &Value) -> Result<String, QueryError> {
-    Ok(match v {
-        Value::Null => String::new(),
-        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-        Value::Int16(n) => n.to_string(),
-        Value::Int32(n) => n.to_string(),
-        Value::Int64(n) => n.to_string(),
-        Value::Float32(f) => f.to_string(),
-        Value::Float64(f) => f.to_string(),
-        Value::Numeric(d) => d.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Date(d) => crate::storage::temporal::format_date(*d),
-        Value::Timestamp(t) => crate::storage::temporal::format_timestamptz(*t),
-        Value::Time(t) => crate::storage::temporal::format_time(*t),
-        Value::Uuid(u) => u.to_string(),
-        Value::Interval(i) => crate::storage::temporal::format_interval(*i),
-        Value::Array(items) => {
-            let mut parts = Vec::with_capacity(items.len());
-            for item in items {
-                parts.push(concat_str(item)?);
-            }
-            format!("{{{}}}", parts.join(","))
-        }
-        other => {
-            return Err(QueryError::type_error(format!(
-                "cannot concatenate {other:?}"
-            )));
-        }
-    })
-}
-
-/// `SUBSTRING(s FROM start FOR len)` — 1-indexed; out-of-range bounds
-/// clamp (no error). The binder defaults `start`/`len`, so all three
-/// arrive present. `NULL` in any argument propagates.
-fn eval_substr(s: Value, from: Value, len: Value) -> Result<Value, QueryError> {
-    if matches!(s, Value::Null) || matches!(from, Value::Null) || matches!(len, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let Value::Text(text) = s else {
-        return Err(QueryError::type_error("SUBSTRING expects a text value"));
-    };
-    let start = as_i64(&from)
-        .ok_or_else(|| QueryError::type_error("SUBSTRING start must be an integer"))?;
-    let length = as_i64(&len)
-        .ok_or_else(|| QueryError::type_error("SUBSTRING length must be an integer"))?;
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len() as i64;
-    // The substring covers the 1-indexed half-open range [start, start+len).
-    let from_idx = start.max(1);
-    let to_idx = start.saturating_add(length).min(n + 1);
-    if to_idx <= from_idx {
-        return Ok(Value::Text(String::new()));
-    }
-    Ok(Value::Text(
-        chars[(from_idx - 1) as usize..(to_idx - 1) as usize]
-            .iter()
-            .collect(),
-    ))
-}
-
-/// `TRIM` — strip any character in `chars` from the requested side(s).
-/// `NULL` in either argument propagates.
-fn eval_trim(s: Value, chars: Value, leading: bool, trailing: bool) -> Result<Value, QueryError> {
-    if matches!(s, Value::Null) || matches!(chars, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let (Value::Text(text), Value::Text(set)) = (s, chars) else {
-        return Err(QueryError::type_error("TRIM expects text values"));
-    };
-    let set: Vec<char> = set.chars().collect();
-    let cs: Vec<char> = text.chars().collect();
-    let mut start = 0;
-    let mut end = cs.len();
-    if leading {
-        while start < end && set.contains(&cs[start]) {
-            start += 1;
-        }
-    }
-    if trailing {
-        while end > start && set.contains(&cs[end - 1]) {
-            end -= 1;
-        }
-    }
-    Ok(Value::Text(cs[start..end].iter().collect()))
-}
-
-#[derive(Clone, Copy)]
-enum Rounding {
-    Ceil,
-    Floor,
-    Nearest,
-}
-
-/// Round to a whole number. Integers pass through (already whole); floats
-/// and numerics round in their own type; `NULL` propagates.
-fn eval_round(v: Value, mode: Rounding) -> Result<Value, QueryError> {
-    let f64_round = |f: f64| match mode {
-        Rounding::Ceil => f.ceil(),
-        Rounding::Floor => f.floor(),
-        Rounding::Nearest => f.round(),
-    };
-    let dec_round = |d: Decimal| match mode {
-        Rounding::Ceil => d.ceil(),
-        Rounding::Floor => d.floor(),
-        Rounding::Nearest => d.round(),
-    };
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) => Ok(v),
-        Value::Float32(f) => Ok(Value::Float32(f64_round(f as f64) as f32)),
-        Value::Float64(f) => Ok(Value::Float64(f64_round(f))),
-        Value::Numeric(d) => Ok(Value::Numeric(dec_round(d))),
-        other => Err(QueryError::type_error(format!(
-            "rounding a non-numeric value {other:?}"
-        ))),
-    }
-}
-
-/// `NULLIF(a, b)` — `NULL` if `a = b` (numeric coercion via `values_eq`),
-/// else `a`.
-fn eval_nullif(a: Value, b: Value) -> Result<Value, QueryError> {
-    Ok(if values_eq(&a, &b) { Value::Null } else { a })
-}
-
-/// First non-null argument, or `NULL` if all are null.
-fn eval_coalesce(args: &[Expr], tuple: &Tuple) -> Result<Value, QueryError> {
-    for arg in args {
-        let v = arg.eval(tuple)?;
-        if !matches!(v, Value::Null) {
-            return Ok(v);
-        }
-    }
-    Ok(Value::Null)
-}
-
-/// Character count of a text value (`NULL` propagates).
-fn eval_length(v: Value) -> Result<Value, QueryError> {
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Text(s) => Ok(Value::Int64(s.chars().count() as i64)),
-        other => Err(QueryError::type_error(format!(
-            "LENGTH of non-text value {other:?}"
-        ))),
-    }
-}
-
-/// `REPEAT(s, n)` — `s` repeated `n` times; a non-positive `n` yields the
-/// empty string. Either argument `NULL` propagates.
-fn eval_repeat(s: Value, n: Value) -> Result<Value, QueryError> {
-    if matches!(s, Value::Null) || matches!(n, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let Value::Text(text) = s else {
-        return Err(QueryError::type_error(
-            "REPEAT expects a text first argument",
-        ));
-    };
-    let count =
-        as_i64(&n).ok_or_else(|| QueryError::type_error("REPEAT count must be an integer"))?;
-    Ok(Value::Text(text.repeat(count.max(0) as usize)))
-}
-
-/// Upper/lower-case a text value (`NULL` propagates).
-fn eval_case(v: Value, upper: bool) -> Result<Value, QueryError> {
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Text(s) => Ok(Value::Text(if upper {
-            s.to_uppercase()
-        } else {
-            s.to_lowercase()
-        })),
-        other => Err(QueryError::type_error(format!(
-            "case folding a non-text value {other:?}"
-        ))),
-    }
-}
-
-/// Absolute value. `NULL` propagates; `i*::MIN` has no positive magnitude
-/// and overflows, surfaced as a type error (matching Postgres).
-fn eval_abs(v: Value) -> Result<Value, QueryError> {
-    let overflow = || QueryError::type_error("ABS argument out of range");
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Int16(n) => n.checked_abs().map(Value::Int16).ok_or_else(overflow),
-        Value::Int32(n) => n.checked_abs().map(Value::Int32).ok_or_else(overflow),
-        Value::Int64(n) => n.checked_abs().map(Value::Int64).ok_or_else(overflow),
-        Value::Float32(f) => Ok(Value::Float32(f.abs())),
-        Value::Float64(f) => Ok(Value::Float64(f.abs())),
-        Value::Numeric(d) => Ok(Value::Numeric(d.abs())),
-        other => Err(QueryError::type_error(format!(
-            "ABS of non-numeric value {other:?}"
-        ))),
-    }
-}
-
-/// `GREATEST`/`LEAST` over the arguments. Nulls are skipped (Postgres
-/// semantics); all-null yields `NULL`. The winning argument is returned
-/// as-is. Incomparable types surface the `cmp_values` type error.
-fn eval_extreme(args: &[Expr], tuple: &Tuple, greatest: bool) -> Result<Value, QueryError> {
-    let mut best: Option<Value> = None;
-    for arg in args {
-        let v = arg.eval(tuple)?;
-        if matches!(v, Value::Null) {
-            continue;
-        }
-        best = Some(match best {
-            None => v,
-            Some(cur) => {
-                let ord = cmp_values(&cur, &v)?;
-                let take_new = if greatest { ord.is_lt() } else { ord.is_gt() };
-                if take_new { v } else { cur }
-            }
-        });
-    }
-    Ok(best.unwrap_or(Value::Null))
 }
 
 fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, QueryError> {
@@ -864,7 +369,7 @@ fn decimal_arith(op: BinaryOperator, a: Decimal, b: Decimal) -> Result<Value, Qu
 /// The integer value of `v`, widened to `i64`, if it is any integer
 /// type. Lets comparisons mix integer widths — notably a column against
 /// a SQL literal, which always binds as `Int64`.
-fn as_i64(v: &Value) -> Option<i64> {
+pub(super) fn as_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Int16(n) => Some(*n as i64),
         Value::Int32(n) => Some(*n as i64),
@@ -906,7 +411,7 @@ fn as_f64(v: &Value) -> Option<f64> {
 /// regardless of width; a float against any number compares as `f64`
 /// (`total_cmp`, so `NaN == NaN`); otherwise fall back to structural
 /// equality (`Text == Text`, mismatched types → not equal).
-fn values_eq(lhs: &Value, rhs: &Value) -> bool {
+pub(super) fn values_eq(lhs: &Value, rhs: &Value) -> bool {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
         return a == b;
     }
@@ -933,7 +438,7 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
 /// highest, and `-0.0` < `0.0`); same-typed bools / text / dates /
 /// timestamps compare directly. Anything else — a non-numeric vs numeric
 /// mix — is a type error the caller surfaces to the user.
-fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
+pub(super) fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
         return Ok(a.cmp(&b));
     }
@@ -1032,6 +537,70 @@ mod tests {
         assert_eq!(eq.eval(&tuple).unwrap(), Value::Bool(true));
         let gt = Expr::binary(BinaryOperator::Gt, Expr::column(0), Expr::lit(1i64));
         assert_eq!(gt.eval(&tuple).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_integer_arithmetic_widens_to_i64() {
+        let tuple = t(vec![Value::Int32(7), Value::Int32(2)]);
+        let bin = |op| {
+            Expr::binary(op, Expr::column(0), Expr::column(1))
+                .eval(&tuple)
+                .unwrap()
+        };
+        assert_eq!(bin(BinaryOperator::Add), Value::Int64(9));
+        assert_eq!(bin(BinaryOperator::Sub), Value::Int64(5));
+        assert_eq!(bin(BinaryOperator::Mul), Value::Int64(14));
+        assert_eq!(bin(BinaryOperator::Div), Value::Int64(3)); // truncating
+        assert_eq!(bin(BinaryOperator::Mod), Value::Int64(1));
+    }
+
+    #[test]
+    fn eval_arithmetic_promotes_to_float() {
+        // A float on either side promotes the whole operation to Float64.
+        let tuple = t(vec![Value::Float64(3.0), Value::Int32(2)]);
+        let bin = |op| {
+            Expr::binary(op, Expr::column(0), Expr::column(1))
+                .eval(&tuple)
+                .unwrap()
+        };
+        assert_eq!(bin(BinaryOperator::Add), Value::Float64(5.0));
+        assert_eq!(bin(BinaryOperator::Div), Value::Float64(1.5));
+    }
+
+    #[test]
+    fn eval_arithmetic_stays_exact_decimal() {
+        let d = rust_decimal::Decimal::from;
+        // Numeric mixed with an integer is exact decimal, not float.
+        let tuple = t(vec![Value::Numeric(d(10)), Value::Int32(4)]);
+        let add = Expr::binary(BinaryOperator::Add, Expr::column(0), Expr::column(1))
+            .eval(&tuple)
+            .unwrap();
+        assert_eq!(add, Value::Numeric(d(14)));
+    }
+
+    #[test]
+    fn eval_arithmetic_null_propagates() {
+        let tuple = t(vec![Value::Int32(1), Value::Null]);
+        let add = Expr::binary(BinaryOperator::Add, Expr::column(0), Expr::column(1))
+            .eval(&tuple)
+            .unwrap();
+        assert_eq!(add, Value::Null);
+    }
+
+    #[test]
+    fn eval_division_by_zero_is_error() {
+        let tuple = t(vec![Value::Int64(1), Value::Int64(0)]);
+        for op in [BinaryOperator::Div, BinaryOperator::Mod] {
+            let e = Expr::binary(op, Expr::column(0), Expr::column(1)).eval(&tuple);
+            assert!(e.is_err(), "{op:?} by zero should error");
+        }
+    }
+
+    #[test]
+    fn eval_integer_overflow_is_error() {
+        let tuple = t(vec![Value::Int64(i64::MAX), Value::Int64(1)]);
+        let add = Expr::binary(BinaryOperator::Add, Expr::column(0), Expr::column(1)).eval(&tuple);
+        assert!(add.is_err());
     }
 
     #[test]
