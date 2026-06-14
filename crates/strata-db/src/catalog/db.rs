@@ -7,7 +7,7 @@ use strata_store::{LevelConfig, StorageEngine};
 use crate::catalog::consts::{DEFAULT_DATASET_NAME, DEFAULT_PROJECT_NAME};
 use crate::catalog::project::Project;
 use crate::catalog::{Catalog, CatalogError, ResourceKind};
-use crate::query::{QueryContext, QueryError};
+use crate::query::{JoinConfig, QueryContext, QueryError};
 
 /// A freely-copyable handle to the storage engine, borrowed from the [`Db`] that
 /// owns it. Every component that touches storage — catalog, projects, datasets —
@@ -33,6 +33,9 @@ impl<'db> TableApi<'db> {
 
 pub struct Db {
     engine: RefCell<StorageEngine<BTreeMapStore>>,
+    /// Executor tunables, sized to the host's RAM at open (see
+    /// [`DbBuilder::join_config`]). Copied into every [`QueryContext`].
+    join_config: JoinConfig,
 }
 
 /// Fluent configuration for opening a [`Db`].
@@ -44,6 +47,7 @@ pub struct Db {
 pub struct DbBuilder {
     mem_capacity: Option<usize>,
     levels: Option<Vec<LevelConfig>>,
+    join_config: Option<JoinConfig>,
 }
 
 impl DbBuilder {
@@ -59,6 +63,14 @@ impl DbBuilder {
         self
     }
 
+    /// Override the executor's join scratch sizing. Defaults to limits derived
+    /// from the host's total RAM at [`open`](Self::open); set this to pin them
+    /// (tests use small values to force the grace join to spill/repartition).
+    pub fn join_config(mut self, config: JoinConfig) -> Self {
+        self.join_config = Some(config);
+        self
+    }
+
     pub fn open(self, path: &Path) -> Result<Db, QueryError> {
         let mem = match self.mem_capacity {
             Some(c) => BTreeMapStore::with_capacity(c),
@@ -68,8 +80,11 @@ impl DbBuilder {
             Some(configs) => StorageEngine::with_levels(path, mem, configs),
             None => StorageEngine::new(path, mem),
         }?;
+        // Startup: size query scratch to the machine unless the caller pinned it.
+        let join_config = self.join_config.unwrap_or_else(JoinConfig::from_system);
         let db = Db {
             engine: RefCell::new(engine),
+            join_config,
         };
         db.ensure_default_namespace()?;
         Ok(db)
@@ -139,6 +154,7 @@ impl Db {
     pub fn query_context(&self) -> QueryContext<'_> {
         QueryContext {
             engine: self.engine.borrow_mut(),
+            join_config: self.join_config,
         }
     }
 

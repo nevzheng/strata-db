@@ -12,6 +12,7 @@
 //! combinators — and lives inside plan nodes that need predicates or
 //! projections.
 
+pub mod config;
 pub mod context;
 pub mod executor;
 pub mod expression;
@@ -21,6 +22,7 @@ pub mod planner;
 pub mod stages;
 pub mod volcano;
 
+pub use config::JoinConfig;
 pub use context::QueryContext;
 pub use executor::{ExecuteResult, Executor, RowResult, RowStream};
 pub use expression::{BinaryOperator, Expr};
