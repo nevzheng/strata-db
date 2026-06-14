@@ -13,7 +13,7 @@ use crate::query::logical_plan::{JoinType, LogicalNode, LogicalPlan, SortKey};
 use crate::storage::types::{Tuple, Value};
 
 use super::scope::Scope;
-use super::{BindNode, Binder, name_idents, three_part_name};
+use super::{BindNode, Binder, name_idents, qualify_table_name};
 
 impl BindNode for AstQuery {
     type Output = LogicalPlan;
@@ -314,8 +314,9 @@ fn bind_table_factor(
         ));
     }
 
-    // User tables: three-part name only for now — no session defaults.
-    let (project, dataset, table_name) = three_part_name(name)?;
+    // User tables: under-qualified names fill from the session search path
+    // (`strata.public`), so `public.t` and bare `t` both resolve.
+    let (project, dataset, table_name) = qualify_table_name(name)?;
     let table = binder
         .ctx()
         .catalog()

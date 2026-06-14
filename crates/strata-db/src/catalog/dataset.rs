@@ -40,14 +40,17 @@ impl<'db> Dataset<'db> {
     }
 
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<Table, QueryError> {
-        let meta = Catalog::new(self.api).create_table(self.project_id, self.id, name, schema)?;
+        // Keep the schema we passed in to echo back the descriptor — the
+        // catalog stores it as the normalized `_columns` rows.
+        let meta =
+            Catalog::new(self.api).create_table(self.project_id, self.id, name, schema.clone())?;
         Ok(Table::new(
             self.project_id,
             self.id,
             meta.id,
             meta.truncation_id,
             meta.name,
-            meta.schema,
+            schema,
         ))
     }
 
@@ -58,13 +61,15 @@ impl<'db> Dataset<'db> {
                 kind: ResourceKind::Table,
                 name: name.to_string(),
             })?;
+        // Reassemble the schema from the table's normalized `_columns` rows.
+        let schema = crate::catalog::assemble_schema(&self.api.read(), meta.id)?;
         Ok(Table::new(
             self.project_id,
             self.id,
             meta.id,
             meta.truncation_id,
             meta.name,
-            meta.schema,
+            schema,
         ))
     }
 

@@ -20,6 +20,7 @@ mod scope;
 
 use sqlparser::ast::{ObjectName, Statement, TimezoneInfo};
 
+use crate::catalog::consts::{DEFAULT_DATASET_NAME, DEFAULT_PROJECT_NAME};
 use crate::query::logical_plan::LogicalPlan;
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
 use crate::query::{QueryContext, QueryError};
@@ -106,15 +107,20 @@ fn name_idents(name: &ObjectName) -> Result<Vec<&str>, QueryError> {
         .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))
 }
 
-/// Split a `project.dataset.table` object name into its three parts.
-/// Errors `unsupported` if it isn't exactly three identifier segments —
-/// we have no session defaults to fill in shorter names. Shared by the
-/// DDL, DML, and query binders.
-fn three_part_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
+/// Resolve a (possibly under-qualified) table name to `(project, dataset,
+/// table)`, filling missing leading parts from the session search path —
+/// fixed at [`DEFAULT_PROJECT_NAME`].[`DEFAULT_DATASET_NAME`] (`strata.public`)
+/// for now. So a bare `t` is `strata.public.t`, `d.t` is `strata.d.t`, and a
+/// full `p.d.t` is itself. This is what lets a pgwire client address `public.t`
+/// (or just `t`) on connect. Shared by the DDL, DML, and query binders.
+/// (Per-session `SET search_path` is future work.)
+fn qualify_table_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
     match name_idents(name)?.as_slice() {
+        [t] => Ok((DEFAULT_PROJECT_NAME, DEFAULT_DATASET_NAME, *t)),
+        [d, t] => Ok((DEFAULT_PROJECT_NAME, *d, *t)),
         [p, d, t] => Ok((*p, *d, *t)),
         _ => Err(QueryError::unsupported(format!(
-            "name needs project.dataset.table, got: {name}"
+            "table name has too many parts (max project.dataset.table): {name}"
         ))),
     }
 }

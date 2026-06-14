@@ -320,41 +320,50 @@ impl SystemRelation {
                     text("BASE TABLE"),
                 ])
             }),
-            SystemRelation::Class => tables(catalog, |_, d, t| {
-                row([
-                    Value::Int64(oid_of(t.id.0)),
-                    text(&t.name),
-                    Value::Int64(oid_of(d.id.0)),
-                    text("r"),
-                    Value::Int32(t.schema.fields.len() as i32),
-                    // relhasindex — now reflects real catalog metadata.
-                    Value::Bool(!t.indexes.is_empty()),
-                    // reltuples = -1: row count unknown (no ANALYZE yet).
-                    Value::Int64(-1),
-                ])
-            }),
-            SystemRelation::InfoColumns => columns(catalog, |p, d, t, i, field| {
-                let pg = pg_type(&field.ty);
+            SystemRelation::Class => {
+                let mut rows = Vec::new();
+                for p in user_projects(catalog)? {
+                    for d in catalog.list_datasets(p.id)? {
+                        for t in catalog.list_tables(p.id, d.id)? {
+                            let natts = catalog.list_columns(t.id)?.len();
+                            rows.push(row([
+                                Value::Int64(oid_of(t.id.0)),
+                                text(&t.name),
+                                Value::Int64(oid_of(d.id.0)),
+                                text("r"),
+                                Value::Int32(natts as i32),
+                                // relhasindex — reflects real catalog metadata.
+                                Value::Bool(!t.indexes.is_empty()),
+                                // reltuples = -1: row count unknown (no ANALYZE yet).
+                                Value::Int64(-1),
+                            ]));
+                        }
+                    }
+                }
+                Ok(rows)
+            }
+            SystemRelation::InfoColumns => columns(catalog, |p, d, t, c| {
+                let pg = pg_type(&c.ty);
                 row([
                     text(&p.name),
                     text(&d.name),
                     text(&t.name),
-                    text(field.name.as_str()),
-                    Value::Int32((i + 1) as i32),
+                    text(&c.name),
+                    Value::Int32((c.position + 1) as i32),
                     Value::Null, // column_default: SQL text not reconstructed yet
-                    text(if field.nullable { "YES" } else { "NO" }),
+                    text(if c.nullable { "YES" } else { "NO" }),
                     text(pg.display),
                     text(pg.name),
                 ])
             }),
-            SystemRelation::Attribute => columns(catalog, |_, _, t, i, field| {
+            SystemRelation::Attribute => columns(catalog, |_, _, t, c| {
                 row([
                     Value::Int64(oid_of(t.id.0)),
-                    text(field.name.as_str()),
-                    Value::Int64(pg_type(&field.ty).oid),
-                    Value::Int32((i + 1) as i32),
-                    Value::Bool(!field.nullable),
-                    Value::Bool(field.default.is_some()),
+                    text(&c.name),
+                    Value::Int64(pg_type(&c.ty).oid),
+                    Value::Int32((c.position + 1) as i32),
+                    Value::Bool(!c.nullable),
+                    Value::Bool(c.default.is_some()),
                     Value::Bool(false),
                 ])
             }),
@@ -399,6 +408,7 @@ fn type_rows() -> Vec<Tuple> {
 type ProjectMeta = crate::catalog::ProjectMeta;
 type DatasetMeta = crate::catalog::DatasetMeta;
 type TableMeta = crate::catalog::TableMeta;
+type ColumnMeta = crate::catalog::ColumnMeta;
 
 fn user_projects(catalog: &CatalogReader) -> Result<Vec<ProjectMeta>, QueryError> {
     Ok(catalog
@@ -441,14 +451,15 @@ fn tables(
 /// Apply `f` to every column (`field` + 0-based index) of every table.
 fn columns(
     catalog: &CatalogReader,
-    f: impl Fn(&ProjectMeta, &DatasetMeta, &TableMeta, usize, &Field) -> Tuple,
+    f: impl Fn(&ProjectMeta, &DatasetMeta, &TableMeta, &ColumnMeta) -> Tuple,
 ) -> Result<Vec<Tuple>, QueryError> {
     let mut rows = Vec::new();
     for p in user_projects(catalog)? {
         for d in catalog.list_datasets(p.id)? {
             for t in catalog.list_tables(p.id, d.id)? {
-                for (i, field) in t.schema.fields.iter().enumerate() {
-                    rows.push(f(&p, &d, &t, i, field));
+                // Columns come from the normalized `_columns` rows, in ordinal order.
+                for c in catalog.list_columns(t.id)? {
+                    rows.push(f(&p, &d, &t, &c));
                 }
             }
         }
