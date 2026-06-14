@@ -122,9 +122,9 @@ pub(super) fn build<'ctx>(
             right,
             on,
             join_type,
-            // `left_schema` is a lowering-time aid (splitting `on`, sort
-            // enforcers); the operators recover arities structurally.
-            left_schema: _,
+            // The schema-driven codec for tuples a join spills (block/grace);
+            // nested-loop and sort-merge recover arities structurally instead.
+            left_schema,
             right_schema,
             strategy,
         } => match strategy {
@@ -133,6 +133,9 @@ pub(super) fn build<'ctx>(
                 join::block_nested_loop_join(*left, *right, on, join_type, right_schema, ctx)
             }
             JoinStrategy::SortMerge => join::sort_merge_join(*left, *right, on, join_type, ctx),
+            JoinStrategy::GraceHash => {
+                join::grace_hash_join(*left, *right, on, join_type, left_schema, right_schema, ctx)
+            }
         },
         PlanNode::Sort {
             input,

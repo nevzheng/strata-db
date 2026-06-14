@@ -51,8 +51,9 @@ impl Pass for Lower {
 /// **sort-merge** join: each input is wrapped in a `Sort` enforcer on its join
 /// key (so the operator can assume sorted inputs). Everything else — non-equi,
 /// cross, and outer joins — falls back to **block nested loop**, the general
-/// algorithm. (`NestedLoop` stays the reference, selectable only by a hand-built
-/// plan; grace-hash routing lands with that operator.)
+/// algorithm. (`NestedLoop` and `GraceHash` exist too but are selectable only by
+/// a hand-built plan — cost-based routing to grace-hash needs stats we don't
+/// have yet.)
 fn lower_join(
     left: &LogicalNode,
     right: &LogicalNode,

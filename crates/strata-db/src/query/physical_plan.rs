@@ -44,6 +44,10 @@ pub enum JoinStrategy {
     BlockNestedLoop,
     /// Sort both inputs on the join key, then merge in one pass. Equi-joins only.
     SortMerge,
+    /// Grace hash join: hash-partition both inputs to disk, then build a hash
+    /// table from each right partition and probe it with the left. Equi-joins
+    /// only; spills so a build side larger than memory still completes.
+    GraceHash,
 }
 
 /// One node of a physical plan tree. Each variant is a concrete

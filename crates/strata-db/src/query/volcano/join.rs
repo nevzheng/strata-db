@@ -1,11 +1,12 @@
 //! Join operators — the nested-loop family. All produce `left ++ right` output
 //! rows and handle every join type (INNER/LEFT/RIGHT/FULL; cross = `on: None`),
-//! NULL-padding the absent side of an outer join. Hash and sort-merge are
-//! separate strategies.
+//! NULL-padding the absent side of an outer join. Sort-merge and grace-hash are
+//! the equi-join specialists.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
-use strata_store::{MemoryWorkspace, Workspace};
+use strata_store::{FileWorkspace, MemoryWorkspace, Workspace};
 
 use crate::catalog::schema::Schema;
 use crate::query::executor::RowStream;
@@ -232,6 +233,165 @@ pub(super) fn sort_merge_join<'ctx>(
     }
 
     Ok(RowStream::new(out.into_iter().map(Ok)))
+}
+
+/// Partitions per side. Equal keys hash to the same partition, so the join
+/// decomposes into this many independent, smaller joins.
+const HASH_PARTITIONS: usize = 16;
+/// In-RAM working set per partition file; overflow spills to disk.
+const PARTITION_MEMORY: usize = 1024 * 1024;
+/// Per-partition on-disk ceiling — the spill backstop.
+const PARTITION_DISK: usize = 1 << 30;
+
+/// Grace hash join (equi-joins; every join type). Phase 1 hash-partitions both
+/// inputs to disk by their join key. Phase 2 processes one partition pair at a
+/// time: build an in-memory hash table from the right partition, then probe it
+/// with the left. Because equal keys land in the same partition, each pair is an
+/// independent join whose build side is ~1/N of the whole — so a build larger
+/// than memory still completes (the "grace" of grace hash).
+///
+/// NULL keys can never match, so they bypass partitioning entirely; outer joins
+/// still emit them, NULL-padded, as unmatched rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn grace_hash_join<'ctx>(
+    left: PlanNode,
+    right: PlanNode,
+    on: Option<Expr>,
+    join_type: JoinType,
+    left_schema: Schema,
+    right_schema: Schema,
+    ctx: &'ctx QueryContext<'_>,
+) -> Result<RowStream<'ctx>, QueryError> {
+    let (left_key, right_key) = equi_keys(&on, &left)?;
+    let left_width = output_arity(&left);
+    let right_width = output_arity(&right);
+
+    // Phase 1 — partition both inputs by hash of the join key.
+    let mut left_parts = new_partitions()?;
+    let mut right_parts = new_partitions()?;
+    // NULL-keyed rows sit out the hash join; outer joins emit them at the end.
+    let mut left_nulls: Vec<Tuple> = Vec::new();
+    let mut right_nulls: Vec<Tuple> = Vec::new();
+
+    for row in build(left, ctx)? {
+        let tuple = row?;
+        match partition_of(&tuple.values[left_key])? {
+            None => left_nulls.push(tuple),
+            Some(p) => spill(&mut left_parts[p], &left_schema.encode(&tuple))?,
+        }
+    }
+    for row in build(right, ctx)? {
+        let tuple = row?;
+        match partition_of(&tuple.values[right_key])? {
+            None => right_nulls.push(tuple),
+            Some(p) => spill(&mut right_parts[p], &right_schema.encode(&tuple))?,
+        }
+    }
+
+    // Phase 2 — one partition pair at a time: build from right, probe with left.
+    let mut out: Vec<Tuple> = Vec::new();
+    for p in 0..HASH_PARTITIONS {
+        // Build: key bytes → indices into this partition's right rows. The
+        // HashMap compares full key bytes, so a hash collision is never a match.
+        let mut build_rows: Vec<Tuple> = Vec::new();
+        let mut build_matched: Vec<bool> = Vec::new();
+        let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for bytes in right_parts[p].tuples() {
+            let tuple = right_schema.decode(&bytes)?;
+            let key =
+                key_bytes(&tuple.values[right_key])?.expect("null keys never reach a partition");
+            table.entry(key).or_default().push(build_rows.len());
+            build_matched.push(false);
+            build_rows.push(tuple);
+        }
+
+        // Probe: stream the left partition; emit a row per build match.
+        for bytes in left_parts[p].tuples() {
+            let l = left_schema.decode(&bytes)?;
+            let key = key_bytes(&l.values[left_key])?.expect("null keys never reach a partition");
+            let mut matched = false;
+            if let Some(idxs) = table.get(&key) {
+                for &idx in idxs {
+                    matched = true;
+                    build_matched[idx] = true;
+                    out.push(concat(&l, &build_rows[idx]));
+                }
+            }
+            // LEFT/FULL: an unmatched probe row survives, padded with right NULLs.
+            if !matched && matches!(join_type, JoinType::Left | JoinType::Full) {
+                out.push(pad_right(&l, right_width));
+            }
+        }
+
+        // RIGHT/FULL: build rows that nothing probed, padded with left NULLs.
+        if matches!(join_type, JoinType::Right | JoinType::Full) {
+            for (idx, matched) in build_matched.iter().enumerate() {
+                if !matched {
+                    out.push(pad_left(left_width, &build_rows[idx]));
+                }
+            }
+        }
+    }
+
+    // NULL-keyed rows: unmatched by definition, kept only by the outer sides.
+    if matches!(join_type, JoinType::Left | JoinType::Full) {
+        for l in &left_nulls {
+            out.push(pad_right(l, right_width));
+        }
+    }
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        for r in &right_nulls {
+            out.push(pad_left(left_width, r));
+        }
+    }
+
+    Ok(RowStream::new(out.into_iter().map(Ok)))
+}
+
+/// One spilling file workspace per partition.
+fn new_partitions() -> Result<Vec<FileWorkspace>, QueryError> {
+    (0..HASH_PARTITIONS)
+        .map(|_| {
+            FileWorkspace::new(PARTITION_MEMORY, PARTITION_DISK)
+                .map_err(|e| QueryError::Internal(format!("hash join partition: {e}")))
+        })
+        .collect()
+}
+
+/// Append an encoded tuple to a partition, mapping a full workspace to a query
+/// error.
+fn spill(part: &mut FileWorkspace, bytes: &[u8]) -> Result<(), QueryError> {
+    part.append(bytes)
+        .map(|_| ())
+        .map_err(|e| QueryError::Internal(format!("hash join spill: {e}")))
+}
+
+/// The partition a join key hashes to — `None` for a NULL key (never matches).
+fn partition_of(value: &Value) -> Result<Option<usize>, QueryError> {
+    Ok(key_bytes(value)?.map(|k| (fnv1a(&k) as usize) % HASH_PARTITIONS))
+}
+
+/// A join key's canonical bytes (order-preserving encoding), or `None` for NULL.
+/// Equal values encode equal, so byte equality *is* join equality.
+fn key_bytes(value: &Value) -> Result<Option<Vec<u8>>, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    value
+        .encode_key(&mut buf)
+        .map_err(|e| QueryError::type_error(format!("cannot hash this join key: {e:?}")))?;
+    Ok(Some(buf))
+}
+
+/// FNV-1a — a small, dependency-free, deterministic hash for partition routing.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// The (left, right) join-key positions within their own tuples, parsed from an

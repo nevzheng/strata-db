@@ -250,6 +250,19 @@ fn strategies_agree_including_cross_join() {
             &db,
         ));
         assert_eq!(nlj, bnlj, "strategies disagree for {join_type:?}");
+
+        // Grace hash handles every equi-join type — must agree too.
+        let grace = sorted(run(
+            join_plan(
+                l.clone(),
+                r.clone(),
+                Some(on_lk_eq_rid()),
+                join_type,
+                JoinStrategy::GraceHash,
+            ),
+            &db,
+        ));
+        assert_eq!(nlj, grace, "grace hash disagrees for {join_type:?}");
     }
 
     // Cross join (on: None) — 3 x 3 = 9 pairs, both strategies.
@@ -432,6 +445,112 @@ fn sort_merge_expands_duplicate_key_groups() {
         rhs: Box::new(Expr::column(3)),
     };
     let rows = run(sort_merge_plan(l, r, on, 1, 1), &db);
+    // The k=5 group is 2 left × 2 right; k=9 / k=7 don't match.
+    assert_eq!(rows.len(), 4);
+}
+
+// --- grace hash join (equi-joins; partitions + spills) ---------------------
+
+/// `l.k = r.k` over the concatenated row (l cols 0,1; r cols 2,3).
+fn on_lk_eq_rk() -> Expr {
+    Expr::Binary {
+        op: BinaryOperator::Eq,
+        lhs: Box::new(Expr::column(1)),
+        rhs: Box::new(Expr::column(3)),
+    }
+}
+
+fn two_int_tables(db: &Db, dataset: &str) -> (Table, Table) {
+    let project = db.create_project("acme").unwrap();
+    let dataset = project.create_dataset(dataset).unwrap();
+    let two_int = || Schema {
+        fields: vec![
+            Field::new("id", LogicalType::Int32),
+            Field::new("k", LogicalType::Int32),
+        ],
+    };
+    (
+        dataset.create_table("l", two_int()).unwrap(),
+        dataset.create_table("r", two_int()).unwrap(),
+    )
+}
+
+#[test]
+fn grace_hash_matches_nested_loop_across_partitions() {
+    let (_tmp, db) = common::temp_db();
+    let (l, r) = two_int_tables(&db, "grace");
+    // Many distinct keys so rows spread across the 16 hash partitions; overlap
+    // is the even keys (0..400 even on the left, 0..600 even on the right).
+    {
+        let mut ctx = db.query_context();
+        let mut w = ctx.table_mut(&l);
+        for id in 0..200i32 {
+            w.put(&row2(id, Value::Int32(id * 2))).unwrap();
+        }
+    }
+    {
+        let mut ctx = db.query_context();
+        let mut w = ctx.table_mut(&r);
+        for id in 0..300i32 {
+            w.put(&row2(id, Value::Int32(id * 2))).unwrap();
+        }
+    }
+    let grace = sorted(run(
+        join_plan(
+            l.clone(),
+            r.clone(),
+            Some(on_lk_eq_rk()),
+            JoinType::Inner,
+            JoinStrategy::GraceHash,
+        ),
+        &db,
+    ));
+    let nlj = sorted(run(
+        join_plan(
+            l,
+            r,
+            Some(on_lk_eq_rk()),
+            JoinType::Inner,
+            JoinStrategy::NestedLoop,
+        ),
+        &db,
+    ));
+    assert_eq!(
+        grace, nlj,
+        "grace hash must match the nested-loop reference"
+    );
+    // Left keys 0,2,..,398 all appear among the right's 0,2,..,598 → 200 matches.
+    assert_eq!(grace.len(), 200);
+}
+
+#[test]
+fn grace_hash_expands_duplicate_key_groups() {
+    let (_tmp, db) = common::temp_db();
+    let (l, r) = two_int_tables(&db, "gracedup");
+    {
+        let mut ctx = db.query_context();
+        let mut w = ctx.table_mut(&l);
+        for (id, k) in [(1, 5), (2, 5), (3, 9)] {
+            w.put(&row2(id, Value::Int32(k))).unwrap();
+        }
+    }
+    {
+        let mut ctx = db.query_context();
+        let mut w = ctx.table_mut(&r);
+        for (id, k) in [(10, 5), (11, 5), (12, 7)] {
+            w.put(&row2(id, Value::Int32(k))).unwrap();
+        }
+    }
+    let rows = run(
+        join_plan(
+            l,
+            r,
+            Some(on_lk_eq_rk()),
+            JoinType::Inner,
+            JoinStrategy::GraceHash,
+        ),
+        &db,
+    );
     // The k=5 group is 2 left × 2 right; k=9 / k=7 don't match.
     assert_eq!(rows.len(), 4);
 }
