@@ -438,7 +438,7 @@ pub(super) fn values_eq(lhs: &Value, rhs: &Value) -> bool {
 /// highest, and `-0.0` < `0.0`); same-typed bools / text / dates /
 /// timestamps compare directly. Anything else — a non-numeric vs numeric
 /// mix — is a type error the caller surfaces to the user.
-pub(super) fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
+pub(crate) fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError> {
     if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
         return Ok(a.cmp(&b));
     }

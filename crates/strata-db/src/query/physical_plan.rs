@@ -89,7 +89,9 @@ pub enum PlanNode {
         right: Box<PlanNode>,
         on: Option<Expr>,
         join_type: JoinType,
-        /// Inner (right) row shape — the build side a hash/block join encodes.
+        /// The two input row shapes (left/right) — the build side a hash/block
+        /// join encodes, and what lower uses to insert sort-merge enforcers.
+        left_schema: Schema,
         right_schema: Schema,
         strategy: JoinStrategy,
     },

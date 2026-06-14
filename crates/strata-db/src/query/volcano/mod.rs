@@ -122,6 +122,9 @@ pub(super) fn build<'ctx>(
             right,
             on,
             join_type,
+            // `left_schema` is a lowering-time aid (splitting `on`, sort
+            // enforcers); the operators recover arities structurally.
+            left_schema: _,
             right_schema,
             strategy,
         } => match strategy {
@@ -129,10 +132,7 @@ pub(super) fn build<'ctx>(
             JoinStrategy::BlockNestedLoop => {
                 join::block_nested_loop_join(*left, *right, on, join_type, right_schema, ctx)
             }
-            // Built in an upcoming piece.
-            JoinStrategy::SortMerge => Err(QueryError::Internal(
-                "sort-merge join not implemented".into(),
-            )),
+            JoinStrategy::SortMerge => join::sort_merge_join(*left, *right, on, join_type, ctx),
         },
         PlanNode::Sort {
             input,

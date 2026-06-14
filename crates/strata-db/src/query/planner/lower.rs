@@ -8,10 +8,11 @@
 //! one place. [`Lower`] is the planner [`Pass`](super::pass::Pass) that
 //! plugs this into the pipeline.
 
+use crate::catalog::schema::Schema;
 use crate::query::QueryContext;
 use crate::query::QueryError;
-use crate::query::expression::Expr;
-use crate::query::logical_plan::LogicalNode;
+use crate::query::expression::{BinaryOperator, Expr};
+use crate::query::logical_plan::{JoinType, LogicalNode, SortKey};
 use crate::query::physical_plan::{JoinStrategy, PhysicalPlan, PlanNode};
 use crate::query::stages::{LogicalQuery, PhysicalQuery};
 
@@ -46,14 +47,87 @@ impl Pass for Lower {
     }
 }
 
-/// Pick the physical algorithm for a join — the single place strategy
-/// selection lives. Block nested loop is the general default: it handles
-/// any predicate (and cross joins) and subsumes tuple-at-a-time nested
-/// loop. It grows cost-based — equi-join → sort-merge/hash, sized inputs →
-/// grace — as those operators land. (`NestedLoop` remains as the reference
-/// implementation, selectable only by a hand-built physical plan.)
-fn select_join_strategy(_on: Option<&Expr>) -> JoinStrategy {
-    JoinStrategy::BlockNestedLoop
+/// Lower a join, choosing the physical algorithm. An inner equi-join becomes a
+/// **sort-merge** join: each input is wrapped in a `Sort` enforcer on its join
+/// key (so the operator can assume sorted inputs). Everything else — non-equi,
+/// cross, and outer joins — falls back to **block nested loop**, the general
+/// algorithm. (`NestedLoop` stays the reference, selectable only by a hand-built
+/// plan; grace-hash routing lands with that operator.)
+fn lower_join(
+    left: &LogicalNode,
+    right: &LogicalNode,
+    on: &Option<Expr>,
+    join_type: JoinType,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> PlanNode {
+    let left_p = left.lower();
+    let right_p = right.lower();
+    let left_arity = left_schema.fields.len();
+
+    if join_type == JoinType::Inner
+        && let Some((left_key, right_key)) = equi_join_keys(on, left_arity)
+    {
+        return PlanNode::Join {
+            left: Box::new(sort_on(left_p, left_key, left_schema)),
+            right: Box::new(sort_on(right_p, right_key, right_schema)),
+            on: on.clone(),
+            join_type,
+            left_schema: left_schema.clone(),
+            right_schema: right_schema.clone(),
+            strategy: JoinStrategy::SortMerge,
+        };
+    }
+
+    PlanNode::Join {
+        left: Box::new(left_p),
+        right: Box::new(right_p),
+        on: on.clone(),
+        join_type,
+        left_schema: left_schema.clone(),
+        right_schema: right_schema.clone(),
+        strategy: JoinStrategy::BlockNestedLoop,
+    }
+}
+
+/// If `on` is an equi-join `col = col` referencing exactly one column on each
+/// side, return the (left, right) key positions *within their own tuples*
+/// (the right index de-offset from the combined `left ++ right` row).
+fn equi_join_keys(on: &Option<Expr>, left_arity: usize) -> Option<(usize, usize)> {
+    let Some(Expr::Binary {
+        op: BinaryOperator::Eq,
+        lhs,
+        rhs,
+    }) = on
+    else {
+        return None;
+    };
+    let (Expr::Column { index: a }, Expr::Column { index: b }) = (lhs.as_ref(), rhs.as_ref())
+    else {
+        return None;
+    };
+    let (a, b) = (*a, *b);
+    if a < left_arity && b >= left_arity {
+        Some((a, b - left_arity))
+    } else if b < left_arity && a >= left_arity {
+        Some((b, a - left_arity))
+    } else {
+        None
+    }
+}
+
+/// Wrap `input` in a `Sort` on a single ascending column — the enforcer that
+/// gives a sort-merge join its required input ordering.
+fn sort_on(input: PlanNode, column: usize, input_schema: &Schema) -> PlanNode {
+    PlanNode::Sort {
+        input: Box::new(input),
+        keys: vec![SortKey {
+            expr: Expr::column(column),
+            ascending: true,
+            nulls_first: false,
+        }],
+        input_schema: input_schema.clone(),
+    }
 }
 
 pub(super) trait LowerNode {
@@ -102,15 +176,9 @@ impl LowerNode for LogicalNode {
                 right,
                 on,
                 join_type,
+                left_schema,
                 right_schema,
-            } => PlanNode::Join {
-                left: Box::new(left.lower()),
-                right: Box::new(right.lower()),
-                on: on.clone(),
-                join_type: *join_type,
-                right_schema: right_schema.clone(),
-                strategy: select_join_strategy(on.as_ref()),
-            },
+            } => lower_join(left, right, on, *join_type, left_schema, right_schema),
             LogicalNode::Values { rows } => PlanNode::Values { rows: rows.clone() },
             LogicalNode::Insert { table, input } => PlanNode::Insert {
                 table: table.clone(),

@@ -89,13 +89,15 @@ pub enum LogicalNode {
     /// Join two inputs. The output row is the left tuple concatenated with
     /// the right (`left ++ right`), and `on` indexes into that combined row.
     /// `on: None` with `join_type = Inner` is a cross join (every pair).
-    /// `right_schema` is the inner (right) row shape — the build side a
-    /// hash/block join materializes, encoded with the schema-driven codec.
+    /// `left_schema` / `right_schema` are the two input row shapes — used to
+    /// split a combined-tuple `on` index into per-side column positions and to
+    /// give a materializing/spilling strategy the schema-driven codec.
     Join {
         left: Box<LogicalNode>,
         right: Box<LogicalNode>,
         on: Option<Expr>,
         join_type: JoinType,
+        left_schema: Schema,
         right_schema: Schema,
     },
     /// Order rows by one or more keys (SQL `ORDER BY`). A pipeline breaker —

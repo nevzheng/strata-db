@@ -201,12 +201,14 @@ fn bind_from(
     for item in rest {
         // `FROM a, b` is a cross join: every pair, no condition.
         let (rnode, rscope) = bind_table_with_joins(item, binder)?;
+        let left_schema = scope.schema();
         let right_schema = rscope.schema();
         node = LogicalNode::Join {
             left: Box::new(node),
             right: Box::new(rnode),
             on: None,
             join_type: JoinType::Inner,
+            left_schema,
             right_schema,
         };
         scope = Scope::concat(scope, rscope);
@@ -225,6 +227,7 @@ fn bind_table_with_joins(
     for join in &twj.joins {
         let (rnode, rscope) = bind_table_factor(&join.relation, binder)?;
         let (join_type, constraint) = join_kind(join)?;
+        let left_schema = scope.schema();
         let right_schema = rscope.schema();
         // The output row — and so any column ref in ON — is `left ++ right`.
         let combined = Scope::concat(scope, rscope);
@@ -243,6 +246,7 @@ fn bind_table_with_joins(
             right: Box::new(rnode),
             on,
             join_type,
+            left_schema,
             right_schema,
         };
         scope = combined;
