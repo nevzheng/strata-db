@@ -16,6 +16,7 @@ use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
 use super::expression::Expr;
+use super::logical_plan::{JoinType, SortKey};
 
 /// A physical plan: the root of an operator tree, plus future
 /// plan-level metadata.
@@ -28,6 +29,25 @@ impl PhysicalPlan {
     pub fn new(root: PlanNode) -> Self {
         Self { root }
     }
+}
+
+/// Which physical algorithm realizes a [`Join`](PlanNode::Join). Every
+/// algorithm takes the same inputs and predicate, so the choice is a field,
+/// not a variant (unlike `SeqScan` vs a future `IndexScan`, which differ in
+/// shape). Chosen during lowering; the executor dispatches on it.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum JoinStrategy {
+    /// Tuple-at-a-time nested loop — the only algorithm that handles any
+    /// predicate (and cross joins). Always correct.
+    NestedLoop,
+    /// Block nested loop — buffer a batch of the outer, one inner scan per batch.
+    BlockNestedLoop,
+    /// Sort both inputs on the join key, then merge in one pass. Equi-joins only.
+    SortMerge,
+    /// Grace hash join: hash-partition both inputs to disk, then build a hash
+    /// table from each right partition and probe it with the left. Equi-joins
+    /// only; spills so a build side larger than memory still completes.
+    GraceHash,
 }
 
 /// One node of a physical plan tree. Each variant is a concrete
@@ -57,6 +77,28 @@ pub enum PlanNode {
     Limit { input: Box<PlanNode>, count: usize },
     /// Skip the first `count` rows of `input` (SQL `OFFSET`).
     Offset { input: Box<PlanNode>, count: usize },
+    /// Sort rows by `keys` (SQL `ORDER BY`). External merge sort; a pipeline
+    /// breaker. `input_schema` is the row shape it spills. Sort-merge join
+    /// requires its inputs ordered by such a node.
+    Sort {
+        input: Box<PlanNode>,
+        keys: Vec<SortKey>,
+        input_schema: Schema,
+    },
+    /// Join two inputs; the output row is `left ++ right`. `on: None` with
+    /// `join_type = Inner` is a cross join. `join_type` is the semantics
+    /// (fixed by the query); `strategy` is the algorithm picked in lowering.
+    Join {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        on: Option<Expr>,
+        join_type: JoinType,
+        /// The two input row shapes (left/right) — the build side a hash/block
+        /// join encodes, and what lower uses to insert sort-merge enforcers.
+        left_schema: Schema,
+        right_schema: Schema,
+        strategy: JoinStrategy,
+    },
     /// Yield each tuple in `rows` then stop. Source node for things
     /// like `INSERT INTO t VALUES (..)`.
     Values { rows: Vec<Tuple> },

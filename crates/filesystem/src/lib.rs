@@ -31,17 +31,26 @@ pub mod block;
 pub mod cache;
 pub mod codec;
 mod error;
-pub mod memory;
+mod memory;
 pub mod page;
 pub mod tuple;
+pub mod workspace;
 
 // Block storage — raw block I/O plus the redo journal that makes its writes
 // durable.
 pub use block::journal::{BlockJournal, JournalOp};
 pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
 
-// Memory — the allocator facade and the raw memory unit it hands out.
+// Memory — the allocator facade and the raw memory unit it hands out. The
+// module is interior; consumers reach the types through these re-exports.
 pub use memory::{MemoryPool, OutOfMemory, Slab};
+
+// Workspace — bounded, journal-less scratch tuple storage (memory or file
+// spill), behind the `Workspace` trait.
+pub use workspace::{
+    FileWorkspace, FileWorkspaceTuples, MemoryWorkspace, TupleBytes, Workspace, WorkspaceBlock,
+    WorkspaceLoc,
+};
 
 // Codec — the on-disk serialization vocabulary (used by page types and the LSM).
 pub use codec::{

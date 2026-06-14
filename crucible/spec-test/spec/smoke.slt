@@ -55,12 +55,25 @@ SELECT * FROM acme.metrics.events
 statement error
 SELECT DISTINCT 1
 
-# Unqualified table names are rejected — DDL/DML need `project.dataset.table`.
-statement error
+# Under-qualified names resolve against the session search path
+# (`strata.public`): a bare `foo` is `strata.public.foo`, so DDL/DML/queries
+# all work without spelling out the project + dataset.
+statement ok
 CREATE TABLE foo (a INT)
 
-statement error
+statement ok
 INSERT INTO foo VALUES (1)
+
+# Queryable bare and via the `public` schema (2-part).
+query T
+SELECT a FROM foo
+----
+1
+
+query T
+SELECT a FROM public.foo
+----
+1
 
 # DROP TABLE isn't supported yet.
 statement error

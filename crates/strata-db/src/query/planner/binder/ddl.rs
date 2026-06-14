@@ -13,7 +13,7 @@ use crate::query::QueryError;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
 use crate::storage::types::{Field, FieldName, LogicalType};
 
-use super::{BindNode, Binder, is_tz_aware, three_part_name};
+use super::{BindNode, Binder, is_tz_aware, qualify_table_name};
 
 // --- CREATE TABLE ----------------------------------------------------------
 
@@ -38,7 +38,7 @@ pub(super) fn bind_create_table(
         return Err(QueryError::unsupported("table constraints"));
     }
 
-    let (project, dataset, table) = three_part_name(&ct.name)?;
+    let (project, dataset, table) = qualify_table_name(&ct.name)?;
 
     // Resolve the parent project + dataset to ids; either missing is a
     // catalog NotFound, surfaced to the caller verbatim.

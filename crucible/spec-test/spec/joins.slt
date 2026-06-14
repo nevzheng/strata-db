@@ -1,0 +1,105 @@
+# Joins: every reachable join type (INNER, LEFT, RIGHT, FULL, CROSS) via
+# explicit JOIN syntax and comma-FROM, plus qualified/unqualified column refs
+# and an ambiguity error. `rowsort` keeps these algorithm-agnostic (SQL join
+# output is unordered, and block-nested-loop emits a different order than
+# tuple-nested-loop). Outer joins COALESCE the padded side to a sentinel
+# because the wire renders NULL as an empty string.
+
+statement ok
+CREATE SCHEMA strata.j
+
+statement ok
+CREATE TABLE strata.j.emp (id INT, name TEXT, dept INT)
+
+statement ok
+INSERT INTO strata.j.emp VALUES (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Carol', 30), (4, 'Dave', NULL)
+
+statement ok
+CREATE TABLE strata.j.dept (id INT, dname TEXT)
+
+statement ok
+INSERT INTO strata.j.dept VALUES (10, 'Eng'), (20, 'Sales'), (40, 'Ops')
+
+# INNER — only matched pairs. Carol (dept 30) and Dave (NULL) have no match;
+# dept 40 (Ops) has no employee.
+query TT rowsort
+SELECT e.name, d.dname FROM strata.j.emp e JOIN strata.j.dept d ON e.dept = d.id
+----
+Alice Eng
+Bob Sales
+
+# LEFT — every employee; unmatched padded with right NULLs (shown as 'none').
+query TT rowsort
+SELECT e.name, COALESCE(d.dname, 'none')
+FROM strata.j.emp e LEFT JOIN strata.j.dept d ON e.dept = d.id
+----
+Alice Eng
+Bob Sales
+Carol none
+Dave none
+
+# RIGHT — every department; Ops (40) has no employee.
+query TT rowsort
+SELECT COALESCE(e.name, 'none'), d.dname
+FROM strata.j.emp e RIGHT JOIN strata.j.dept d ON e.dept = d.id
+----
+Alice Eng
+Bob Sales
+none Ops
+
+# FULL — unmatched rows from both sides.
+query TT rowsort
+SELECT COALESCE(e.name, 'none'), COALESCE(d.dname, 'none')
+FROM strata.j.emp e FULL JOIN strata.j.dept d ON e.dept = d.id
+----
+Alice Eng
+Bob Sales
+Carol none
+Dave none
+none Ops
+
+# CROSS via explicit syntax — 4 x 3 = 12 pairs.
+query T rowsort
+SELECT e.id FROM strata.j.emp e CROSS JOIN strata.j.dept d
+----
+1
+1
+1
+2
+2
+2
+3
+3
+3
+4
+4
+4
+
+# Comma-FROM is a cross join; the WHERE makes it an inner join.
+query TT rowsort
+SELECT e.name, d.dname FROM strata.j.emp e, strata.j.dept d WHERE e.dept = d.id
+----
+Alice Eng
+Bob Sales
+
+# Unqualified projection resolves across the combined scope (distinct names);
+# ON uses table-name qualifiers (no alias).
+query TT rowsort
+SELECT name, dname FROM strata.j.emp JOIN strata.j.dept ON emp.dept = dept.id
+----
+Alice Eng
+Bob Sales
+
+# A three-table left-deep chain.
+query TT rowsort
+SELECT e.name, d.dname
+FROM strata.j.emp e
+JOIN strata.j.dept d ON e.dept = d.id
+JOIN strata.j.dept d2 ON d.id = d2.id
+----
+Alice Eng
+Bob Sales
+
+# Ambiguous unqualified ref — `id` exists on both sides.
+statement error
+SELECT id FROM strata.j.emp e JOIN strata.j.dept d ON e.dept = d.id

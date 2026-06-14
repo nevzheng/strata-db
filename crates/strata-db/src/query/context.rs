@@ -14,10 +14,14 @@ use strata_store::memstore::BTreeMapStore;
 
 use crate::catalog::CatalogReader;
 use crate::catalog::tables::Table;
+use crate::query::JoinConfig;
 use crate::storage::table_api::{TableReader, TableWriter};
 
 pub struct QueryContext<'db> {
     pub(crate) engine: RefMut<'db, StorageEngine<BTreeMapStore>>,
+    /// Executor tunables (join scratch sizing), copied from the owning `Db` at
+    /// context open. See [`JoinConfig`].
+    pub(crate) join_config: JoinConfig,
 }
 
 impl QueryContext<'_> {
@@ -37,5 +41,10 @@ impl QueryContext<'_> {
     /// Read-side catalog handle scoped to this context's engine lock.
     pub(crate) fn catalog(&self) -> CatalogReader<'_> {
         CatalogReader::new(&self.engine)
+    }
+
+    /// Executor tunables for this query (join scratch sizing).
+    pub(crate) fn join_config(&self) -> JoinConfig {
+        self.join_config
     }
 }

@@ -16,15 +16,17 @@ mod ddl;
 mod dml;
 mod expr;
 mod query;
+mod scope;
 
 use sqlparser::ast::{ObjectName, Statement, TimezoneInfo};
 
-use crate::catalog::schema::Schema;
+use crate::catalog::consts::{DEFAULT_DATASET_NAME, DEFAULT_PROJECT_NAME};
 use crate::query::logical_plan::LogicalPlan;
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
 use crate::query::{QueryContext, QueryError};
 
 use super::pass::Pass;
+use scope::Scope;
 
 pub(super) struct Binder<'a, 'db> {
     ctx: &'a QueryContext<'db>,
@@ -32,10 +34,7 @@ pub(super) struct Binder<'a, 'db> {
     /// visible at one nesting level (one outer query, one subquery,
     /// etc.). `current_scope()` returns the identifiers that resolve
     /// right now — pushed when we enter a FROM, popped when we leave.
-    ///
-    /// Modeled as `Schema` today; once we add joins / aliases / CTEs,
-    /// this grows into a richer `Scope` struct.
-    scopes: Vec<Schema>,
+    scopes: Vec<Scope>,
 }
 
 impl<'a, 'db> Binder<'a, 'db> {
@@ -46,15 +45,15 @@ impl<'a, 'db> Binder<'a, 'db> {
         }
     }
 
-    fn push_scope(&mut self, schema: Schema) {
-        self.scopes.push(schema);
+    fn push_scope(&mut self, scope: Scope) {
+        self.scopes.push(scope);
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    fn current_scope(&self) -> Option<&Schema> {
+    fn current_scope(&self) -> Option<&Scope> {
         self.scopes.last()
     }
 
@@ -108,15 +107,20 @@ fn name_idents(name: &ObjectName) -> Result<Vec<&str>, QueryError> {
         .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))
 }
 
-/// Split a `project.dataset.table` object name into its three parts.
-/// Errors `unsupported` if it isn't exactly three identifier segments —
-/// we have no session defaults to fill in shorter names. Shared by the
-/// DDL, DML, and query binders.
-fn three_part_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
+/// Resolve a (possibly under-qualified) table name to `(project, dataset,
+/// table)`, filling missing leading parts from the session search path —
+/// fixed at [`DEFAULT_PROJECT_NAME`].[`DEFAULT_DATASET_NAME`] (`strata.public`)
+/// for now. So a bare `t` is `strata.public.t`, `d.t` is `strata.d.t`, and a
+/// full `p.d.t` is itself. This is what lets a pgwire client address `public.t`
+/// (or just `t`) on connect. Shared by the DDL, DML, and query binders.
+/// (Per-session `SET search_path` is future work.)
+fn qualify_table_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
     match name_idents(name)?.as_slice() {
+        [t] => Ok((DEFAULT_PROJECT_NAME, DEFAULT_DATASET_NAME, *t)),
+        [d, t] => Ok((DEFAULT_PROJECT_NAME, *d, *t)),
         [p, d, t] => Ok((*p, *d, *t)),
         _ => Err(QueryError::unsupported(format!(
-            "name needs project.dataset.table, got: {name}"
+            "table name has too many parts (max project.dataset.table): {name}"
         ))),
     }
 }

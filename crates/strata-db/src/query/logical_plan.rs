@@ -20,6 +20,31 @@ use crate::storage::types::Tuple;
 
 use super::expression::Expr;
 
+/// One `ORDER BY` term: the expression to sort by, the direction, and where
+/// NULLs land. NULL placement is independent of the direction (matching SQL).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SortKey {
+    pub expr: Expr,
+    pub ascending: bool,
+    pub nulls_first: bool,
+}
+
+/// How a join treats rows with no match on the other side. The condition
+/// itself lives in [`LogicalNode::Join::on`]; this is the row-emission
+/// semantics, fixed by the query (the optimizer never changes it — only the
+/// physical [`JoinStrategy`](crate::query::physical_plan::JoinStrategy)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JoinType {
+    /// Only matched pairs. (Cross join = `Inner` with `on: None`.)
+    Inner,
+    /// Matched pairs, plus each unmatched left row padded with right NULLs.
+    Left,
+    /// Matched pairs, plus each unmatched right row padded with left NULLs.
+    Right,
+    /// Matched pairs, plus unmatched rows from both sides, NULL-padded.
+    Full,
+}
+
 /// A logical plan: the root of an operator tree, plus future
 /// plan-level metadata (output schema, estimated cardinality, …).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -60,6 +85,29 @@ pub enum LogicalNode {
     Offset {
         input: Box<LogicalNode>,
         count: usize,
+    },
+    /// Join two inputs. The output row is the left tuple concatenated with
+    /// the right (`left ++ right`), and `on` indexes into that combined row.
+    /// `on: None` with `join_type = Inner` is a cross join (every pair).
+    /// `left_schema` / `right_schema` are the two input row shapes — used to
+    /// split a combined-tuple `on` index into per-side column positions and to
+    /// give a materializing/spilling strategy the schema-driven codec.
+    Join {
+        left: Box<LogicalNode>,
+        right: Box<LogicalNode>,
+        on: Option<Expr>,
+        join_type: JoinType,
+        left_schema: Schema,
+        right_schema: Schema,
+    },
+    /// Order rows by one or more keys (SQL `ORDER BY`). A pipeline breaker —
+    /// it consumes all input before producing the first row. `input_schema` is
+    /// the shape of the rows it materializes (so it can encode them to scratch
+    /// storage with the schema-driven codec).
+    Sort {
+        input: Box<LogicalNode>,
+        keys: Vec<SortKey>,
+        input_schema: Schema,
     },
     /// Source node for `INSERT INTO t VALUES (..)`.
     Values { rows: Vec<Tuple> },

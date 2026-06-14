@@ -28,11 +28,15 @@
 //!   _datasets:        ffffffff-ffff-0000-0000-000000000002   (ProjectId, DatasetId) -> DatasetMeta
 //!   _tables:          ffffffff-ffff-0000-0000-000000000003   (ProjectId, DatasetId, TableId) -> TableMeta
 //!   _queries:         ffffffff-ffff-0000-0000-000000000004   (ProjectId, QueryId) -> QueryMeta
+//!   _stats:           ffffffff-ffff-0000-0000-000000000005   (schema, table, column) -> ColumnStats
+//!   _columns:         ffffffff-ffff-0000-0000-000000000006   (TableId, position) -> ColumnMeta
+//!   _indexes:         ffffffff-ffff-0000-0000-000000000007   (TableId, name) -> IndexMeta
+//!   _constraints:     ffffffff-ffff-0000-0000-000000000008   (TableId, name) -> ConstraintMeta
 //! ```
 //!
 //! Future system tables should pick the next available suffix
-//! (`...000000000005`, `...000000000006`, ...) so they remain distinct
-//! [`TableId`]s within the catalog dataset.
+//! (`...000000000009`, ...) so they remain distinct [`TableId`]s within the
+//! catalog dataset.
 //!
 //! # Roles
 //!
@@ -142,6 +146,29 @@ pub const STATS_TABLE_NAME: &str = "_stats";
 /// Reserved [`TableId`] for the column-statistics table.
 pub const STATS_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000005"));
 
+// Normalized catalog tables — one row per column / index / constraint, the
+// stored source for the `pg_attribute` / `pg_index` / `pg_constraint` views and
+// the catalog's assembled `TableSchema` descriptor. All keyed by table id (+ a
+// discriminator), so a prefix scan returns a table's columns/indexes/etc.
+
+/// Display name of the table storing `ColumnMeta` rows, one per column.
+pub const COLUMNS_TABLE_NAME: &str = "_columns";
+
+/// Reserved [`TableId`] for the columns metadata table.
+pub const COLUMNS_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000006"));
+
+/// Display name of the table storing `IndexMeta` rows, one per index.
+pub const INDEXES_TABLE_NAME: &str = "_indexes";
+
+/// Reserved [`TableId`] for the indexes metadata table.
+pub const INDEXES_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000007"));
+
+/// Display name of the table storing `ConstraintMeta` rows, one per constraint.
+pub const CONSTRAINTS_TABLE_NAME: &str = "_constraints";
+
+/// Reserved [`TableId`] for the constraints metadata table.
+pub const CONSTRAINTS_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000008"));
+
 // --- Pre-built metas ---
 //
 // These can't be `const` because `*Meta` carries an owned `String` name.
@@ -166,7 +193,7 @@ pub(crate) fn uuid_table_meta() -> TableMeta {
         id: UUID_TABLE_ID,
         name: UUID_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
-        schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -175,7 +202,7 @@ pub(crate) fn projects_table_meta() -> TableMeta {
         id: PROJECTS_TABLE_ID,
         name: PROJECTS_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
-        schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -184,7 +211,7 @@ pub(crate) fn datasets_table_meta() -> TableMeta {
         id: DATASETS_TABLE_ID,
         name: DATASETS_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
-        schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -193,7 +220,7 @@ pub(crate) fn tables_table_meta() -> TableMeta {
         id: TABLES_TABLE_ID,
         name: TABLES_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
-        schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -202,6 +229,33 @@ pub(crate) fn queries_table_meta() -> TableMeta {
         id: QUERIES_TABLE_ID,
         name: QUERIES_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
-        schema: system_table_schema(),
+        indexes: Vec::new(),
+    }
+}
+
+pub(crate) fn columns_table_meta() -> TableMeta {
+    TableMeta {
+        id: COLUMNS_TABLE_ID,
+        name: COLUMNS_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
+        indexes: Vec::new(),
+    }
+}
+
+pub(crate) fn indexes_table_meta() -> TableMeta {
+    TableMeta {
+        id: INDEXES_TABLE_ID,
+        name: INDEXES_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
+        indexes: Vec::new(),
+    }
+}
+
+pub(crate) fn constraints_table_meta() -> TableMeta {
+    TableMeta {
+        id: CONSTRAINTS_TABLE_ID,
+        name: CONSTRAINTS_TABLE_NAME.to_string(),
+        truncation_id: TruncationId::INITIAL,
+        indexes: Vec::new(),
     }
 }

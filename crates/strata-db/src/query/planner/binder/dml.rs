@@ -11,7 +11,7 @@ use crate::query::expression::Expr;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
 use crate::storage::types::{Field, LogicalType, Tuple, Value};
 
-use super::{BindNode, Binder, three_part_name};
+use super::{BindNode, Binder, qualify_table_name};
 
 // --- INSERT ----------------------------------------------------------------
 
@@ -30,7 +30,7 @@ pub(super) fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<Logica
             "INSERT target must be a table name",
         ));
     };
-    let (project, dataset, table_name) = three_part_name(name)?;
+    let (project, dataset, table_name) = qualify_table_name(name)?;
     let table = binder
         .ctx()
         .catalog()

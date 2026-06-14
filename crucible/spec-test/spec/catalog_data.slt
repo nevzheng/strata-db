@@ -1,0 +1,53 @@
+# End-to-end: create a table, insert rows, and confirm the catalog reflects it
+# — the column metadata is assembled from the normalized `_columns` rows, so
+# this exercises the create → store → introspect path together. Row counts
+# (`reltuples`) are a TBD placeholder (-1) until ANALYZE populates statistics.
+#
+# The spec server is shared, and pg_attribute filters only by column name, so
+# columns are uniquely prefixed (`widget_*`) to scope these assertions.
+
+statement ok
+CREATE SCHEMA strata.cat
+
+statement ok
+CREATE TABLE strata.cat.widgets (widget_id INT, widget_name TEXT NOT NULL, widget_price NUMERIC)
+
+statement ok
+INSERT INTO strata.cat.widgets VALUES (1, 'gear', NUMERIC '9.99'), (2, 'bolt', NUMERIC '0.10')
+
+# The data itself round-trips.
+query TT rowsort
+SELECT widget_name, widget_price FROM strata.cat.widgets
+----
+bolt 0.10
+gear 9.99
+
+# information_schema.columns reflects the columns in declared order, with the
+# NOT NULL flag — all derived from the normalized `_columns` rows.
+query TTT
+SELECT column_name, ordinal_position, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'cat' AND table_name = 'widgets'
+----
+widget_id 1 YES
+widget_name 2 NO
+widget_price 3 YES
+
+# pg_class: column count is real (counts `_columns`); reltuples is the
+# "unknown" placeholder until ANALYZE.
+query TTT
+SELECT relname, relnatts, reltuples FROM pg_class WHERE relname = 'widgets'
+----
+widgets 3 -1
+
+# pg_attribute: the canonical PG type OID and NOT NULL flag (text = 25).
+query TTT
+SELECT attname, atttypid, attnotnull FROM pg_attribute WHERE attname = 'widget_name'
+----
+widget_name 25 t
+
+# numeric = 1700.
+query TT
+SELECT attname, atttypid FROM pg_attribute WHERE attname = 'widget_price'
+----
+widget_price 1700

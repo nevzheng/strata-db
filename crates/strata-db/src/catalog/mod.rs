@@ -35,6 +35,7 @@ pub mod consts;
 pub mod dataset;
 pub mod db;
 pub mod ids;
+pub mod index;
 pub mod project;
 pub mod schema;
 pub mod system;
@@ -44,8 +45,8 @@ use strata_store::StorageEngine;
 use strata_store::memstore::BTreeMapStore;
 
 use crate::catalog::consts::{
-    CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, STATS_TABLE_ID, STATS_TABLE_NAME,
-    SYSTEM_PROJECT_ID, TABLES_TABLE_ID, system_table_schema,
+    CATALOG_DATASET_ID, COLUMNS_TABLE_ID, COLUMNS_TABLE_NAME, DATASETS_TABLE_ID, PROJECTS_TABLE_ID,
+    STATS_TABLE_ID, STATS_TABLE_NAME, SYSTEM_PROJECT_ID, TABLES_TABLE_ID, system_table_schema,
 };
 use crate::catalog::db::TableApi;
 use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId, TruncationId};
@@ -54,7 +55,7 @@ use crate::catalog::system::ColumnStats;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
 use crate::storage::table_api::{ScanOptions, TableReader, TableWriter};
-use crate::storage::types::{Tuple, Value};
+use crate::storage::types::{Field, FieldName, LogicalType, Tuple, Value};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceKind {
@@ -103,7 +104,12 @@ pub(crate) struct TableMeta {
     pub id: TableId,
     pub truncation_id: TruncationId,
     pub name: String,
-    pub schema: Schema,
+    /// Secondary indexes on the table. `default` so rows written before this
+    /// field existed deserialize as "no indexes". The table's columns are the
+    /// normalized `_columns` rows — assembled via [`assemble_schema`], not
+    /// embedded here.
+    #[serde(default)]
+    pub indexes: Vec<crate::catalog::index::Index>,
 }
 
 /// One row per query executed within a project. `info` is freeform
@@ -115,6 +121,63 @@ pub(crate) struct TableMeta {
 pub(crate) struct QueryMeta {
     pub id: QueryId,
     pub info: serde_json::Value,
+}
+
+// --- Normalized catalog rows ---
+//
+// The source of truth for a table's shape, one row per column / index /
+// constraint (vs. the denormalized schema embedded in `TableMeta` today). The
+// catalog assembles a table's descriptor by prefix-scanning these by table id;
+// the `pg_attribute` / `pg_index` / `pg_constraint` views read them directly.
+// Scaffolding until the write/read paths are switched over.
+
+/// One row in `_columns`. Mirrors a [`Field`](crate::storage::types::Field) plus
+/// its owning table and 0-based ordinal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ColumnMeta {
+    pub table_id: TableId,
+    pub position: u32,
+    pub name: String,
+    pub ty: LogicalType,
+    pub nullable: bool,
+    /// `DEFAULT` as serialized `Expr` JSON, mirroring `Field::default`.
+    pub default: Option<String>,
+}
+
+/// One row in `_indexes` — the stored form of
+/// [`Index`](crate::catalog::index::Index) plus the flags `pg_index` exposes.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IndexMeta {
+    pub table_id: TableId,
+    pub name: String,
+    /// Keyed columns, in order (positions in the table schema).
+    pub columns: Vec<usize>,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub is_clustered: bool,
+}
+
+/// One row in `_constraints` — a primary key, foreign key, unique, or check.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConstraintMeta {
+    pub table_id: TableId,
+    pub name: String,
+    pub kind: ConstraintKind,
+    pub columns: Vec<usize>,
+    /// Referenced table + columns, for a foreign key.
+    pub ref_table: Option<TableId>,
+    pub ref_columns: Vec<usize>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ConstraintKind {
+    Primary,
+    Foreign,
+    Unique,
+    Check,
 }
 
 // --- System-table helpers ---
@@ -196,6 +259,83 @@ fn tables_meta_table() -> Table {
 
 fn stats_meta_table() -> Table {
     system_table(STATS_TABLE_ID, STATS_TABLE_NAME)
+}
+
+fn columns_meta_table() -> Table {
+    system_table(COLUMNS_TABLE_ID, COLUMNS_TABLE_NAME)
+}
+
+/// Key for a `_columns` row: `table_id` (16 bytes) + `position` (big-endian
+/// `u32`). Prefixing by `table_id` returns a table's columns in ordinal order.
+fn column_key(table_id: TableId, position: u32) -> Vec<u8> {
+    let mut key = table_id.as_bytes().to_vec();
+    key.extend_from_slice(&position.to_be_bytes());
+    key
+}
+
+/// Write one `_columns` row per field — the normalized form of `schema`.
+fn write_columns(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    table_id: TableId,
+    schema: &Schema,
+) -> Result<(), QueryError> {
+    let table = columns_meta_table();
+    for (i, field) in schema.fields.iter().enumerate() {
+        let meta = ColumnMeta {
+            table_id,
+            position: i as u32,
+            name: field.name.as_str().to_string(),
+            ty: field.ty.clone(),
+            nullable: field.nullable,
+            default: field.default.clone(),
+        };
+        write_meta(engine, &table, &column_key(table_id, i as u32), &meta)?;
+    }
+    Ok(())
+}
+
+/// The normalized columns of `table_id`, in ordinal order. The assembled form
+/// of a table's schema (read from `_columns`, not the `_tables` blob).
+pub(crate) fn list_columns(
+    engine: &StorageEngine<BTreeMapStore>,
+    table_id: TableId,
+) -> Result<Vec<ColumnMeta>, QueryError> {
+    list_metas(engine, columns_meta_table(), table_id.as_bytes())
+}
+
+/// Assemble a table's [`Schema`] from its normalized `_columns` rows — the
+/// read-path counterpart to [`write_columns`]. This is the catalog's source of
+/// truth for a table's shape; the schema still embedded in the `_tables` blob
+/// is redundant (a later cleanup drops it).
+pub(crate) fn assemble_schema(
+    engine: &StorageEngine<BTreeMapStore>,
+    table_id: TableId,
+) -> Result<Schema, QueryError> {
+    let columns = list_columns(engine, table_id)?;
+    Ok(Schema {
+        fields: columns
+            .into_iter()
+            .map(|c| Field {
+                name: FieldName::new(c.name),
+                ty: c.ty,
+                nullable: c.nullable,
+                default: c.default,
+            })
+            .collect(),
+    })
+}
+
+/// Delete all `_columns` rows for `table_id` (before rewriting on replace).
+fn clear_columns(
+    engine: &mut StorageEngine<BTreeMapStore>,
+    table_id: TableId,
+) -> Result<(), QueryError> {
+    let table = columns_meta_table();
+    let existing = list_columns(engine, table_id)?;
+    for col in &existing {
+        remove_meta(engine, &table, &column_key(table_id, col.position))?;
+    }
+    Ok(())
 }
 
 /// Key for a column-statistics row: `schema\0table\0column`. NUL separators
@@ -337,14 +477,18 @@ pub(crate) fn resolve_table(
                 name: table.to_string(),
             }
         })?;
+    // The descriptor's schema is assembled from the normalized `_columns`
+    // rows (the source of truth), not the schema embedded in the blob.
+    let schema = assemble_schema(engine, table_meta.id)?;
     Ok(Table::new(
         project_meta.id,
         dataset_meta.id,
         table_meta.id,
         table_meta.truncation_id,
         table_meta.name,
-        table_meta.schema,
-    ))
+        schema,
+    )
+    .with_indexes(table_meta.indexes))
 }
 
 // --- Write-side free functions ---------------------------------------------
@@ -391,11 +535,15 @@ pub(crate) fn create_table(
     if get_table(engine, project_id, dataset_id, name)?.is_some() {
         return Err(already_exists(ResourceKind::Table, name));
     }
+    let id = TableId::new();
+    // Normalized columns (additive — the `_tables` blob still embeds the schema
+    // until the read path is cut over).
+    write_columns(engine, id, &schema)?;
     let meta = TableMeta {
-        id: TableId::new(),
+        id,
         truncation_id: TruncationId::INITIAL,
         name: name.to_string(),
-        schema,
+        indexes: Vec::new(),
     };
     put_table_meta(engine, project_id, dataset_id, &meta)?;
     Ok(meta)
@@ -425,11 +573,16 @@ pub(crate) fn replace_table(
         ),
         None => (TruncationId::INITIAL, TableId::new()),
     };
+    // Rewrite the normalized columns for the (stable) logical id — clearing any
+    // from a prior incarnation so a shrunk schema leaves no stale rows.
+    clear_columns(engine, id)?;
+    write_columns(engine, id, &schema)?;
     let meta = TableMeta {
         id,
         truncation_id,
         name: name.to_string(),
-        schema,
+        // A fresh incarnation starts with no indexes (CREATE OR REPLACE drops them).
+        indexes: Vec::new(),
     };
     put_table_meta(engine, project_id, dataset_id, &meta)?;
     Ok(meta)
@@ -537,6 +690,12 @@ impl<'a> CatalogReader<'a> {
             &dataset_scope(project_id, dataset_id),
         )?;
         Ok(live_incarnations(metas))
+    }
+
+    /// A table's normalized columns, in ordinal order — the source for the
+    /// `pg_attribute` / `information_schema.columns` views and `relnatts`.
+    pub(crate) fn list_columns(&self, table_id: TableId) -> Result<Vec<ColumnMeta>, QueryError> {
+        list_columns(self.engine, table_id)
     }
 
     /// Every stored column-statistics row (the `pg_stats` / `st_stats`
@@ -744,4 +903,39 @@ fn truncation_exhausted(name: &str) -> QueryError {
         name: name.to_string(),
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::db::Db;
+    use crate::storage::types::{Field, LogicalType};
+
+    #[test]
+    fn create_table_writes_normalized_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let project = db.create_project("acme").unwrap();
+        let dataset = project.create_dataset("metrics").unwrap();
+        let table = dataset
+            .create_table(
+                "events",
+                Schema {
+                    fields: vec![
+                        Field::new("id", LogicalType::Int32),
+                        Field::new("name", LogicalType::Text),
+                    ],
+                },
+            )
+            .unwrap();
+
+        let ctx = db.query_context();
+        let cols = list_columns(&ctx.engine, table.id()).unwrap();
+
+        assert_eq!(cols.len(), 2);
+        assert_eq!((cols[0].position, cols[0].name.as_str()), (0, "id"));
+        assert!(matches!(cols[0].ty, LogicalType::Int32));
+        assert_eq!((cols[1].position, cols[1].name.as_str()), (1, "name"));
+        assert!(matches!(cols[1].ty, LogicalType::Text));
+    }
 }
