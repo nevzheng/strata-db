@@ -2,8 +2,8 @@
 //! plus the column / type mapping they need.
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable as AstCreateTable, DataType, ExactNumberInfo,
-    Expr as AstExpr, ObjectName, SchemaName, SqlOption,
+    ArrayElemTypeDef, ColumnDef, ColumnOption, CreateTable as AstCreateTable, DataType,
+    ExactNumberInfo, Expr as AstExpr, ObjectName, SchemaName, SqlOption,
 };
 
 use crate::catalog::consts::DEFAULT_PROJECT_NAME;
@@ -211,6 +211,20 @@ pub(super) fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
         DataType::Time(_, _) => LogicalType::Time,
         DataType::Uuid => LogicalType::Uuid,
         DataType::Interval { .. } => LogicalType::Interval,
+        DataType::Array(def) => {
+            let elem = match def {
+                ArrayElemTypeDef::AngleBracket(t)
+                | ArrayElemTypeDef::SquareBracket(t, _)
+                | ArrayElemTypeDef::Parenthesis(t) => bind_data_type(t)?,
+                ArrayElemTypeDef::None => {
+                    return Err(QueryError::unsupported("ARRAY without an element type"));
+                }
+            };
+            if matches!(elem, LogicalType::Array(_)) {
+                return Err(QueryError::unsupported("nested arrays"));
+            }
+            LogicalType::Array(Box::new(elem))
+        }
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }

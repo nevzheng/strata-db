@@ -121,6 +121,8 @@ pub enum Expr {
         input: Box<Expr>,
         target: LogicalType,
     },
+    /// `ARRAY[a, b, …]` — evaluate each element per row into a `Value::Array`.
+    Array { elements: Vec<Expr> },
 }
 
 impl Expr {
@@ -205,7 +207,14 @@ impl Expr {
                     None => Ok(Value::Null),
                 }
             }
-            Expr::Cast { input, target } => eval_cast(input.eval(tuple)?, *target),
+            Expr::Cast { input, target } => eval_cast(input.eval(tuple)?, target),
+            Expr::Array { elements } => {
+                let mut items = Vec::with_capacity(elements.len());
+                for e in elements {
+                    items.push(e.eval(tuple)?);
+                }
+                Ok(Value::Array(items))
+            }
         }
     }
 }
@@ -214,7 +223,7 @@ impl Expr {
 /// target accepts the sources that convert sensibly; anything else is a
 /// type error. Float/numeric → integer rounds; out-of-range narrowing is
 /// an error.
-fn eval_cast(v: Value, target: LogicalType) -> Result<Value, QueryError> {
+fn eval_cast(v: Value, target: &LogicalType) -> Result<Value, QueryError> {
     use LogicalType as T;
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
@@ -235,6 +244,11 @@ fn eval_cast(v: Value, target: LogicalType) -> Result<Value, QueryError> {
         T::Uuid => cast_to_uuid(&v),
         T::Interval => cast_to_interval(&v),
         T::Json => cast_to_json(&v),
+        // No text->array parsing yet; only an array passes through.
+        T::Array(_) => match v {
+            arr @ Value::Array(_) => Ok(arr),
+            other => Err(cast_err(&other, "array")),
+        },
     }
 }
 
@@ -520,6 +534,13 @@ fn concat_str(v: &Value) -> Result<String, QueryError> {
         Value::Time(t) => crate::storage::temporal::format_time(*t),
         Value::Uuid(u) => u.to_string(),
         Value::Interval(i) => crate::storage::temporal::format_interval(*i),
+        Value::Array(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                parts.push(concat_str(item)?);
+            }
+            format!("{{{}}}", parts.join(","))
+        }
         other => {
             return Err(QueryError::type_error(format!(
                 "cannot concatenate {other:?}"
@@ -819,6 +840,10 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
     if let (Value::Interval(a), Value::Interval(b)) = (lhs, rhs) {
         return a.to_micros() == b.to_micros();
     }
+    // Arrays compare element-wise, so element types coerce (Int32 vs Int64).
+    if let (Value::Array(a), Value::Array(b)) = (lhs, rhs) {
+        return a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_eq(x, y));
+    }
     lhs == rhs
 }
 
@@ -849,6 +874,16 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
         // Intervals order by their normalized micros, so `1 mon` == `30 days`.
         (Value::Interval(a), Value::Interval(b)) => Ok(a.to_micros().cmp(&b.to_micros())),
+        // Arrays compare element-wise; a prefix sorts before a longer array.
+        (Value::Array(a), Value::Array(b)) => {
+            for (x, y) in a.iter().zip(b.iter()) {
+                let ord = cmp_values(x, y)?;
+                if ord != std::cmp::Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            Ok(a.len().cmp(&b.len()))
+        }
         (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),

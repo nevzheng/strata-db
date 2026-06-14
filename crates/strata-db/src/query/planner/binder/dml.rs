@@ -96,6 +96,31 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
         Value::Time(t) if matches!(field.ty, T::Time) => Ok(Value::Time(t)),
         Value::Uuid(u) if matches!(field.ty, T::Uuid) => Ok(Value::Uuid(u)),
         Value::Interval(i) if matches!(field.ty, T::Interval) => Ok(Value::Interval(i)),
+        // Arrays: coerce each element to the column's element type. NULL
+        // elements aren't supported in v1.
+        Value::Array(items) if matches!(field.ty, T::Array(_)) => {
+            let T::Array(elem) = &field.ty else {
+                unreachable!()
+            };
+            let elem_field = Field {
+                name: field.name.clone(),
+                ty: (**elem).clone(),
+                nullable: false,
+            };
+            let coerced = items
+                .into_iter()
+                .map(|v| {
+                    if matches!(v, Value::Null) {
+                        Err(QueryError::type_error(
+                            "NULL array elements aren't supported",
+                        ))
+                    } else {
+                        coerce_value(v, &elem_field)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Array(coerced))
+        }
         Value::Text(s) if matches!(field.ty, T::Text) => Ok(Value::Text(s)),
         Value::Bytes(b) if matches!(field.ty, T::Bytes) => Ok(Value::Bytes(b)),
         Value::Json(j) if matches!(field.ty, T::Json) => Ok(Value::Json(j)),

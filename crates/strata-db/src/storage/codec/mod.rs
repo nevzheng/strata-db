@@ -108,6 +108,8 @@ impl Value {
             Value::Time(n) => n.encoded_size(),
             Value::Uuid(u) => u.encoded_size(),
             Value::Interval(i) => i.encoded_size(),
+            // u32 count + each element's encoding.
+            Value::Array(items) => 4 + items.iter().map(Value::encoded_size).sum::<usize>(),
         }
     }
 
@@ -133,6 +135,12 @@ impl Value {
             Value::Time(n) => n.encode(buf),
             Value::Uuid(u) => u.encode(buf),
             Value::Interval(i) => i.encode(buf),
+            Value::Array(items) => {
+                buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for item in items {
+                    item.encode(buf);
+                }
+            }
         }
     }
 
@@ -156,13 +164,20 @@ impl Value {
             Value::Time(n) => n.encode_key(buf),
             Value::Uuid(u) => u.encode_key(buf),
             Value::Interval(i) => i.encode_key(buf),
+            // Element keys concatenated — element-wise ordering (correct
+            // for fixed-width elements; a null element has no key).
+            Value::Array(items) => {
+                for item in items {
+                    item.encode_key(buf)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Decode a single non-null value of the given type, advancing `buf`
     /// past the bytes it consumed.
-    pub fn decode(ty: LogicalType, buf: &mut &[u8]) -> Result<Value, DecodeError> {
+    pub fn decode(ty: &LogicalType, buf: &mut &[u8]) -> Result<Value, DecodeError> {
         match ty {
             LogicalType::Bool => Ok(Value::Bool(bool::decode(buf)?)),
             LogicalType::Int16 => Ok(Value::Int16(i16::decode(buf)?)),
@@ -179,6 +194,14 @@ impl Value {
             LogicalType::Time => Ok(Value::Time(i64::decode(buf)?)),
             LogicalType::Uuid => Ok(Value::Uuid(Uuid::decode(buf)?)),
             LogicalType::Interval => Ok(Value::Interval(Interval::decode(buf)?)),
+            LogicalType::Array(elem) => {
+                let count = u32::from_le_bytes(take(buf, 4)?.try_into().unwrap()) as usize;
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(Value::decode(elem, buf)?);
+                }
+                Ok(Value::Array(items))
+            }
         }
     }
 }
@@ -307,7 +330,7 @@ mod tests {
         let mut buf = Vec::new();
         Value::Int32(42).encode(&mut buf);
         let mut cursor: &[u8] = &buf;
-        let decoded = Value::decode(LogicalType::Int32, &mut cursor).unwrap();
+        let decoded = Value::decode(&LogicalType::Int32, &mut cursor).unwrap();
         assert_eq!(decoded, Value::Int32(42));
     }
 
@@ -332,7 +355,7 @@ mod tests {
         original.encode(&mut buf);
         assert_eq!(buf.len(), original.encoded_size());
         let mut cursor: &[u8] = &buf;
-        let decoded = Value::decode(LogicalType::Json, &mut cursor).unwrap();
+        let decoded = Value::decode(&LogicalType::Json, &mut cursor).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -426,6 +449,33 @@ mod tests {
         .map(|s| dec(s))
         .collect();
         assert_key_order_preserving(&ascending);
+    }
+
+    #[test]
+    fn array_value_roundtrips() {
+        let arr = Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
+        let mut buf = Vec::new();
+        arr.encode(&mut buf);
+        assert_eq!(buf.len(), arr.encoded_size());
+        let ty = LogicalType::Array(Box::new(LogicalType::Int32));
+        let mut cur: &[u8] = &buf;
+        assert_eq!(Value::decode(&ty, &mut cur).unwrap(), arr);
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn array_keys_order_element_wise() {
+        let key = |items: &[i32]| {
+            let mut b = Vec::new();
+            Value::Array(items.iter().map(|n| Value::Int32(*n)).collect())
+                .encode_key(&mut b)
+                .unwrap();
+            b
+        };
+        // A prefix sorts before a longer array; otherwise element order wins.
+        assert!(key(&[1, 2]) < key(&[1, 2, 9]));
+        assert!(key(&[1, 2, 9]) < key(&[1, 3]));
+        assert!(key(&[1]) < key(&[2]));
     }
 
     #[test]

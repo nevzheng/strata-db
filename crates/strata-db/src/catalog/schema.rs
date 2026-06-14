@@ -79,7 +79,7 @@ impl Schema {
             if is_null {
                 values.push(Value::Null);
             } else {
-                values.push(Value::decode(field.ty, &mut cursor)?);
+                values.push(Value::decode(&field.ty, &mut cursor)?);
             }
         }
 

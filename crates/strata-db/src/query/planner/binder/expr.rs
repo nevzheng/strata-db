@@ -116,6 +116,14 @@ impl BindNode for AstExpr {
                 target: super::ddl::bind_data_type(data_type)?,
             }),
             AstExpr::Interval(iv) => bind_interval(iv),
+            AstExpr::Array(arr) => {
+                let elements = arr
+                    .elem
+                    .iter()
+                    .map(|e| e.bind(binder))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expr::Array { elements })
+            }
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }

@@ -51,7 +51,9 @@
 //!   lex sort matches content sort. Required for prefix and range scans
 //!   to behave.
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+// No longer `Copy` — `Array` holds a boxed element type. Pass by
+// reference or clone where a `LogicalType` is needed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalType {
     Bool,
     Int16,
@@ -68,6 +70,8 @@ pub enum LogicalType {
     Time,
     Uuid,
     Interval,
+    /// A one-dimensional array of `element` (no nesting in v1).
+    Array(Box<LogicalType>),
 }
 
 /// A SQL `INTERVAL`, stored as Postgres's three independent components.
@@ -122,6 +126,9 @@ pub enum Value {
     Uuid(uuid::Uuid),
     /// An `INTERVAL` — months / days / microseconds (see [`Interval`]).
     Interval(Interval),
+    /// A one-dimensional array. Elements share the column's element type;
+    /// `NULL` elements aren't supported in v1.
+    Array(Vec<Value>),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is

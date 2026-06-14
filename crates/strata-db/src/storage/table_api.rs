@@ -48,6 +48,8 @@ fn check_value_size(value: &Value) -> Result<(), QueryError> {
     let len = match value {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
+        // An array must fit in a page too — check its full encoded size.
+        Value::Array(_) => value.encoded_size(),
         _ => return Ok(()),
     };
     if len > MAX_TEXT_SIZE {

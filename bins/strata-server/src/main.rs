@@ -239,6 +239,13 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Time(t) => Some(strata_db::storage::temporal::format_time(*t)),
         Value::Uuid(u) => Some(u.to_string()),
         Value::Interval(i) => Some(strata_db::storage::temporal::format_interval(*i)),
+        Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|v| value_to_text(v).unwrap_or_else(|| "NULL".into()))
+                .collect();
+            Some(format!("{{{}}}", parts.join(",")))
+        }
     }
 }
 
