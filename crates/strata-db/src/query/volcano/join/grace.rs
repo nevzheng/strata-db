@@ -12,14 +12,14 @@
 //! does) and **probe by streaming the larger side one tuple at a time** — the
 //! probe side is never held in memory.
 //!
-//! If the smaller side still won't fit, we **recursively repartition** with a
-//! fresh hash seed so keys actually redistribute (re-hashing with the same seed
-//! would just re-collide). The fit decision reads [`Workspace::used`] (the
-//! partition's spilled footprint). A partition that even repartitioning can't
-//! split is a single key value larger than the budget; we build it in memory
-//! anyway rather than spill the table to disk — one big in-memory map is O(n+m)
-//! with no random I/O, where a disk-resident hash table would be random reads,
-//! the worst case.
+//! We don't predict the fit — we **build the table and measure it**, bailing
+//! the moment the materialized rows outgrow the budget. An oversized partition
+//! is then **repartitioned** with a fresh hash seed (so keys actually
+//! redistribute instead of re-colliding) and retried, up to a small cap. A
+//! partition that even repartitioning can't split is a single key value larger
+//! than the budget; on the last attempt we build it in memory anyway rather than
+//! spill the table to disk — one big in-memory map is O(n+m) with no random I/O,
+//! where a disk-resident hash table would be random reads, the worst case.
 //!
 //! NULL keys can never match, so they bypass partitioning entirely; outer joins
 //! still emit them, NULL-padded, as unmatched rows.
@@ -50,13 +50,14 @@ const HASH_PARTITIONS: usize = 16;
 const PARTITION_MEMORY: usize = 64 * 1024;
 /// Per-partition on-disk ceiling — the spill backstop.
 const PARTITION_DISK: usize = 1 << 30;
-/// A partition whose smaller side's spilled footprint is at or under this builds
-/// its hash table in memory. Measured against [`Workspace::used`] (encoded
-/// bytes); the decoded table costs a few× more, so this is conservative.
+/// Build-side memory ceiling: a hash table whose materialized rows exceed this
+/// many bytes is abandoned and its partition repartitioned. Counts encoded
+/// bytes; the live table costs a few× more, so this is conservative.
 const BUILD_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
-/// Cap on recursive repartitioning passes. Past this, a still-oversized
-/// partition is irreducible skew (one key value) — built in memory anyway.
-const MAX_REPARTITION_LEVELS: usize = 4;
+/// Cap on repartitioning retries. Past this, a still-oversized partition is
+/// irreducible skew (one key value) — built in memory anyway. Small on purpose:
+/// each pass rewrites the data, and >2 rarely helps once a single key dominates.
+const MAX_REPARTITION_LEVELS: usize = 2;
 /// Base seed for partition routing (per the slab-bucket convention); each
 /// recursion level mixes in its depth so re-hashing actually redistributes.
 const BUCKET_SEED: u64 = 0xdead_beef_cafe_babe;
@@ -251,30 +252,8 @@ impl GraceHashStream {
     /// worklist is empty.
     fn load_next_partition(&mut self) -> Result<bool, QueryError> {
         while let Some((left_ws, right_ws, level)) = self.worklist.pop() {
-            let smaller = left_ws.used().min(right_ws.used());
-            if smaller > self.params.build_budget && level < MAX_REPARTITION_LEVELS {
-                let next = level + 1;
-                let left_sub = repartition(
-                    &left_ws,
-                    self.params.left_key,
-                    &self.params.left_schema,
-                    next,
-                )?;
-                let right_sub = repartition(
-                    &right_ws,
-                    self.params.right_key,
-                    &self.params.right_schema,
-                    next,
-                )?;
-                drop(left_ws); // free the parent partitions' temp files now
-                drop(right_ws);
-                for pair in left_sub.into_iter().zip(right_sub) {
-                    self.worklist.push((pair.0, pair.1, next));
-                }
-                continue;
-            }
-
-            // Build the table from the smaller side; stream-probe the larger.
+            // Build the table from the smaller side (cheap `used()` heuristic);
+            // stream-probe the larger.
             let build_is_left = left_ws.used() <= right_ws.used();
             let (build_ws, probe_ws, build_schema, build_key) = if build_is_left {
                 (
@@ -291,8 +270,32 @@ impl GraceHashStream {
                     self.params.right_key,
                 )
             };
-            let (table, build_rows, build_matched) =
-                build_table(&build_ws, build_schema, build_key)?;
+
+            // Try to build it in memory, bailing if it outgrows the budget. Out
+            // of retries, build unconditionally (irreducible single-key skew).
+            let cap = (level < MAX_REPARTITION_LEVELS).then_some(self.params.build_budget);
+            let built = build_table(&build_ws, build_schema, build_key, cap)?;
+
+            let Some((table, build_rows, build_matched)) = built else {
+                // Didn't fit — repartition both sides with a fresh seed (so keys
+                // redistribute) and retry one level deeper.
+                let next = level + 1;
+                let (probe_schema, probe_key) = if build_is_left {
+                    (&self.params.right_schema, self.params.right_key)
+                } else {
+                    (&self.params.left_schema, self.params.left_key)
+                };
+                let build_sub = repartition(&build_ws, build_key, build_schema, next)?;
+                let probe_sub = repartition(&probe_ws, probe_key, probe_schema, next)?;
+                drop(build_ws); // free the parent partitions' temp files now
+                drop(probe_ws);
+                for (b, p) in build_sub.into_iter().zip(probe_sub) {
+                    // Restore left/right roles so output stays left ++ right.
+                    let pair = if build_is_left { (b, p) } else { (p, b) };
+                    self.worklist.push((pair.0, pair.1, next));
+                }
+                continue;
+            };
             drop(build_ws); // table is materialized; the file is no longer needed
 
             self.current = Some(Probe {
@@ -311,22 +314,39 @@ impl GraceHashStream {
     }
 }
 
-/// Build a hash table from one partition side. The obvious build phase: decode
+/// Build a hash table from one partition side — the obvious build phase: decode
 /// each tuple, index it by its join-key bytes. Returns the table, the rows it
 /// points into, and a per-row matched bitmap (for outer joins).
+///
+/// With `cap = Some(budget)`, gives up (returns `None`) once the materialized
+/// rows exceed `budget` bytes, so the caller can repartition instead of holding
+/// an oversized table; `cap = None` builds unconditionally.
 type BuiltTable = (HashMap<Vec<u8>, Vec<usize>>, Vec<Tuple>, Vec<bool>);
-fn build_table(ws: &FileWorkspace, schema: &Schema, key: usize) -> Result<BuiltTable, QueryError> {
+fn build_table(
+    ws: &FileWorkspace,
+    schema: &Schema,
+    key: usize,
+    cap: Option<usize>,
+) -> Result<Option<BuiltTable>, QueryError> {
     let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
     let mut rows: Vec<Tuple> = Vec::new();
     let mut matched: Vec<bool> = Vec::new();
+    let mut used = 0usize;
     for bytes in ws.tuples() {
+        // Measure the real build as we go; bail the moment it won't fit.
+        used += bytes.len();
+        if let Some(budget) = cap
+            && used > budget
+        {
+            return Ok(None);
+        }
         let tuple = schema.decode(&bytes)?;
         let k = key_bytes(&tuple.values[key])?.expect("null keys never partition");
         table.entry(k).or_default().push(rows.len());
         matched.push(false);
         rows.push(tuple);
     }
-    Ok((table, rows, matched))
+    Ok(Some((table, rows, matched)))
 }
 
 /// Probe one streamed tuple against the build table, buffering its output rows
