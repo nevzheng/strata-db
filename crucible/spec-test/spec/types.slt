@@ -268,6 +268,13 @@ SELECT CAST('23:59:59' AS TIME)
 ----
 23:59:59
 
+# Out-of-range TIME is rejected at bind time.
+statement error
+SELECT TIME '25:00:00'
+
+statement error
+SELECT TIME 'nonsense'
+
 # =====================================================================
 # UUID — 16 bytes, ordered by byte value
 # =====================================================================
@@ -295,3 +302,10 @@ query T
 SELECT CAST('550E8400-E29B-41D4-A716-446655440000' AS UUID)
 ----
 550e8400-e29b-41d4-a716-446655440000
+
+# A malformed UUID is rejected at bind time.
+statement error
+SELECT UUID 'not-a-uuid'
+
+statement error
+SELECT CAST('xyz' AS UUID)
