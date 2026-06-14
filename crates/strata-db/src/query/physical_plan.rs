@@ -16,7 +16,7 @@ use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
 use super::expression::Expr;
-use super::logical_plan::JoinType;
+use super::logical_plan::{JoinType, SortKey};
 
 /// A physical plan: the root of an operator tree, plus future
 /// plan-level metadata.
@@ -73,6 +73,14 @@ pub enum PlanNode {
     Limit { input: Box<PlanNode>, count: usize },
     /// Skip the first `count` rows of `input` (SQL `OFFSET`).
     Offset { input: Box<PlanNode>, count: usize },
+    /// Sort rows by `keys` (SQL `ORDER BY`). External merge sort; a pipeline
+    /// breaker. `input_schema` is the row shape it spills. Sort-merge join
+    /// requires its inputs ordered by such a node.
+    Sort {
+        input: Box<PlanNode>,
+        keys: Vec<SortKey>,
+        input_schema: Schema,
+    },
     /// Join two inputs; the output row is `left ++ right`. `on: None` with
     /// `join_type = Inner` is a cross join. `join_type` is the semantics
     /// (fixed by the query); `strategy` is the algorithm picked in lowering.
@@ -81,6 +89,8 @@ pub enum PlanNode {
         right: Box<PlanNode>,
         on: Option<Expr>,
         join_type: JoinType,
+        /// Inner (right) row shape — the build side a hash/block join encodes.
+        right_schema: Schema,
         strategy: JoinStrategy,
     },
     /// Yield each tuple in `rows` then stop. Source node for things

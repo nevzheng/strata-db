@@ -31,6 +31,12 @@ pub enum BinaryOperator {
     // Logical
     And,
     Or,
+    // Arithmetic
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     // String
     Concat,
 }
@@ -772,6 +778,7 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
                 "OR expects Bool, got {l:?} / {r:?}"
             ))),
         },
+        Add | Sub | Mul | Div | Mod => eval_arithmetic(op, &lhs, &rhs),
         // `||`: stringify both sides and join (NULL already handled above).
         Concat => {
             let mut s = concat_str(&lhs)?;
@@ -779,6 +786,79 @@ fn eval_binary(op: BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Quer
             Ok(Value::Text(s))
         }
     }
+}
+
+/// Arithmetic with numeric coercion mirroring the comparison path: pure
+/// integers compute in `i64`; a float on either side promotes to `f64`
+/// (matching Postgres); otherwise it's exact decimal. NULLs are handled by the
+/// caller before this point.
+fn eval_arithmetic(op: BinaryOperator, lhs: &Value, rhs: &Value) -> Result<Value, QueryError> {
+    if let (Some(a), Some(b)) = (as_i64(lhs), as_i64(rhs)) {
+        return int_arith(op, a, b);
+    }
+    let has_float = matches!(lhs, Value::Float32(_) | Value::Float64(_))
+        || matches!(rhs, Value::Float32(_) | Value::Float64(_));
+    if has_float && let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
+        return float_arith(op, a, b);
+    }
+    if let (Some(a), Some(b)) = (as_decimal(lhs), as_decimal(rhs)) {
+        return decimal_arith(op, a, b);
+    }
+    Err(QueryError::type_error(format!(
+        "cannot apply arithmetic to {lhs:?} and {rhs:?}"
+    )))
+}
+
+fn int_arith(op: BinaryOperator, a: i64, b: i64) -> Result<Value, QueryError> {
+    use BinaryOperator::*;
+    let result = match op {
+        Add => a.checked_add(b),
+        Sub => a.checked_sub(b),
+        Mul => a.checked_mul(b),
+        Div if b == 0 => return Err(QueryError::type_error("division by zero")),
+        Mod if b == 0 => return Err(QueryError::type_error("division by zero")),
+        Div => a.checked_div(b),
+        Mod => a.checked_rem(b),
+        _ => unreachable!("non-arithmetic op reached int_arith"),
+    };
+    result
+        .map(Value::Int64)
+        .ok_or_else(|| QueryError::type_error("integer overflow"))
+}
+
+fn float_arith(op: BinaryOperator, a: f64, b: f64) -> Result<Value, QueryError> {
+    use BinaryOperator::*;
+    let result = match op {
+        Add => a + b,
+        Sub => a - b,
+        Mul => a * b,
+        Div if b == 0.0 => return Err(QueryError::type_error("division by zero")),
+        Div => a / b,
+        Mod => {
+            return Err(QueryError::type_error(
+                "modulo is undefined for floating point",
+            ));
+        }
+        _ => unreachable!("non-arithmetic op reached float_arith"),
+    };
+    Ok(Value::Float64(result))
+}
+
+fn decimal_arith(op: BinaryOperator, a: Decimal, b: Decimal) -> Result<Value, QueryError> {
+    use BinaryOperator::*;
+    let result = match op {
+        Add => a.checked_add(b),
+        Sub => a.checked_sub(b),
+        Mul => a.checked_mul(b),
+        Div if b == Decimal::ZERO => return Err(QueryError::type_error("division by zero")),
+        Mod if b == Decimal::ZERO => return Err(QueryError::type_error("division by zero")),
+        Div => a.checked_div(b),
+        Mod => a.checked_rem(b),
+        _ => unreachable!("non-arithmetic op reached decimal_arith"),
+    };
+    result
+        .map(Value::Numeric)
+        .ok_or_else(|| QueryError::type_error("numeric overflow"))
 }
 
 /// The integer value of `v`, widened to `i64`, if it is any integer

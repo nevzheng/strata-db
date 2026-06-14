@@ -88,16 +88,27 @@ impl LowerNode for LogicalNode {
                 input: Box::new(input.lower()),
                 count: *count,
             },
+            LogicalNode::Sort {
+                input,
+                keys,
+                input_schema,
+            } => PlanNode::Sort {
+                input: Box::new(input.lower()),
+                keys: keys.clone(),
+                input_schema: input_schema.clone(),
+            },
             LogicalNode::Join {
                 left,
                 right,
                 on,
                 join_type,
+                right_schema,
             } => PlanNode::Join {
                 left: Box::new(left.lower()),
                 right: Box::new(right.lower()),
                 on: on.clone(),
                 join_type: *join_type,
+                right_schema: right_schema.clone(),
                 strategy: select_join_strategy(on.as_ref()),
             },
             LogicalNode::Values { rows } => PlanNode::Values { rows: rows.clone() },

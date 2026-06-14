@@ -531,6 +531,11 @@ fn bind_binary_op(op: &AstBinaryOperator) -> Result<BinaryOperator, QueryError> 
         AstBinaryOperator::GtEq => BinaryOperator::GtEq,
         AstBinaryOperator::And => BinaryOperator::And,
         AstBinaryOperator::Or => BinaryOperator::Or,
+        AstBinaryOperator::Plus => BinaryOperator::Add,
+        AstBinaryOperator::Minus => BinaryOperator::Sub,
+        AstBinaryOperator::Multiply => BinaryOperator::Mul,
+        AstBinaryOperator::Divide => BinaryOperator::Div,
+        AstBinaryOperator::Modulo => BinaryOperator::Mod,
         AstBinaryOperator::StringConcat => BinaryOperator::Concat,
         other => return Err(QueryError::unsupported(format!("binary op: {other:?}"))),
     })

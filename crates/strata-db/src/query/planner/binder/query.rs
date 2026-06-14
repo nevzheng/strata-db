@@ -2,14 +2,14 @@
 //! projection list.
 
 use sqlparser::ast::{
-    Expr as AstExpr, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause,
-    Query as AstQuery, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
+    Expr as AstExpr, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause, OrderByExpr,
+    OrderByKind, Query as AstQuery, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
 use crate::catalog::system::SystemRelation;
 use crate::query::QueryError;
 use crate::query::expression::Expr;
-use crate::query::logical_plan::{JoinType, LogicalNode, LogicalPlan};
+use crate::query::logical_plan::{JoinType, LogicalNode, LogicalPlan, SortKey};
 use crate::storage::types::{Tuple, Value};
 
 use super::scope::Scope;
@@ -19,14 +19,17 @@ impl BindNode for AstQuery {
     type Output = LogicalPlan;
 
     fn bind(&self, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
-        // ORDER BY / FETCH would change the result; reject rather than
-        // silently ignore them.
-        if self.order_by.is_some() {
-            return Err(QueryError::unsupported("ORDER BY"));
-        }
+        // FETCH would change the result; reject rather than silently ignore.
         if self.fetch.is_some() {
             return Err(QueryError::unsupported("FETCH"));
         }
+        let order_by = match &self.order_by {
+            None => None,
+            Some(ob) => match &ob.kind {
+                OrderByKind::Expressions(exprs) => Some(exprs.as_slice()),
+                OrderByKind::All(_) => return Err(QueryError::unsupported("ORDER BY ALL")),
+            },
+        };
 
         let SetExpr::Select(select) = self.body.as_ref() else {
             return Err(QueryError::unsupported(format!(
@@ -34,7 +37,7 @@ impl BindNode for AstQuery {
                 self.body
             )));
         };
-        let mut node = select.bind(binder)?;
+        let mut node = bind_select(select, order_by, binder)?;
 
         // `LIMIT k OFFSET n` (Postgres): skip n rows, then take k. Apply
         // OFFSET first so it sits closest to the input.
@@ -88,56 +91,93 @@ fn bind_count(expr: &AstExpr, binder: &mut Binder, what: &str) -> Result<usize, 
 
 // --- SELECT body: FROM + WHERE + projection --------------------------------
 
-impl BindNode for Select {
-    type Output = LogicalNode;
-
-    fn bind(&self, binder: &mut Binder) -> Result<LogicalNode, QueryError> {
-        // Reject SQL features the engine doesn't implement yet, so they
-        // surface as a clear `unsupported: <feature>` instead of silently
-        // producing a wrong plan.
-        if self.distinct.is_some() {
-            return Err(QueryError::unsupported("DISTINCT"));
-        }
-        if !matches!(&self.group_by, GroupByExpr::Expressions(exprs, _) if exprs.is_empty()) {
-            return Err(QueryError::unsupported("GROUP BY"));
-        }
-        if self.having.is_some() {
-            return Err(QueryError::unsupported("HAVING"));
-        }
-
-        // 1. FROM → source + the scope it exposes. Empty FROM yields a
-        // one-row, zero-column source so `SELECT <expr>` (no FROM) binds.
-        let (source, scope) = bind_from(&self.from, binder)?;
-
-        binder.push_scope(scope);
-
-        // 2. WHERE → wrap in Filter if a predicate is present.
-        let after_where = match &self.selection {
-            Some(pred) => LogicalNode::Filter {
-                input: Box::new(source),
-                predicate: pred.bind(binder)?,
-            },
-            None => source,
-        };
-
-        // 3. Projection → Project. Each `SelectItem` may expand to
-        // multiple expressions (wildcards), hence flatten.
-        let expressions: Vec<Expr> = self
-            .projection
-            .iter()
-            .map(|item| item.bind(binder))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-
-        binder.pop_scope();
-
-        Ok(LogicalNode::Project {
-            input: Box::new(after_where),
-            expressions,
-        })
+/// Bind a `SELECT` body, optionally with an `ORDER BY`. The Sort sits below the
+/// projection so it can order by any input column or expression (binding
+/// against the FROM scope), not just the select list.
+fn bind_select(
+    select: &Select,
+    order_by: Option<&[OrderByExpr]>,
+    binder: &mut Binder,
+) -> Result<LogicalNode, QueryError> {
+    // Reject SQL features the engine doesn't implement yet, so they surface as
+    // a clear `unsupported: <feature>` instead of silently producing a wrong plan.
+    if select.distinct.is_some() {
+        return Err(QueryError::unsupported("DISTINCT"));
     }
+    if !matches!(&select.group_by, GroupByExpr::Expressions(exprs, _) if exprs.is_empty()) {
+        return Err(QueryError::unsupported("GROUP BY"));
+    }
+    if select.having.is_some() {
+        return Err(QueryError::unsupported("HAVING"));
+    }
+
+    // 1. FROM → source + the scope it exposes. Empty FROM yields a one-row,
+    // zero-column source so `SELECT <expr>` (no FROM) binds.
+    let (source, scope) = bind_from(&select.from, binder)?;
+
+    binder.push_scope(scope);
+
+    // 2. WHERE → wrap in Filter if a predicate is present.
+    let after_where = match &select.selection {
+        Some(pred) => LogicalNode::Filter {
+            input: Box::new(source),
+            predicate: pred.bind(binder)?,
+        },
+        None => source,
+    };
+
+    // 3. ORDER BY → Sort below the projection, binding against the FROM scope.
+    let after_order = match order_by {
+        Some(exprs) => {
+            let keys = bind_sort_keys(exprs, binder)?;
+            // The Sort materializes the FROM rows — carry their schema so it can
+            // encode them in scratch storage.
+            let input_schema = binder
+                .current_scope()
+                .ok_or_else(|| QueryError::Internal("no scope for ORDER BY".into()))?
+                .schema();
+            LogicalNode::Sort {
+                input: Box::new(after_where),
+                keys,
+                input_schema,
+            }
+        }
+        None => after_where,
+    };
+
+    // 4. Projection → Project. Each `SelectItem` may expand to multiple
+    // expressions (wildcards), hence flatten.
+    let expressions: Vec<Expr> = select
+        .projection
+        .iter()
+        .map(|item| item.bind(binder))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    binder.pop_scope();
+
+    Ok(LogicalNode::Project {
+        input: Box::new(after_order),
+        expressions,
+    })
+}
+
+/// Bind `ORDER BY` terms. NULL placement defaults the Postgres way: NULLS LAST
+/// for ASC, NULLS FIRST for DESC.
+fn bind_sort_keys(exprs: &[OrderByExpr], binder: &mut Binder) -> Result<Vec<SortKey>, QueryError> {
+    exprs
+        .iter()
+        .map(|o| {
+            let ascending = o.options.asc.unwrap_or(true);
+            Ok(SortKey {
+                expr: o.expr.bind(binder)?,
+                ascending,
+                nulls_first: o.options.nulls_first.unwrap_or(!ascending),
+            })
+        })
+        .collect()
 }
 
 // --- FROM clause (relations + joins → a source + the scope it exposes) -----
@@ -161,11 +201,13 @@ fn bind_from(
     for item in rest {
         // `FROM a, b` is a cross join: every pair, no condition.
         let (rnode, rscope) = bind_table_with_joins(item, binder)?;
+        let right_schema = rscope.schema();
         node = LogicalNode::Join {
             left: Box::new(node),
             right: Box::new(rnode),
             on: None,
             join_type: JoinType::Inner,
+            right_schema,
         };
         scope = Scope::concat(scope, rscope);
     }
@@ -183,6 +225,7 @@ fn bind_table_with_joins(
     for join in &twj.joins {
         let (rnode, rscope) = bind_table_factor(&join.relation, binder)?;
         let (join_type, constraint) = join_kind(join)?;
+        let right_schema = rscope.schema();
         // The output row — and so any column ref in ON — is `left ++ right`.
         let combined = Scope::concat(scope, rscope);
         let on = match constraint {
@@ -200,6 +243,7 @@ fn bind_table_with_joins(
             right: Box::new(rnode),
             on,
             join_type,
+            right_schema,
         };
         scope = combined;
     }

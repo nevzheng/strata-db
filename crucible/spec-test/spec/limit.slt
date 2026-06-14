@@ -47,6 +47,9 @@ SELECT n FROM strata.lim.nums OFFSET 10
 statement error
 SELECT n FROM strata.lim.nums LIMIT -1
 
-# ORDER BY is rejected, not silently ignored.
-statement error
-SELECT n FROM strata.lim.nums ORDER BY n
+# ORDER BY DESC then LIMIT — the top rows by descending key.
+query T
+SELECT n FROM strata.lim.nums ORDER BY n DESC LIMIT 2
+----
+5
+4

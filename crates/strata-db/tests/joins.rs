@@ -79,11 +79,13 @@ fn join_plan(
     join_type: JoinType,
     strategy: JoinStrategy,
 ) -> PhysicalPlan {
+    let right_schema = r.schema().clone();
     PhysicalPlan::new(PlanNode::Join {
         left: Box::new(PlanNode::SeqScan { table: l }),
         right: Box::new(PlanNode::SeqScan { table: r }),
         on,
         join_type,
+        right_schema,
         strategy,
     })
 }

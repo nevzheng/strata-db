@@ -1,0 +1,82 @@
+# ORDER BY: ascending/descending, NULL placement, multiple keys, ordering by a
+# non-selected column, and ORDER BY combined with WHERE + LIMIT. Output is
+# ordered, so these are NOT rowsorted — the row order is the assertion. A
+# secondary `id` key breaks ties deterministically.
+
+statement ok
+CREATE SCHEMA strata.ob
+
+statement ok
+CREATE TABLE strata.ob.t (id INT, name TEXT, score INT)
+
+statement ok
+INSERT INTO strata.ob.t VALUES (1, 'Carol', 30), (2, 'Alice', NULL), (3, 'Bob', 20), (4, 'Dave', 20)
+
+# ASC by text.
+query T
+SELECT name FROM strata.ob.t ORDER BY name
+----
+Alice
+Bob
+Carol
+Dave
+
+# DESC by text.
+query T
+SELECT name FROM strata.ob.t ORDER BY name DESC
+----
+Dave
+Carol
+Bob
+Alice
+
+# ASC numeric — NULLS LAST by default.
+query T
+SELECT name FROM strata.ob.t ORDER BY score, id
+----
+Bob
+Dave
+Carol
+Alice
+
+# DESC numeric — NULLS FIRST by default.
+query T
+SELECT name FROM strata.ob.t ORDER BY score DESC, id
+----
+Alice
+Carol
+Bob
+Dave
+
+# Explicit NULLS FIRST overrides the ASC default.
+query T
+SELECT name FROM strata.ob.t ORDER BY score ASC NULLS FIRST, id
+----
+Alice
+Bob
+Dave
+Carol
+
+# Order by a column that isn't in the select list.
+query T
+SELECT name FROM strata.ob.t ORDER BY id DESC
+----
+Dave
+Bob
+Alice
+Carol
+
+# ORDER BY with WHERE and LIMIT.
+query T
+SELECT name FROM strata.ob.t WHERE score IS NOT NULL ORDER BY score, id LIMIT 2
+----
+Bob
+Dave
+
+# Order by an expression.
+query TI
+SELECT name, score + id FROM strata.ob.t WHERE score IS NOT NULL ORDER BY score + id
+----
+Bob 23
+Dave 24
+Carol 31

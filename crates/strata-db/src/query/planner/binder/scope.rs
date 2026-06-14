@@ -56,6 +56,14 @@ impl Scope {
         self.columns.len()
     }
 
+    /// The columns as a [`Schema`] — what a materializing operator (sort, join
+    /// build side) needs to encode/decode these rows in scratch storage.
+    pub fn schema(&self) -> Schema {
+        Schema {
+            fields: self.columns.iter().map(|c| c.field.clone()).collect(),
+        }
+    }
+
     /// Resolve a column reference to its index. `relation` is the optional
     /// qualifier (`t` in `t.col`). Errors if nothing matches, or if the name
     /// is ambiguous across relations.
