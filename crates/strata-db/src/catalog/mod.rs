@@ -35,6 +35,7 @@ pub mod consts;
 pub mod dataset;
 pub mod db;
 pub mod ids;
+pub mod index;
 pub mod project;
 pub mod schema;
 pub mod system;
@@ -104,6 +105,10 @@ pub(crate) struct TableMeta {
     pub truncation_id: TruncationId,
     pub name: String,
     pub schema: Schema,
+    /// Secondary indexes on the table. `default` so rows written before this
+    /// field existed deserialize as "no indexes".
+    #[serde(default)]
+    pub indexes: Vec<crate::catalog::index::Index>,
 }
 
 /// One row per query executed within a project. `info` is freeform
@@ -344,7 +349,8 @@ pub(crate) fn resolve_table(
         table_meta.truncation_id,
         table_meta.name,
         table_meta.schema,
-    ))
+    )
+    .with_indexes(table_meta.indexes))
 }
 
 // --- Write-side free functions ---------------------------------------------
@@ -396,6 +402,7 @@ pub(crate) fn create_table(
         truncation_id: TruncationId::INITIAL,
         name: name.to_string(),
         schema,
+        indexes: Vec::new(),
     };
     put_table_meta(engine, project_id, dataset_id, &meta)?;
     Ok(meta)
@@ -430,6 +437,8 @@ pub(crate) fn replace_table(
         truncation_id,
         name: name.to_string(),
         schema,
+        // A fresh incarnation starts with no indexes (CREATE OR REPLACE drops them).
+        indexes: Vec::new(),
     };
     put_table_meta(engine, project_id, dataset_id, &meta)?;
     Ok(meta)

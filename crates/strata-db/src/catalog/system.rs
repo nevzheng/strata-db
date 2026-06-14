@@ -327,7 +327,9 @@ impl SystemRelation {
                     Value::Int64(oid_of(d.id.0)),
                     text("r"),
                     Value::Int32(t.schema.fields.len() as i32),
-                    Value::Bool(false),
+                    // relhasindex — now reflects real catalog metadata.
+                    Value::Bool(!t.indexes.is_empty()),
+                    // reltuples = -1: row count unknown (no ANALYZE yet).
                     Value::Int64(-1),
                 ])
             }),

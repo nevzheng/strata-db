@@ -167,6 +167,7 @@ pub(crate) fn uuid_table_meta() -> TableMeta {
         name: UUID_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -176,6 +177,7 @@ pub(crate) fn projects_table_meta() -> TableMeta {
         name: PROJECTS_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -185,6 +187,7 @@ pub(crate) fn datasets_table_meta() -> TableMeta {
         name: DATASETS_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -194,6 +197,7 @@ pub(crate) fn tables_table_meta() -> TableMeta {
         name: TABLES_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
 
@@ -203,5 +207,6 @@ pub(crate) fn queries_table_meta() -> TableMeta {
         name: QUERIES_TABLE_NAME.to_string(),
         truncation_id: TruncationId::INITIAL,
         schema: system_table_schema(),
+        indexes: Vec::new(),
     }
 }
