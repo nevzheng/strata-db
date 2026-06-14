@@ -23,6 +23,13 @@
 //! | `Numeric` | `Decimal`  | `NUMERIC` / `DECIMAL` |
 //! | `Time`  | `i64`        | `TIME` (without time zone) |
 //! | `Uuid`  | `uuid::Uuid` | `UUID` |
+//! | `Interval` | [`Interval`] | `INTERVAL` |
+//!
+//! `Interval` keeps Postgres's three components — months, days, and
+//! microseconds — separately (a month isn't a fixed number of days), so
+//! `'1 mon'` and `'30 days'` store and display distinctly. They compare
+//! *equal* via [`Interval::to_micros`] (30-day months, 24-h days), which
+//! is what the order-preserving key encodes and what SQL `=` uses.
 //!
 //! `Numeric` is exact decimal (backed by `rust_decimal`); its
 //! order-preserving key encoding lives in [`crate::storage::codec`].
@@ -60,6 +67,26 @@ pub enum LogicalType {
     Numeric,
     Time,
     Uuid,
+    Interval,
+}
+
+/// A SQL `INTERVAL`, stored as Postgres's three independent components.
+/// Comparison and the order-preserving key use [`Interval::to_micros`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Interval {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
+impl Interval {
+    /// Normalize to a single microsecond count for comparison/ordering,
+    /// using 30-day months and 24-hour days (matching Postgres). `i128`
+    /// because a full `i32` month count overflows `i64` micros.
+    pub fn to_micros(self) -> i128 {
+        const DAY: i128 = 86_400_000_000;
+        self.months as i128 * 30 * DAY + self.days as i128 * DAY + self.micros as i128
+    }
 }
 
 /// A single runtime datum carrying both its type tag and the data.
@@ -93,6 +120,8 @@ pub enum Value {
     Time(i64),
     /// A `UUID` (16 bytes); orders by byte value, like Postgres.
     Uuid(uuid::Uuid),
+    /// An `INTERVAL` — months / days / microseconds (see [`Interval`]).
+    Interval(Interval),
 }
 
 /// An ordered row of [`Value`]s. The schema that interprets a tuple is

@@ -3,8 +3,9 @@
 
 use sqlparser::ast::{
     BinaryOperator as AstBinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField,
-    Expr as AstExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    TrimWhereField, TypedString, UnaryOperator, Value as AstValue,
+    Expr as AstExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    Interval as AstInterval, ObjectName, TrimWhereField, TypedString, UnaryOperator,
+    Value as AstValue,
 };
 
 use rust_decimal::Decimal;
@@ -114,6 +115,7 @@ impl BindNode for AstExpr {
                 input: Box::new(expr.bind(binder)?),
                 target: super::ddl::bind_data_type(data_type)?,
             }),
+            AstExpr::Interval(iv) => bind_interval(iv),
             other => Err(QueryError::unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -235,6 +237,25 @@ fn bind_trim(
     Ok(Expr::Call {
         func,
         args: vec![s, chars],
+    })
+}
+
+/// Bind an `INTERVAL '…'` literal. The value is a string literal; the
+/// optional leading field (`INTERVAL '5' DAY`) is appended as the unit.
+fn bind_interval(iv: &AstInterval) -> Result<Expr, QueryError> {
+    let AstExpr::Value(v) = iv.value.as_ref() else {
+        return Err(QueryError::unsupported("non-literal INTERVAL value"));
+    };
+    let AstValue::SingleQuotedString(s) = &v.value else {
+        return Err(QueryError::unsupported("INTERVAL value must be a string"));
+    };
+    let text = match &iv.leading_field {
+        Some(field) => format!("{s} {}", field.to_string().to_lowercase()),
+        None => s.clone(),
+    };
+    let interval = temporal::parse_interval(&text).map_err(QueryError::type_error)?;
+    Ok(Expr::Literal {
+        value: Value::Interval(interval),
     })
 }
 

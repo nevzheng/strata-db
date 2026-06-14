@@ -238,6 +238,7 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Numeric(d) => Some(d.to_string()),
         Value::Time(t) => Some(strata_db::storage::temporal::format_time(*t)),
         Value::Uuid(u) => Some(u.to_string()),
+        Value::Interval(i) => Some(strata_db::storage::temporal::format_interval(*i)),
     }
 }
 

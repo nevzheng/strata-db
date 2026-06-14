@@ -309,3 +309,50 @@ SELECT UUID 'not-a-uuid'
 
 statement error
 SELECT CAST('xyz' AS UUID)
+
+# =====================================================================
+# INTERVAL — months / days / microseconds (Postgres 3-component)
+# =====================================================================
+
+query T
+SELECT INTERVAL '1 day'
+----
+1 day
+
+query T
+SELECT INTERVAL '1 year 2 mons 3 days 04:05:06'
+----
+1 year 2 mons 3 days 04:05:06
+
+query T
+SELECT INTERVAL '90 minutes'
+----
+01:30:00
+
+# `1 mon` and `30 days` compare EQUAL (normalized: 30-day months)...
+query T
+SELECT INTERVAL '1 mon' = INTERVAL '30 days'
+----
+t
+
+query T
+SELECT INTERVAL '1 day' < INTERVAL '2 days'
+----
+t
+
+statement ok
+CREATE TABLE strata.types.spans (id INT, span INTERVAL)
+
+statement ok
+INSERT INTO strata.types.spans VALUES (1, INTERVAL '1 mon'), (2, INTERVAL '30 days')
+
+# ...yet they store and read back distinctly (faithful 3-component round-trip).
+query TT
+SELECT * FROM strata.types.spans
+----
+1 1 mon
+2 30 days
+
+# An unparseable interval is rejected at bind time.
+statement error
+SELECT INTERVAL 'not an interval'

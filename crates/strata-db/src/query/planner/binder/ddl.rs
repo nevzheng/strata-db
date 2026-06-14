@@ -210,6 +210,7 @@ pub(super) fn bind_data_type(ty: &DataType) -> Result<LogicalType, QueryError> {
         }
         DataType::Time(_, _) => LogicalType::Time,
         DataType::Uuid => LogicalType::Uuid,
+        DataType::Interval { .. } => LogicalType::Interval,
         other => return Err(QueryError::unsupported(format!("column type: {other:?}"))),
     })
 }

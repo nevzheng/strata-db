@@ -40,13 +40,14 @@
 //! will land alongside composite keys.
 
 mod decimal;
+mod interval;
 mod scalar;
 mod text;
 
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::storage::types::{LogicalType, Value};
+use crate::storage::types::{Interval, LogicalType, Value};
 
 /// Tried to encode a value as a key that has no meaningful key form.
 /// Today the only such case is `Value::Null`.
@@ -106,6 +107,7 @@ impl Value {
             Value::Numeric(d) => d.encoded_size(),
             Value::Time(n) => n.encoded_size(),
             Value::Uuid(u) => u.encoded_size(),
+            Value::Interval(i) => i.encoded_size(),
         }
     }
 
@@ -130,6 +132,7 @@ impl Value {
             Value::Numeric(d) => d.encode(buf),
             Value::Time(n) => n.encode(buf),
             Value::Uuid(u) => u.encode(buf),
+            Value::Interval(i) => i.encode(buf),
         }
     }
 
@@ -152,6 +155,7 @@ impl Value {
             Value::Numeric(d) => d.encode_key(buf),
             Value::Time(n) => n.encode_key(buf),
             Value::Uuid(u) => u.encode_key(buf),
+            Value::Interval(i) => i.encode_key(buf),
         }
         Ok(())
     }
@@ -174,6 +178,7 @@ impl Value {
             LogicalType::Numeric => Ok(Value::Numeric(Decimal::decode(buf)?)),
             LogicalType::Time => Ok(Value::Time(i64::decode(buf)?)),
             LogicalType::Uuid => Ok(Value::Uuid(Uuid::decode(buf)?)),
+            LogicalType::Interval => Ok(Value::Interval(Interval::decode(buf)?)),
         }
     }
 }

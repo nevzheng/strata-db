@@ -14,6 +14,9 @@
 //! validation, and formatting.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use pg_interval::Interval as PgInterval;
+
+use crate::storage::types::Interval;
 
 /// The Unix epoch as a civil date — the zero point for `Value::Date`.
 fn epoch() -> NaiveDate {
@@ -102,6 +105,27 @@ pub fn format_time(micros: i64) -> String {
     let secs = micros.div_euclid(1_000_000);
     let (h, m, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Parse a Postgres `INTERVAL` body into our three-component form. Accepts
+/// the postgres (`'1 year 2 mons 3 days 04:05:06'`), SQL, and ISO-8601
+/// forms via `pg_interval`.
+pub fn parse_interval(s: &str) -> Result<Interval, String> {
+    let s = s.trim();
+    let pg = PgInterval::from_postgres(s)
+        .or_else(|_| PgInterval::from_sql(s))
+        .or_else(|_| PgInterval::from_iso(s))
+        .map_err(|_| format!("invalid INTERVAL literal: {s:?}"))?;
+    Ok(Interval {
+        months: pg.months,
+        days: pg.days,
+        micros: pg.microseconds,
+    })
+}
+
+/// Render an interval in Postgres's default output form.
+pub fn format_interval(iv: Interval) -> String {
+    PgInterval::new(iv.months, iv.days, iv.micros).to_postgres()
 }
 
 #[cfg(test)]
@@ -198,5 +222,23 @@ mod tests {
         assert_eq!(parse_time("14:30:00").unwrap(), 52_200_000_000);
         assert_eq!(format_time(parse_time("23:59:59").unwrap()), "23:59:59");
         assert!(parse_time("nope").is_err());
+    }
+
+    #[test]
+    fn interval_parse_normalize_format() {
+        // 1 month and 30 days store distinctly but normalize equal.
+        let a = parse_interval("1 mon").unwrap();
+        let b = parse_interval("30 days").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.to_micros(), b.to_micros());
+
+        let iv = parse_interval("1 year 2 mons 3 days 04:05:06").unwrap();
+        assert_eq!((iv.months, iv.days), (14, 3));
+        assert_eq!(format_interval(iv), "1 year 2 mons 3 days 04:05:06");
+        assert_eq!(
+            format_interval(parse_interval("90 minutes").unwrap()),
+            "01:30:00"
+        );
+        assert!(parse_interval("nonsense").is_err());
     }
 }

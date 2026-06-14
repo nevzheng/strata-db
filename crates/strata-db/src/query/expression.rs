@@ -233,7 +233,18 @@ fn eval_cast(v: Value, target: LogicalType) -> Result<Value, QueryError> {
         T::Timestamp => cast_to_timestamp(&v),
         T::Time => cast_to_time(&v),
         T::Uuid => cast_to_uuid(&v),
+        T::Interval => cast_to_interval(&v),
         T::Json => cast_to_json(&v),
+    }
+}
+
+fn cast_to_interval(v: &Value) -> Result<Value, QueryError> {
+    match v {
+        Value::Interval(i) => Ok(Value::Interval(*i)),
+        Value::Text(s) => crate::storage::temporal::parse_interval(s.trim())
+            .map(Value::Interval)
+            .map_err(QueryError::type_error),
+        other => Err(cast_err(other, "interval")),
     }
 }
 
@@ -508,6 +519,7 @@ fn concat_str(v: &Value) -> Result<String, QueryError> {
         Value::Timestamp(t) => crate::storage::temporal::format_timestamptz(*t),
         Value::Time(t) => crate::storage::temporal::format_time(*t),
         Value::Uuid(u) => u.to_string(),
+        Value::Interval(i) => crate::storage::temporal::format_interval(*i),
         other => {
             return Err(QueryError::type_error(format!(
                 "cannot concatenate {other:?}"
@@ -803,6 +815,10 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
     if let (Some(a), Some(b)) = (as_f64(lhs), as_f64(rhs)) {
         return a.total_cmp(&b).is_eq();
     }
+    // Intervals compare by normalized micros, not field-by-field.
+    if let (Value::Interval(a), Value::Interval(b)) = (lhs, rhs) {
+        return a.to_micros() == b.to_micros();
+    }
     lhs == rhs
 }
 
@@ -831,6 +847,8 @@ fn cmp_values(lhs: &Value, rhs: &Value) -> Result<std::cmp::Ordering, QueryError
         (Value::Timestamp(a), Value::Timestamp(b)) => Ok(a.cmp(b)),
         (Value::Time(a), Value::Time(b)) => Ok(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Ok(a.cmp(b)),
+        // Intervals order by their normalized micros, so `1 mon` == `30 days`.
+        (Value::Interval(a), Value::Interval(b)) => Ok(a.to_micros().cmp(&b.to_micros())),
         (l, r) => Err(QueryError::type_error(format!(
             "cannot compare {l:?} and {r:?}"
         ))),
