@@ -306,41 +306,74 @@ fn bind_function(func: &Function, binder: &mut Binder) -> Result<Expr, QueryErro
 /// Resolve a function name + arity to a scalar function. `MAX`/`MIN` with
 /// two or more arguments are the row-wise `GREATEST`/`LEAST`; the one-arg
 /// aggregate form needs `GROUP BY`, which doesn't exist yet.
-fn resolve_scalar_func(name: &str, argc: usize) -> Result<ScalarFunc, QueryError> {
-    match (name, argc) {
-        ("ABS", 1) => Ok(ScalarFunc::Abs),
-        ("ABS", n) => Err(QueryError::type_error(format!(
-            "ABS takes exactly 1 argument, got {n}"
-        ))),
-        ("GREATEST", n) | ("MAX", n) if n >= 2 => Ok(ScalarFunc::Greatest),
-        ("LEAST", n) | ("MIN", n) if n >= 2 => Ok(ScalarFunc::Least),
-        ("GREATEST", _) => Ok(ScalarFunc::Greatest), // single-arg GREATEST is valid
-        ("LEAST", _) => Ok(ScalarFunc::Least),
-        ("MAX" | "MIN", _) => Err(QueryError::unsupported(format!(
-            "{name} as an aggregate (needs GROUP BY); {name}(a, b, …) is supported"
-        ))),
-        // CEIL/FLOOR arrive as their own AST nodes (see `bind_ceil_floor`),
-        // not here. ROUND(x, n) (round to n places) isn't supported yet.
-        ("ROUND", 1) => Ok(ScalarFunc::Round),
-        ("COALESCE", n) if n >= 1 => Ok(ScalarFunc::Coalesce),
-        ("NULLIF", 2) => Ok(ScalarFunc::Nullif),
-        ("NULLIF", n) => Err(QueryError::type_error(format!(
-            "NULLIF takes exactly 2 arguments, got {n}"
-        ))),
-        ("CONCAT", _) => Ok(ScalarFunc::Concat),
-        ("LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH", 1) => Ok(ScalarFunc::Length),
-        ("REPEAT", 2) => Ok(ScalarFunc::Repeat),
-        ("UPPER" | "UCASE", 1) => Ok(ScalarFunc::Upper),
-        ("LOWER" | "LCASE", 1) => Ok(ScalarFunc::Lower),
-        // Recognized names with the wrong arity get a clear arity error.
-        ("ROUND" | "LENGTH" | "UPPER" | "LOWER", n) => Err(QueryError::type_error(format!(
-            "{name} takes exactly 1 argument, got {n}"
-        ))),
-        ("REPEAT", n) => Err(QueryError::type_error(format!(
-            "REPEAT takes exactly 2 arguments, got {n}"
-        ))),
-        _ => Err(QueryError::unsupported(format!("function {name}"))),
+/// How many arguments a scalar function accepts.
+enum Arity {
+    Exact(usize),
+    AtLeast(usize),
+    Any,
+}
+
+impl Arity {
+    fn accepts(&self, argc: usize) -> bool {
+        match self {
+            Arity::Exact(n) => argc == *n,
+            Arity::AtLeast(n) => argc >= *n,
+            Arity::Any => true,
+        }
     }
+
+    fn describe(&self) -> String {
+        match self {
+            Arity::Exact(n) => format!("exactly {n} argument(s)"),
+            Arity::AtLeast(n) => format!("at least {n} argument(s)"),
+            Arity::Any => "any number of arguments".into(),
+        }
+    }
+}
+
+/// The scalar-function registry: map a name to its [`ScalarFunc`] and
+/// expected [`Arity`], then validate the call once. Adding a function is
+/// a single table row. (`CEIL`/`FLOOR`/`SUBSTRING`/`TRIM` don't appear
+/// here — sqlparser gives them their own AST nodes, bound elsewhere.)
+fn resolve_scalar_func(name: &str, argc: usize) -> Result<ScalarFunc, QueryError> {
+    use Arity::*;
+    use ScalarFunc as F;
+
+    let (func, arity) = match name {
+        // Numeric.
+        "ABS" => (F::Abs, Exact(1)),
+        "ROUND" => (F::Round, Exact(1)), // ROUND(x, n) not supported yet
+        // Conditional.
+        "COALESCE" => (F::Coalesce, AtLeast(1)),
+        "NULLIF" => (F::Nullif, Exact(2)),
+        "GREATEST" => (F::Greatest, AtLeast(1)),
+        "LEAST" => (F::Least, AtLeast(1)),
+        // String.
+        "CONCAT" => (F::Concat, Any),
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => (F::Length, Exact(1)),
+        "REPEAT" => (F::Repeat, Exact(2)),
+        "UPPER" | "UCASE" => (F::Upper, Exact(1)),
+        "LOWER" | "LCASE" => (F::Lower, Exact(1)),
+        // MAX/MIN with ≥2 args are the row-wise GREATEST/LEAST; the 1-arg
+        // aggregate form needs GROUP BY, which doesn't exist yet.
+        "MAX" | "MIN" if argc >= 2 => {
+            return Ok(if name == "MAX" { F::Greatest } else { F::Least });
+        }
+        "MAX" | "MIN" => {
+            return Err(QueryError::unsupported(format!(
+                "{name} as an aggregate (needs GROUP BY); {name}(a, b, …) is supported"
+            )));
+        }
+        _ => return Err(QueryError::unsupported(format!("function {name}"))),
+    };
+
+    if !arity.accepts(argc) {
+        return Err(QueryError::type_error(format!(
+            "{name} takes {}, got {argc}",
+            arity.describe()
+        )));
+    }
+    Ok(func)
 }
 
 /// Extract a single, unqualified function name, upper-cased for matching.

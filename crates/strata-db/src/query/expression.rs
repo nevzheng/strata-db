@@ -462,11 +462,7 @@ fn eval_call(func: ScalarFunc, args: &[Expr], tuple: &Tuple) -> Result<Value, Qu
         ScalarFunc::Repeat => eval_repeat(args[0].eval(tuple)?, args[1].eval(tuple)?),
         ScalarFunc::Upper => eval_case(args[0].eval(tuple)?, true),
         ScalarFunc::Lower => eval_case(args[0].eval(tuple)?, false),
-        ScalarFunc::Nullif => {
-            let a = args[0].eval(tuple)?;
-            let b = args[1].eval(tuple)?;
-            Ok(if values_eq(&a, &b) { Value::Null } else { a })
-        }
+        ScalarFunc::Nullif => eval_nullif(args[0].eval(tuple)?, args[1].eval(tuple)?),
         ScalarFunc::Concat => eval_concat(args, tuple),
         ScalarFunc::Substr => eval_substr(
             args[0].eval(tuple)?,
@@ -605,6 +601,12 @@ fn eval_round(v: Value, mode: Rounding) -> Result<Value, QueryError> {
             "rounding a non-numeric value {other:?}"
         ))),
     }
+}
+
+/// `NULLIF(a, b)` — `NULL` if `a = b` (numeric coercion via `values_eq`),
+/// else `a`.
+fn eval_nullif(a: Value, b: Value) -> Result<Value, QueryError> {
+    Ok(if values_eq(&a, &b) { Value::Null } else { a })
 }
 
 /// First non-null argument, or `NULL` if all are null.
