@@ -5,6 +5,8 @@
 //! per row, per operator level) but the simplest that can run a plan;
 //! vectorized and JIT backends will live alongside.
 
+use strata_store::{MemoryWorkspace, Workspace};
+
 use crate::catalog::CatalogError;
 use crate::catalog::tables::Table;
 use crate::storage::table_api::ScanOptions;
@@ -128,11 +130,13 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
             strategy,
         } => match strategy {
             JoinStrategy::NestedLoop => nested_loop_join(*left, *right, on, join_type, ctx),
-            // The only strategy the optimizer emits today; the others are
-            // built in upcoming pieces.
-            other => Err(QueryError::Internal(format!(
-                "join strategy not implemented: {other:?}"
-            ))),
+            JoinStrategy::BlockNestedLoop => {
+                block_nested_loop_join(*left, *right, on, join_type, ctx)
+            }
+            // Built in an upcoming piece.
+            JoinStrategy::SortMerge => Err(QueryError::Internal(
+                "sort-merge join not implemented".into(),
+            )),
         },
         PlanNode::Values { rows } => Ok(RowStream::new(rows.into_iter().map(Ok))),
         // Sinks (Insert/Delete/CreateTable) are top-level only — they
@@ -208,6 +212,108 @@ fn nested_loop_join<'ctx>(
     }
 
     Ok(RowStream::new(out.into_iter().map(Ok)))
+}
+
+/// Block nested-loop join. Buffers the outer in fixed-size blocks and scans
+/// the inner *once per block* (instead of once per outer tuple), amortizing
+/// the rescans. The inner is materialized into a [`MemoryWorkspace`] — the
+/// seam where a spilling backing (file workspace / grace) plugs in later.
+///
+/// Output order differs from tuple-nested-loop (inner-major within a block),
+/// which is fine: SQL join output is unordered.
+fn block_nested_loop_join<'ctx>(
+    left: PlanNode,
+    right: PlanNode,
+    on: Option<Expr>,
+    join_type: JoinType,
+    ctx: &'ctx QueryContext<'_>,
+) -> Result<RowStream<'ctx>, QueryError> {
+    let left_width = output_arity(&left);
+    let right_width = output_arity(&right);
+
+    // Materialize the inner (right) into a rescannable workspace.
+    let mut inner = MemoryWorkspace::new(INNER_WORKSPACE_BUDGET);
+    let mut inner_count = 0usize;
+    for row in build(right, ctx)? {
+        inner
+            .append(&encode_tuple(&row?)?)
+            .map_err(|e| QueryError::Internal(format!("join workspace: {e}")))?;
+        inner_count += 1;
+    }
+    // Tracks inner rows that matched anything, for RIGHT/FULL's unmatched pass.
+    let mut inner_matched = vec![false; inner_count];
+
+    let mut out: Vec<Tuple> = Vec::new();
+    let mut outer = build(left, ctx)?;
+    let mut block: Vec<Tuple> = Vec::with_capacity(OUTER_BLOCK_TUPLES);
+
+    loop {
+        // Fill one block of outer rows.
+        block.clear();
+        for row in outer.by_ref() {
+            block.push(row?);
+            if block.len() == OUTER_BLOCK_TUPLES {
+                break;
+            }
+        }
+        if block.is_empty() {
+            break;
+        }
+
+        let mut block_matched = vec![false; block.len()];
+        // One inner scan serves the whole block.
+        for (k, bytes) in inner.tuples().enumerate() {
+            let inner_tuple = decode_tuple(&bytes)?;
+            for (i, l) in block.iter().enumerate() {
+                let combined = concat(l, &inner_tuple);
+                let matched = match &on {
+                    None => true,
+                    Some(pred) => matches!(pred.eval(&combined)?, Value::Bool(true)),
+                };
+                if matched {
+                    block_matched[i] = true;
+                    inner_matched[k] = true;
+                    out.push(combined);
+                }
+            }
+        }
+        // LEFT/FULL: unmatched outer rows in this block, padded with right NULLs.
+        if matches!(join_type, JoinType::Left | JoinType::Full) {
+            for (i, l) in block.iter().enumerate() {
+                if !block_matched[i] {
+                    out.push(pad_right(l, right_width));
+                }
+            }
+        }
+    }
+
+    // RIGHT/FULL: inner rows that never matched, padded with left NULLs.
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        for (k, bytes) in inner.tuples().enumerate() {
+            if !inner_matched[k] {
+                out.push(pad_left(left_width, &decode_tuple(&bytes)?));
+            }
+        }
+    }
+
+    Ok(RowStream::new(out.into_iter().map(Ok)))
+}
+
+/// Outer rows buffered per block (one inner rescan per block).
+const OUTER_BLOCK_TUPLES: usize = 1024;
+/// Ceiling for the in-RAM inner side. Spilling to a file workspace is future
+/// work; until then a larger inner fails with a clear resource error.
+const INNER_WORKSPACE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Serialize a tuple for scratch storage. The workspace holds opaque bytes and
+/// the plan carries no schema, so we use the tuple's self-describing encoding.
+fn encode_tuple(tuple: &Tuple) -> Result<Vec<u8>, QueryError> {
+    serde_json::to_vec(tuple).map_err(|e| QueryError::Internal(format!("workspace encode: {e}")))
+}
+
+fn decode_tuple(bytes: &[u8]) -> Result<Tuple, QueryError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| QueryError::Internal(format!("workspace decode: {e}")))
 }
 
 /// `left ++ right`.

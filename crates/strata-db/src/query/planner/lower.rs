@@ -47,12 +47,13 @@ impl Pass for Lower {
 }
 
 /// Pick the physical algorithm for a join — the single place strategy
-/// selection lives. Today it always returns the general nested-loop
-/// algorithm (handles any predicate and cross joins); it grows cost-based
-/// — equi-join → hash/sort-merge, sized inputs → grace — as those
-/// operators land.
+/// selection lives. Block nested loop is the general default: it handles
+/// any predicate (and cross joins) and subsumes tuple-at-a-time nested
+/// loop. It grows cost-based — equi-join → sort-merge/hash, sized inputs →
+/// grace — as those operators land. (`NestedLoop` remains as the reference
+/// implementation, selectable only by a hand-built physical plan.)
 fn select_join_strategy(_on: Option<&Expr>) -> JoinStrategy {
-    JoinStrategy::NestedLoop
+    JoinStrategy::BlockNestedLoop
 }
 
 pub(super) trait LowerNode {
