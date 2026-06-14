@@ -1,0 +1,151 @@
+# DEFAULT — a column's DEFAULT fills any value not supplied at INSERT,
+# evaluated per row. Knowing *which* column is missing needs a column list
+# (or a short positional row): named columns are filled, the rest fall back
+# to their default, then NULL if nullable, else error. Defaults are constant
+# expressions (Postgres allows any expression that doesn't reference another
+# column or use a subquery — our binder enforces that for free).
+#
+# Uses its own `strata.def` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.def
+
+statement ok
+CREATE TABLE strata.def.t (id INT, status TEXT DEFAULT 'active', qty INT DEFAULT 0, note TEXT)
+
+# Column list names what's provided; status/qty fall back to their defaults,
+# note (nullable, no default) becomes NULL.
+statement ok
+INSERT INTO strata.def.t (id) VALUES (1)
+
+# A provided value wins over the default.
+statement ok
+INSERT INTO strata.def.t (id, status) VALUES (2, 'paused')
+
+# Positional with fewer values than columns: id + status supplied, qty
+# defaults, note is NULL.
+statement ok
+INSERT INTO strata.def.t VALUES (3, 'x')
+
+# A reordered column list still lands each value in the right column.
+statement ok
+INSERT INTO strata.def.t (qty, id) VALUES (99, 4)
+
+query TTTT
+SELECT id, status, qty, COALESCE(note, 'none') FROM strata.def.t
+----
+1 active 0 none
+2 paused 0 none
+3 x 0 none
+4 active 99 none
+
+# The default is evaluated per row across a multi-row insert.
+statement ok
+INSERT INTO strata.def.t (id) VALUES (10), (11)
+
+query TT
+SELECT id, status FROM strata.def.t WHERE id >= 10
+----
+10 active
+11 active
+
+# --- expression & function defaults -----------------------------------
+
+# Defaults may be any constant expression: a function call, unary minus,
+# string concat — all evaluated to a value per row.
+statement ok
+CREATE TABLE strata.def.expr (id INT, code TEXT DEFAULT UPPER('hi'), n INT DEFAULT -1, tag TEXT DEFAULT 'a' || 'b')
+
+statement ok
+INSERT INTO strata.def.expr (id) VALUES (1)
+
+query TTTT
+SELECT id, code, n, tag FROM strata.def.expr
+----
+1 HI -1 ab
+
+# --- NOT NULL with a default ------------------------------------------
+
+# A NOT NULL column with a default can be omitted — the default supplies a
+# non-null value.
+statement ok
+CREATE TABLE strata.def.req (id INT, kind TEXT NOT NULL DEFAULT 'std')
+
+statement ok
+INSERT INTO strata.def.req (id) VALUES (1)
+
+query TT
+SELECT id, kind FROM strata.def.req
+----
+1 std
+
+# --- typed-literal defaults -------------------------------------------
+
+# A default can be any typed literal — they round-trip through the schema
+# (stored as JSON) and decode back to the right type on read.
+statement ok
+CREATE TABLE strata.def.typed (id INT, uid UUID DEFAULT UUID '00000000-0000-0000-0000-000000000000', born DATE DEFAULT DATE '2000-01-01', clock TIME DEFAULT TIME '09:00:00', rate NUMERIC DEFAULT NUMERIC '1.5', ok BOOLEAN DEFAULT true, span INTERVAL DEFAULT INTERVAL '1 day')
+
+statement ok
+INSERT INTO strata.def.typed (id) VALUES (1)
+
+query TTTTTTT
+SELECT id, uid, born, clock, rate, ok, span FROM strata.def.typed
+----
+1 00000000-0000-0000-0000-000000000000 2000-01-01 09:00:00 1.5 t 1 day
+
+# UUID defaults are constant literals today (a volatile uuid_v4() default
+# would generate a fresh value per row once that function lands). Different
+# UUID versions are just different literal values; both rows get the same
+# constant from the per-row eval.
+statement ok
+CREATE TABLE strata.def.uuids (id INT, v4 UUID DEFAULT UUID '550e8400-e29b-41d4-a716-446655440000', v7 UUID DEFAULT UUID '018f8a3e-1c2d-7e3f-8a4b-5c6d7e8f9a0b')
+
+statement ok
+INSERT INTO strata.def.uuids (id) VALUES (1), (2)
+
+query TTT
+SELECT id, v4, v7 FROM strata.def.uuids
+----
+1 550e8400-e29b-41d4-a716-446655440000 018f8a3e-1c2d-7e3f-8a4b-5c6d7e8f9a0b
+2 550e8400-e29b-41d4-a716-446655440000 018f8a3e-1c2d-7e3f-8a4b-5c6d7e8f9a0b
+
+# --- expression defaults (Postgres-compatible) ------------------------
+
+# Any constant expression works: CAST, the :: cast, COALESCE, CASE, and a
+# row-wise function — all evaluated to a value per row.
+statement ok
+CREATE TABLE strata.def.exprs (id INT, big BIGINT DEFAULT CAST(1 AS BIGINT), picked TEXT DEFAULT COALESCE(NULL, 'fallback'), label TEXT DEFAULT CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END, hi INT DEFAULT GREATEST(3, 7, 2), parsed INT DEFAULT '42'::INT)
+
+statement ok
+INSERT INTO strata.def.exprs (id) VALUES (1)
+
+query TTTTTT
+SELECT id, big, picked, label, hi, parsed FROM strata.def.exprs
+----
+1 1 fallback yes 7 42
+
+# --- rejected cases ---------------------------------------------------
+
+# NOT NULL, no default, omitted → error (nothing to fill it with).
+statement ok
+CREATE TABLE strata.def.bad (id INT, name TEXT NOT NULL)
+
+statement error
+INSERT INTO strata.def.bad (id) VALUES (1)
+
+# Unknown column in the list → error.
+statement error
+INSERT INTO strata.def.t (id, nope) VALUES (5, 1)
+
+# The same column named twice → error.
+statement error
+INSERT INTO strata.def.t (id, id) VALUES (5, 6)
+
+# More values than columns → error (fewer is fine, more is not).
+statement error
+INSERT INTO strata.def.t VALUES (5, 'a', 1, 'n', 'extra')
+
+# A DEFAULT can't reference another column (no scope at CREATE TABLE).
+statement error
+CREATE TABLE strata.def.refcol (a INT, b INT DEFAULT a)

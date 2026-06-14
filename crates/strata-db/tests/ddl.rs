@@ -373,19 +373,3 @@ fn insert_null_into_nullable_column_is_ok() {
     assert_eq!(rows[0].values[0], Value::Int32(1));
     assert_eq!(rows[0].values[1], Value::Null);
 }
-
-#[test]
-fn insert_wrong_arity_errors() {
-    let (_tmp, db) = common::temp_db();
-    create_public_table(&db, "CREATE TABLE strata.public.t (a INT, b TEXT)");
-    let err = exec(&db, "INSERT INTO strata.public.t VALUES (1)").unwrap_err();
-    assert!(matches!(err, QueryError::Type(_)), "got {err:?}");
-}
-
-#[test]
-fn insert_explicit_column_list_is_unsupported() {
-    let (_tmp, db) = common::temp_db();
-    create_public_table(&db, "CREATE TABLE strata.public.t (a INT, b TEXT)");
-    let err = exec(&db, "INSERT INTO strata.public.t (a, b) VALUES (1, 'x')").unwrap_err();
-    assert!(matches!(err, QueryError::Unsupported(_)), "got {err:?}");
-}
