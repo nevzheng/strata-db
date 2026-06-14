@@ -18,6 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = { version = "0.62", features = ["serde"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+# Fast, seedable non-cryptographic hash for grace-hash-join partition routing.
+# xxh3's per-call seed lets recursive repartitioning use a fresh hash each level
+# so a busy partition actually redistributes instead of re-colliding.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 serde_json = "1"
