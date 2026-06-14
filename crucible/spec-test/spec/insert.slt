@@ -1,0 +1,48 @@
+# INSERT value semantics beyond the basic round-trip (which lives in
+# ddl/create_replace.slt): NULL against NOT NULL / nullable columns, and
+# the integer range check on a narrowing insert.
+#
+# Uses its own `strata.ins` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.ins
+
+# --- NULL handling ----------------------------------------------------
+
+statement ok
+CREATE TABLE strata.ins.req (id INT, name TEXT NOT NULL)
+
+# Explicit NULL into a NOT NULL column is rejected.
+statement error
+INSERT INTO strata.ins.req VALUES (1, NULL)
+
+statement ok
+CREATE TABLE strata.ins.opt (id INT, note TEXT)
+
+# NULL into a nullable column is fine; it reads back as NULL (shown here
+# through COALESCE so the value is unambiguous).
+statement ok
+INSERT INTO strata.ins.opt VALUES (1, NULL)
+
+query TT
+SELECT id, COALESCE(note, 'none') FROM strata.ins.opt
+----
+1 none
+
+# --- integer range on narrowing ---------------------------------------
+
+statement ok
+CREATE TABLE strata.ins.small (n SMALLINT)
+
+# 100000 > i16::MAX — narrowing into SMALLINT fails the range check.
+statement error
+INSERT INTO strata.ins.small VALUES (100000)
+
+# A value that fits round-trips.
+statement ok
+INSERT INTO strata.ins.small VALUES (30000)
+
+query T
+SELECT n FROM strata.ins.small
+----
+30000

@@ -1,0 +1,80 @@
+# CREATE SCHEMA semantics (BigQuery model: a schema *is* a dataset named
+# `[project.]dataset`). Covers creating and using a schema, the bare-name
+# default-project shorthand, IF NOT EXISTS idempotency, the rejected forms,
+# and CREATE TABLE error paths. Basic CREATE TABLE / INSERT / OR REPLACE
+# round-trips live in `create_replace.slt`.
+#
+# Self-contained: creates its own schemas under the seeded `strata` project.
+
+# --- create + use a named schema --------------------------------------
+
+statement ok
+CREATE SCHEMA strata.sdemo
+
+statement ok
+CREATE TABLE strata.sdemo.events (id INT, name TEXT)
+
+statement ok
+INSERT INTO strata.sdemo.events VALUES (1, 'a')
+
+query TT
+SELECT * FROM strata.sdemo.events
+----
+1 a
+
+# --- default-project shorthand ----------------------------------------
+
+# A bare dataset name resolves its project to the default (`strata`).
+statement ok
+CREATE SCHEMA srpt
+
+statement ok
+CREATE TABLE strata.srpt.t (id INT)
+
+statement ok
+INSERT INTO strata.srpt.t VALUES (7)
+
+query T
+SELECT id FROM strata.srpt.t
+----
+7
+
+# --- IF NOT EXISTS idempotency ----------------------------------------
+
+statement ok
+CREATE SCHEMA strata.sdup
+
+# Re-creating without IF NOT EXISTS errors...
+statement error
+CREATE SCHEMA strata.sdup
+
+# ...with IF NOT EXISTS it's a silent no-op.
+statement ok
+CREATE SCHEMA IF NOT EXISTS strata.sdup
+
+# --- rejected forms ---------------------------------------------------
+
+# Unknown project (we create datasets, not projects).
+statement error
+CREATE SCHEMA nope.analytics
+
+# The AUTHORIZATION form isn't supported.
+statement error
+CREATE SCHEMA AUTHORIZATION someone
+
+# CREATE TABLE in a dataset that doesn't exist.
+statement error
+CREATE TABLE strata.nope.events (id INT)
+
+# --- CREATE OR REPLACE on a missing table acts like CREATE ------------
+
+statement ok
+CREATE OR REPLACE TABLE strata.sdemo.fresh (id INT)
+
+statement ok
+INSERT INTO strata.sdemo.fresh VALUES (1)
+
+query T
+SELECT id FROM strata.sdemo.fresh
+----
+1

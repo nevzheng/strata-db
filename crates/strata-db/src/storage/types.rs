@@ -158,6 +158,13 @@ pub struct Field {
     pub name: FieldName,
     pub ty: LogicalType,
     pub nullable: bool,
+    /// `DEFAULT` expression, as JSON-serialized `query::expression::Expr`.
+    ///
+    /// Stored as an opaque string so this storage type stays free of any
+    /// query-layer dependency — only the binder serializes it (CREATE
+    /// TABLE) and deserializes it (INSERT). `None` means no default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 impl Field {
@@ -168,6 +175,7 @@ impl Field {
             name: FieldName::new(name),
             ty,
             nullable: true,
+            default: None,
         }
     }
 }

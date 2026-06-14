@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::query::QueryError;
+use crate::query::expression::Expr;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
 use crate::storage::types::{Field, LogicalType, Tuple, Value};
 
@@ -14,17 +15,16 @@ use super::{BindNode, Binder, three_part_name};
 
 // --- INSERT ----------------------------------------------------------------
 
-/// Bind `INSERT INTO p.d.t VALUES (..), (..)` into an [`LogicalNode::Insert`]
-/// over a [`LogicalNode::Values`] source. v1 limits: positional values only
-/// (no column list), `VALUES` source only (no `INSERT ... SELECT`), constant
-/// expressions only. Each value is validated and coerced against the table's
-/// stored schema.
+/// Bind `INSERT INTO p.d.t [(cols)] VALUES (..), (..)` into an
+/// [`LogicalNode::Insert`] over a [`LogicalNode::Values`] source. v1 limits:
+/// `VALUES` source only (no `INSERT ... SELECT`), constant expressions only.
+///
+/// Columns not supplied for a row are filled from the column's `DEFAULT`
+/// (or `NULL` if nullable) — see [`resolve_default`]. With an explicit
+/// column list, "missing" is the set of table columns not named; without
+/// one, values map positionally to the leading columns and the trailing
+/// columns are missing.
 pub(super) fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<LogicalPlan, QueryError> {
-    if !insert.columns.is_empty() {
-        return Err(QueryError::unsupported(
-            "INSERT with an explicit column list",
-        ));
-    }
     let TableObject::TableName(name) = &insert.table else {
         return Err(QueryError::unsupported(
             "INSERT target must be a table name",
@@ -37,6 +37,10 @@ pub(super) fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<Logica
         .resolve_table(project, dataset, table_name)?;
     let schema = table.schema().clone();
 
+    // Map each listed column name to its position in the table schema.
+    // An empty list means positional (values map to the leading columns).
+    let target_cols = resolve_target_columns(&insert.columns, &schema.fields, table.name())?;
+
     let source = insert
         .source
         .as_ref()
@@ -45,21 +49,35 @@ pub(super) fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<Logica
         return Err(QueryError::unsupported("INSERT source must be VALUES"));
     };
 
+    let expected = target_cols.as_ref().map_or(schema.fields.len(), Vec::len);
     let mut rows = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
         let exprs = &row.content;
-        if exprs.len() != schema.fields.len() {
+        if exprs.len() > expected {
             return Err(QueryError::type_error(format!(
-                "INSERT has {} value(s) but table `{}` has {} column(s)",
+                "INSERT has {} value(s) but {} column(s) are targeted in `{}`",
                 exprs.len(),
+                expected,
                 table.name(),
-                schema.fields.len()
             )));
         }
-        let mut row_values = Vec::with_capacity(exprs.len());
-        for (expr, field) in exprs.iter().zip(&schema.fields) {
-            let value = const_eval(expr, binder)?;
-            row_values.push(coerce_value(value, field)?);
+
+        // Slot i holds the supplied value for field i, if any.
+        let mut slots: Vec<Option<&AstExpr>> = vec![None; schema.fields.len()];
+        for (pos, expr) in exprs.iter().enumerate() {
+            // With a column list, the value's position picks the named
+            // column; without one, position is the column index directly.
+            let field_idx = target_cols.as_ref().map_or(pos, |cols| cols[pos]);
+            slots[field_idx] = Some(expr);
+        }
+
+        let mut row_values = Vec::with_capacity(schema.fields.len());
+        for (field, slot) in schema.fields.iter().zip(&slots) {
+            let value = match slot {
+                Some(expr) => coerce_value(const_eval(expr, binder)?, field)?,
+                None => resolve_default(field)?,
+            };
+            row_values.push(value);
         }
         rows.push(Tuple { values: row_values });
     }
@@ -68,6 +86,69 @@ pub(super) fn bind_insert(insert: &Insert, binder: &mut Binder) -> Result<Logica
         table,
         input: Box::new(LogicalNode::Values { rows }),
     }))
+}
+
+/// Resolve an explicit `INSERT` column list to field indices, in the order
+/// the values will be supplied. Returns `None` for the positional form (no
+/// column list). Errors on an unknown or repeated column name.
+fn resolve_target_columns(
+    columns: &[sqlparser::ast::ObjectName],
+    fields: &[Field],
+    table_name: &str,
+) -> Result<Option<Vec<usize>>, QueryError> {
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let mut indices = Vec::with_capacity(columns.len());
+    for col in columns {
+        // A target column is a plain, unqualified name.
+        let name = match col.0.as_slice() {
+            [part] => part.as_ident().map(|i| i.value.as_str()).ok_or_else(|| {
+                QueryError::unsupported(format!("non-identifier column in INSERT: {col}"))
+            })?,
+            _ => {
+                return Err(QueryError::unsupported(format!(
+                    "qualified column in INSERT: {col}"
+                )));
+            }
+        };
+        let idx = fields
+            .iter()
+            .position(|f| f.name.as_str() == name)
+            .ok_or_else(|| {
+                QueryError::type_error(format!("column `{name}` does not exist in `{table_name}`"))
+            })?;
+        if indices.contains(&idx) {
+            return Err(QueryError::type_error(format!(
+                "column `{name}` specified more than once"
+            )));
+        }
+        indices.push(idx);
+    }
+    Ok(Some(indices))
+}
+
+/// Resolve the value for a column with no supplied value: evaluate its
+/// `DEFAULT` (per row, so a future volatile default like `now()` runs each
+/// time), else `NULL` if the column is nullable, else reject. The stored
+/// default is JSON — deserialized back into an [`Expr`] here, keeping the
+/// query layer the only place that understands the expression.
+fn resolve_default(field: &Field) -> Result<Value, QueryError> {
+    match &field.default {
+        Some(json) => {
+            let expr: Expr = serde_json::from_str(json).map_err(|e| {
+                QueryError::Internal(format!("deserialize DEFAULT expression: {e}"))
+            })?;
+            // Defaults can't reference columns, so an empty tuple suffices.
+            let value = expr.eval(&Tuple { values: vec![] })?;
+            coerce_value(value, field)
+        }
+        None if field.nullable => Ok(Value::Null),
+        None => Err(QueryError::type_error(format!(
+            "missing value for column `{}` (no default, NOT NULL)",
+            field.name.as_str()
+        ))),
+    }
 }
 
 /// Evaluate a `VALUES` expression to a constant. It binds with no scope,
@@ -106,6 +187,7 @@ fn coerce_value(value: Value, field: &Field) -> Result<Value, QueryError> {
                 name: field.name.clone(),
                 ty: (**elem).clone(),
                 nullable: false,
+                default: None,
             };
             let coerced = items
                 .into_iter()

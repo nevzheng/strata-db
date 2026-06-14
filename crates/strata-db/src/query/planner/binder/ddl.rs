@@ -13,7 +13,7 @@ use crate::query::QueryError;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
 use crate::storage::types::{Field, FieldName, LogicalType};
 
-use super::{Binder, is_tz_aware, three_part_name};
+use super::{BindNode, Binder, is_tz_aware, three_part_name};
 
 // --- CREATE TABLE ----------------------------------------------------------
 
@@ -56,7 +56,7 @@ pub(super) fn bind_create_table(
             name: dataset.to_string(),
         })?;
 
-    let schema = bind_schema(&ct.columns)?;
+    let schema = bind_schema(&ct.columns, binder)?;
 
     Ok(LogicalPlan::new(LogicalNode::CreateTable {
         project_id: project_meta.id,
@@ -129,28 +129,41 @@ fn dataset_name(name: &ObjectName) -> Result<(&str, &str), QueryError> {
 
 /// Turn the AST column list into a storage [`Schema`]. Field order is
 /// preserved — column 0 is the primary key by convention.
-fn bind_schema(columns: &[ColumnDef]) -> Result<Schema, QueryError> {
+fn bind_schema(columns: &[ColumnDef], binder: &mut Binder) -> Result<Schema, QueryError> {
     if columns.is_empty() {
         return Err(QueryError::unsupported("CREATE TABLE with no columns"));
     }
     let fields = columns
         .iter()
-        .map(bind_column)
+        .map(|col| bind_column(col, binder))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Schema { fields })
 }
 
-fn bind_column(col: &ColumnDef) -> Result<Field, QueryError> {
+fn bind_column(col: &ColumnDef, binder: &mut Binder) -> Result<Field, QueryError> {
     let ty = bind_data_type(&col.data_type)?;
-    // SQL columns are nullable unless `NOT NULL` is given. We accept
-    // only the null-related options for now; anything else (defaults,
-    // generated columns, inline PK/UNIQUE) is rejected so we don't
-    // silently ignore it.
+    // SQL columns are nullable unless `NOT NULL` is given. We accept the
+    // null-related options and `DEFAULT`; anything else (generated
+    // columns, inline PK/UNIQUE) is rejected so we don't silently ignore it.
     let mut nullable = true;
+    let mut default = None;
     for opt in &col.options {
         match &opt.option {
             ColumnOption::Null => nullable = true,
             ColumnOption::NotNull => nullable = false,
+            // Bind the default with no scope pushed: it can't reference
+            // other columns (resolve_column fails without a scope) and
+            // can't contain a subquery — matching Postgres' two
+            // restrictions. We store the bound expression as JSON so the
+            // storage layer stays free of any query-layer type; INSERT
+            // deserializes and evaluates it per row.
+            ColumnOption::Default(expr) => {
+                let bound = expr.bind(binder)?;
+                let json = serde_json::to_string(&bound).map_err(|e| {
+                    QueryError::Internal(format!("serialize DEFAULT expression: {e}"))
+                })?;
+                default = Some(json);
+            }
             other => {
                 return Err(QueryError::unsupported(format!("column option: {other:?}")));
             }
@@ -160,6 +173,7 @@ fn bind_column(col: &ColumnDef) -> Result<Field, QueryError> {
         name: FieldName::new(col.name.value.as_str()),
         ty,
         nullable,
+        default,
     })
 }
 
