@@ -2,17 +2,17 @@
 //! projection list.
 
 use sqlparser::ast::{
-    Expr as AstExpr, GroupByExpr, LimitClause, Query as AstQuery, Select, SelectItem, SetExpr,
-    TableFactor, TableWithJoins,
+    Expr as AstExpr, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause,
+    Query as AstQuery, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
-use crate::catalog::schema::Schema;
 use crate::catalog::system::SystemRelation;
 use crate::query::QueryError;
 use crate::query::expression::Expr;
-use crate::query::logical_plan::{LogicalNode, LogicalPlan};
+use crate::query::logical_plan::{JoinType, LogicalNode, LogicalPlan};
 use crate::storage::types::{Tuple, Value};
 
+use super::scope::Scope;
 use super::{BindNode, Binder, name_idents, three_part_name};
 
 impl BindNode for AstQuery {
@@ -105,18 +105,9 @@ impl BindNode for Select {
             return Err(QueryError::unsupported("HAVING"));
         }
 
-        // 1. FROM → source + the schema it exposes. Empty FROM yields a
+        // 1. FROM → source + the scope it exposes. Empty FROM yields a
         // one-row, zero-column source so `SELECT <expr>` (no FROM) binds.
-        let (source, scope) = match self.from.as_slice() {
-            [] => (
-                LogicalNode::Values {
-                    rows: vec![Tuple { values: vec![] }],
-                },
-                Schema { fields: vec![] },
-            ),
-            [one] => one.bind(binder)?,
-            _ => return Err(QueryError::unsupported("comma-separated FROM")),
-        };
+        let (source, scope) = bind_from(&self.from, binder)?;
 
         binder.push_scope(scope);
 
@@ -149,50 +140,148 @@ impl BindNode for Select {
     }
 }
 
-// --- FROM relation (produces a source + the schema it exposes) -------------
+// --- FROM clause (relations + joins → a source + the scope it exposes) -----
 
-impl BindNode for TableWithJoins {
-    type Output = (LogicalNode, Schema);
+/// Bind the FROM list. Empty FROM is a one-row, zero-column source (so
+/// `SELECT <expr>` binds). Multiple comma-separated items are cross joins.
+fn bind_from(
+    items: &[TableWithJoins],
+    binder: &mut Binder,
+) -> Result<(LogicalNode, Scope), QueryError> {
+    let [first, rest @ ..] = items else {
+        return Ok((
+            LogicalNode::Values {
+                rows: vec![Tuple { values: vec![] }],
+            },
+            Scope::empty(),
+        ));
+    };
 
-    fn bind(&self, binder: &mut Binder) -> Result<(LogicalNode, Schema), QueryError> {
-        if !self.joins.is_empty() {
-            return Err(QueryError::unsupported("joins"));
-        }
-        let TableFactor::Table { name, .. } = &self.relation else {
-            return Err(QueryError::unsupported(format!(
-                "FROM relation: {:?}",
-                self.relation
-            )));
+    let (mut node, mut scope) = bind_table_with_joins(first, binder)?;
+    for item in rest {
+        // `FROM a, b` is a cross join: every pair, no condition.
+        let (rnode, rscope) = bind_table_with_joins(item, binder)?;
+        node = LogicalNode::Join {
+            left: Box::new(node),
+            right: Box::new(rnode),
+            on: None,
+            join_type: JoinType::Inner,
         };
-
-        // System-catalog relations resolve specially: an unqualified `pg_*` /
-        // `st_*`, or a qualified `information_schema.x` / `pg_catalog.x`. They
-        // carry no project.dataset prefix, unlike user tables.
-        let parts = name_idents(name)?;
-        let (dataset_opt, leaf) = match parts.as_slice() {
-            [t] => (None, *t),
-            [d, t] => (Some(*d), *t),
-            [_, d, t] => (Some(*d), *t),
-            _ => {
-                return Err(QueryError::unsupported(format!(
-                    "name needs project.dataset.table, got: {name}"
-                )));
-            }
-        };
-        if let Some(relation) = SystemRelation::resolve(dataset_opt, leaf) {
-            let schema = relation.schema();
-            return Ok((LogicalNode::SystemScan { relation }, schema));
-        }
-
-        // User tables: three-part name only for now — no session defaults.
-        let (project, dataset, table_name) = three_part_name(name)?;
-        let table = binder
-            .ctx()
-            .catalog()
-            .resolve_table(project, dataset, table_name)?;
-        let schema = table.schema().clone();
-        Ok((LogicalNode::Scan { table }, schema))
+        scope = Scope::concat(scope, rscope);
     }
+    Ok((node, scope))
+}
+
+/// A FROM item: a base relation followed by zero or more joins, folded
+/// left-deep. Returns the source node and the combined scope.
+fn bind_table_with_joins(
+    twj: &TableWithJoins,
+    binder: &mut Binder,
+) -> Result<(LogicalNode, Scope), QueryError> {
+    let (mut node, mut scope) = bind_table_factor(&twj.relation, binder)?;
+
+    for join in &twj.joins {
+        let (rnode, rscope) = bind_table_factor(&join.relation, binder)?;
+        let (join_type, constraint) = join_kind(join)?;
+        // The output row — and so any column ref in ON — is `left ++ right`.
+        let combined = Scope::concat(scope, rscope);
+        let on = match constraint {
+            Some(expr) => {
+                // Bind ON against the combined scope.
+                binder.push_scope(combined.clone());
+                let bound = expr.bind(binder);
+                binder.pop_scope();
+                Some(bound?)
+            }
+            None => None,
+        };
+        node = LogicalNode::Join {
+            left: Box::new(node),
+            right: Box::new(rnode),
+            on,
+            join_type,
+        };
+        scope = combined;
+    }
+    Ok((node, scope))
+}
+
+/// Map a parsed join to our `(JoinType, ON condition)`. Cross joins and a
+/// bare join have no condition. `USING` / `NATURAL` and outer-apply-style
+/// joins aren't supported yet.
+fn join_kind(join: &Join) -> Result<(JoinType, Option<&AstExpr>), QueryError> {
+    let (ty, constraint) = match &join.join_operator {
+        // Postgres `JOIN`/`INNER` → `Join`/`Inner`; `LEFT [OUTER]` → `Left`/
+        // `LeftOuter`; likewise right; `FULL [OUTER]` → `FullOuter`.
+        JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (JoinType::Left, Some(c)),
+        JoinOperator::Right(c) | JoinOperator::RightOuter(c) => (JoinType::Right, Some(c)),
+        JoinOperator::FullOuter(c) => (JoinType::Full, Some(c)),
+        JoinOperator::CrossJoin(_) => (JoinType::Inner, None),
+        other => {
+            return Err(QueryError::unsupported(format!("join operator: {other:?}")));
+        }
+    };
+    let on = match constraint {
+        None | Some(JoinConstraint::None) => None,
+        Some(JoinConstraint::On(expr)) => Some(expr),
+        Some(other) => {
+            return Err(QueryError::unsupported(format!(
+                "join constraint: {other:?}"
+            )));
+        }
+    };
+    Ok((ty, on))
+}
+
+/// Bind one table factor (a base relation) to a source node and its scope,
+/// tagging every column with the relation's alias or name for qualified refs.
+fn bind_table_factor(
+    factor: &TableFactor,
+    binder: &mut Binder,
+) -> Result<(LogicalNode, Scope), QueryError> {
+    let TableFactor::Table { name, alias, .. } = factor else {
+        return Err(QueryError::unsupported(format!(
+            "FROM relation: {factor:?}"
+        )));
+    };
+    let alias = alias.as_ref().map(|a| a.name.value.clone());
+
+    // System-catalog relations resolve specially: an unqualified `pg_*` /
+    // `st_*`, or a qualified `information_schema.x` / `pg_catalog.x`. They
+    // carry no project.dataset prefix, unlike user tables.
+    let parts = name_idents(name)?;
+    let (dataset_opt, leaf) = match parts.as_slice() {
+        [t] => (None, *t),
+        [d, t] => (Some(*d), *t),
+        [_, d, t] => (Some(*d), *t),
+        _ => {
+            return Err(QueryError::unsupported(format!(
+                "name needs project.dataset.table, got: {name}"
+            )));
+        }
+    };
+    if let Some(relation) = SystemRelation::resolve(dataset_opt, leaf) {
+        let schema = relation.schema();
+        let rel = alias.unwrap_or_else(|| leaf.to_string());
+        return Ok((
+            LogicalNode::SystemScan { relation },
+            Scope::for_relation(Some(rel), &schema),
+        ));
+    }
+
+    // User tables: three-part name only for now — no session defaults.
+    let (project, dataset, table_name) = three_part_name(name)?;
+    let table = binder
+        .ctx()
+        .catalog()
+        .resolve_table(project, dataset, table_name)?;
+    let schema = table.schema().clone();
+    let rel = alias.unwrap_or_else(|| table_name.to_string());
+    Ok((
+        LogicalNode::Scan { table },
+        Scope::for_relation(Some(rel), &schema),
+    ))
 }
 
 // --- One projection item — may expand (wildcard → many) --------------------
@@ -208,7 +297,7 @@ impl BindNode for SelectItem {
                 let scope = binder
                     .current_scope()
                     .ok_or_else(|| QueryError::Internal("no scope for `*`".into()))?;
-                Ok((0..scope.fields.len()).map(Expr::column).collect())
+                Ok((0..scope.len()).map(Expr::column).collect())
             }
             other => Err(QueryError::unsupported(format!(
                 "projection item: {other:?}"

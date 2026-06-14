@@ -16,15 +16,16 @@ mod ddl;
 mod dml;
 mod expr;
 mod query;
+mod scope;
 
 use sqlparser::ast::{ObjectName, Statement, TimezoneInfo};
 
-use crate::catalog::schema::Schema;
 use crate::query::logical_plan::LogicalPlan;
 use crate::query::stages::{AnalyzedQuery, ParsedQuery};
 use crate::query::{QueryContext, QueryError};
 
 use super::pass::Pass;
+use scope::Scope;
 
 pub(super) struct Binder<'a, 'db> {
     ctx: &'a QueryContext<'db>,
@@ -32,10 +33,7 @@ pub(super) struct Binder<'a, 'db> {
     /// visible at one nesting level (one outer query, one subquery,
     /// etc.). `current_scope()` returns the identifiers that resolve
     /// right now — pushed when we enter a FROM, popped when we leave.
-    ///
-    /// Modeled as `Schema` today; once we add joins / aliases / CTEs,
-    /// this grows into a richer `Scope` struct.
-    scopes: Vec<Schema>,
+    scopes: Vec<Scope>,
 }
 
 impl<'a, 'db> Binder<'a, 'db> {
@@ -46,15 +44,15 @@ impl<'a, 'db> Binder<'a, 'db> {
         }
     }
 
-    fn push_scope(&mut self, schema: Schema) {
-        self.scopes.push(schema);
+    fn push_scope(&mut self, scope: Scope) {
+        self.scopes.push(scope);
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    fn current_scope(&self) -> Option<&Schema> {
+    fn current_scope(&self) -> Option<&Scope> {
         self.scopes.last()
     }
 

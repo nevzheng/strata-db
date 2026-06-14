@@ -10,8 +10,9 @@
 
 use crate::query::QueryContext;
 use crate::query::QueryError;
+use crate::query::expression::Expr;
 use crate::query::logical_plan::LogicalNode;
-use crate::query::physical_plan::{PhysicalPlan, PlanNode};
+use crate::query::physical_plan::{JoinStrategy, PhysicalPlan, PlanNode};
 use crate::query::stages::{LogicalQuery, PhysicalQuery};
 
 use super::pass::Pass;
@@ -45,6 +46,15 @@ impl Pass for Lower {
     }
 }
 
+/// Pick the physical algorithm for a join — the single place strategy
+/// selection lives. Today it always returns the general nested-loop
+/// algorithm (handles any predicate and cross joins); it grows cost-based
+/// — equi-join → hash/sort-merge, sized inputs → grace — as those
+/// operators land.
+fn select_join_strategy(_on: Option<&Expr>) -> JoinStrategy {
+    JoinStrategy::NestedLoop
+}
+
 pub(super) trait LowerNode {
     type Output;
     fn lower(&self) -> Self::Output;
@@ -76,6 +86,18 @@ impl LowerNode for LogicalNode {
             LogicalNode::Offset { input, count } => PlanNode::Offset {
                 input: Box::new(input.lower()),
                 count: *count,
+            },
+            LogicalNode::Join {
+                left,
+                right,
+                on,
+                join_type,
+            } => PlanNode::Join {
+                left: Box::new(left.lower()),
+                right: Box::new(right.lower()),
+                on: on.clone(),
+                join_type: *join_type,
+                strategy: select_join_strategy(on.as_ref()),
             },
             LogicalNode::Values { rows } => PlanNode::Values { rows: rows.clone() },
             LogicalNode::Insert { table, input } => PlanNode::Insert {

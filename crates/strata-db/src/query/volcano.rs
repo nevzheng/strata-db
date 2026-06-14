@@ -14,7 +14,8 @@ use super::QueryContext;
 use super::QueryError;
 use super::executor::{ExecuteResult, Executor, RowResult, RowStream};
 use super::expression::Expr;
-use super::physical_plan::{PhysicalPlan, PlanNode};
+use super::logical_plan::JoinType;
+use super::physical_plan::{JoinStrategy, PhysicalPlan, PlanNode};
 
 pub struct Volcano;
 
@@ -119,6 +120,20 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
             input: build(*input, ctx)?,
             remaining: count,
         })),
+        PlanNode::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy,
+        } => match strategy {
+            JoinStrategy::NestedLoop => nested_loop_join(*left, *right, on, join_type, ctx),
+            // The only strategy the optimizer emits today; the others are
+            // built in upcoming pieces.
+            other => Err(QueryError::Internal(format!(
+                "join strategy not implemented: {other:?}"
+            ))),
+        },
         PlanNode::Values { rows } => Ok(RowStream::new(rows.into_iter().map(Ok))),
         // Sinks (Insert/Delete/CreateTable) are top-level only — they
         // need `&mut ctx` and can't sit inside a pull iterator chain
@@ -134,6 +149,108 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
 
 fn drain(input: PlanNode, ctx: &QueryContext<'_>) -> Result<Vec<Tuple>, QueryError> {
     build(input, ctx)?.collect()
+}
+
+// --- joins -----------------------------------------------------------------
+
+/// Tuple-at-a-time nested-loop join — the general algorithm, correct for any
+/// predicate (and cross joins with `on: None`). The output row is the left
+/// tuple concatenated with the right.
+///
+/// Materializes both inputs up front (the inner must be rescanned; outer/full
+/// joins need a second pass over unmatched right rows). The slow, always-right
+/// baseline; the streaming/spilling variants are separate operators.
+fn nested_loop_join<'ctx>(
+    left: PlanNode,
+    right: PlanNode,
+    on: Option<Expr>,
+    join_type: JoinType,
+    ctx: &'ctx QueryContext<'_>,
+) -> Result<RowStream<'ctx>, QueryError> {
+    // Arities (for NULL-padding) read structurally, so an empty side still
+    // pads to the right width.
+    let left_width = output_arity(&left);
+    let right_width = output_arity(&right);
+    let left_rows: Vec<Tuple> = build(left, ctx)?.collect::<Result<_, _>>()?;
+    let right_rows: Vec<Tuple> = build(right, ctx)?.collect::<Result<_, _>>()?;
+
+    let mut out: Vec<Tuple> = Vec::new();
+    // Tracks which right rows matched, for RIGHT/FULL's unmatched pass.
+    let mut right_matched = vec![false; right_rows.len()];
+
+    for l in &left_rows {
+        let mut l_matched = false;
+        for (j, r) in right_rows.iter().enumerate() {
+            let combined = concat(l, r);
+            let matched = match &on {
+                None => true,
+                Some(pred) => matches!(pred.eval(&combined)?, Value::Bool(true)),
+            };
+            if matched {
+                l_matched = true;
+                right_matched[j] = true;
+                out.push(combined);
+            }
+        }
+        // LEFT/FULL: an unmatched left row survives, padded with right NULLs.
+        if !l_matched && matches!(join_type, JoinType::Left | JoinType::Full) {
+            out.push(pad_right(l, right_width));
+        }
+    }
+
+    // RIGHT/FULL: unmatched right rows survive, padded with left NULLs.
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        for (j, r) in right_rows.iter().enumerate() {
+            if !right_matched[j] {
+                out.push(pad_left(left_width, r));
+            }
+        }
+    }
+
+    Ok(RowStream::new(out.into_iter().map(Ok)))
+}
+
+/// `left ++ right`.
+fn concat(left: &Tuple, right: &Tuple) -> Tuple {
+    let mut values = Vec::with_capacity(left.values.len() + right.values.len());
+    values.extend(left.values.iter().cloned());
+    values.extend(right.values.iter().cloned());
+    Tuple { values }
+}
+
+/// `left ++ NULLs` — an unmatched left row in a LEFT/FULL join.
+fn pad_right(left: &Tuple, right_width: usize) -> Tuple {
+    let mut values = left.values.clone();
+    values.resize(values.len() + right_width, Value::Null);
+    Tuple { values }
+}
+
+/// `NULLs ++ right` — an unmatched right row in a RIGHT/FULL join.
+fn pad_left(left_width: usize, right: &Tuple) -> Tuple {
+    let mut values = vec![Value::Null; left_width];
+    values.extend(right.values.iter().cloned());
+    Tuple { values }
+}
+
+/// A plan node's output column count. Needed to NULL-pad the absent side of an
+/// outer join even when that side yields zero rows. Computed structurally —
+/// plans don't carry an output schema yet.
+fn output_arity(node: &PlanNode) -> usize {
+    match node {
+        PlanNode::SeqScan { table } => table.schema().fields.len(),
+        PlanNode::SystemScan { relation } => relation.schema().fields.len(),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. } => output_arity(input),
+        PlanNode::Project { expressions, .. } => expressions.len(),
+        PlanNode::Values { rows } => rows.first().map_or(0, |t| t.values.len()),
+        PlanNode::Join { left, right, .. } => output_arity(left) + output_arity(right),
+        // Sinks produce a row count, not rows.
+        PlanNode::Insert { .. }
+        | PlanNode::Delete { .. }
+        | PlanNode::CreateTable { .. }
+        | PlanNode::CreateDataset { .. } => 0,
+    }
 }
 
 // --- sinks: drain input, then apply writes ---------------------------------

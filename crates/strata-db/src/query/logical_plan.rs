@@ -20,6 +20,22 @@ use crate::storage::types::Tuple;
 
 use super::expression::Expr;
 
+/// How a join treats rows with no match on the other side. The condition
+/// itself lives in [`LogicalNode::Join::on`]; this is the row-emission
+/// semantics, fixed by the query (the optimizer never changes it — only the
+/// physical [`JoinStrategy`](crate::query::physical_plan::JoinStrategy)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JoinType {
+    /// Only matched pairs. (Cross join = `Inner` with `on: None`.)
+    Inner,
+    /// Matched pairs, plus each unmatched left row padded with right NULLs.
+    Left,
+    /// Matched pairs, plus each unmatched right row padded with left NULLs.
+    Right,
+    /// Matched pairs, plus unmatched rows from both sides, NULL-padded.
+    Full,
+}
+
 /// A logical plan: the root of an operator tree, plus future
 /// plan-level metadata (output schema, estimated cardinality, …).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -60,6 +76,15 @@ pub enum LogicalNode {
     Offset {
         input: Box<LogicalNode>,
         count: usize,
+    },
+    /// Join two inputs. The output row is the left tuple concatenated with
+    /// the right (`left ++ right`), and `on` indexes into that combined row.
+    /// `on: None` with `join_type = Inner` is a cross join (every pair).
+    Join {
+        left: Box<LogicalNode>,
+        right: Box<LogicalNode>,
+        on: Option<Expr>,
+        join_type: JoinType,
     },
     /// Source node for `INSERT INTO t VALUES (..)`.
     Values { rows: Vec<Tuple> },

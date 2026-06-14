@@ -27,6 +27,7 @@ impl BindNode for AstExpr {
                 value: bind_value(&v.value)?,
             }),
             AstExpr::Identifier(ident) => resolve_column(ident, binder),
+            AstExpr::CompoundIdentifier(idents) => resolve_compound(idents, binder),
             AstExpr::BinaryOp { op, left, right } => Ok(Expr::Binary {
                 op: bind_binary_op(op)?,
                 lhs: Box::new(left.bind(binder)?),
@@ -502,13 +503,22 @@ fn resolve_column(ident: &Ident, binder: &Binder) -> Result<Expr, QueryError> {
     let scope = binder
         .current_scope()
         .ok_or_else(|| QueryError::Internal("no scope for column ref".into()))?;
-    let name = ident.value.as_str();
-    let index = scope
-        .fields
-        .iter()
-        .position(|f| f.name.as_str() == name)
-        .ok_or_else(|| QueryError::Internal(format!("unknown column: {name}")))?;
-    Ok(Expr::column(index))
+    Ok(Expr::column(scope.resolve(None, ident.value.as_str())?))
+}
+
+/// A qualified reference (`t.col`). Resolves the column within relation `t`.
+fn resolve_compound(idents: &[Ident], binder: &Binder) -> Result<Expr, QueryError> {
+    let scope = binder
+        .current_scope()
+        .ok_or_else(|| QueryError::Internal("no scope for column ref".into()))?;
+    match idents {
+        [relation, name] => Ok(Expr::column(
+            scope.resolve(Some(relation.value.as_str()), name.value.as_str())?,
+        )),
+        _ => Err(QueryError::unsupported(format!(
+            "qualified name: {idents:?}"
+        ))),
+    }
 }
 
 fn bind_binary_op(op: &AstBinaryOperator) -> Result<BinaryOperator, QueryError> {
