@@ -133,9 +133,17 @@ pub(super) fn build<'ctx>(
                 join::block_nested_loop_join(*left, *right, on, join_type, right_schema, ctx)
             }
             JoinStrategy::SortMerge => join::sort_merge_join(*left, *right, on, join_type, ctx),
-            JoinStrategy::GraceHash => {
-                join::grace_hash_join(*left, *right, on, join_type, left_schema, right_schema, ctx)
-            }
+            JoinStrategy::GraceHash => join::grace_hash_join(
+                *left,
+                *right,
+                join::JoinPlan {
+                    on,
+                    join_type,
+                    left_schema,
+                    right_schema,
+                },
+                ctx,
+            ),
         },
         PlanNode::Sort {
             input,

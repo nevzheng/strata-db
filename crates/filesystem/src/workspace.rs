@@ -303,6 +303,54 @@ impl Workspace for FileWorkspace {
     }
 }
 
+impl FileWorkspace {
+    /// Consume the workspace into an owned, block-buffered cursor over every
+    /// tuple in insertion order. Unlike [`tuples`](Workspace::tuples) — which
+    /// borrows `&self`, so the iterator can't outlive the borrow — this owns the
+    /// workspace, so the cursor can be stored and driven independently. That's
+    /// what lets a streaming join hold a probe cursor as operator state and pull
+    /// one tuple at a time (no materializing the side into memory). One page is
+    /// buffered at a time, same footprint as `tuples`.
+    pub fn into_tuples(self) -> FileWorkspaceTuples {
+        FileWorkspaceTuples {
+            ws: self,
+            next_page: 0,
+            page: Vec::new().into_iter(),
+        }
+    }
+}
+
+/// Owned cursor over a [`FileWorkspace`]'s tuples (see
+/// [`into_tuples`](FileWorkspace::into_tuples)). Buffers one page at a time.
+pub struct FileWorkspaceTuples {
+    ws: FileWorkspace,
+    next_page: usize,
+    page: std::vec::IntoIter<Vec<u8>>,
+}
+
+impl Iterator for FileWorkspaceTuples {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(tuple) = self.page.next() {
+                return Some(tuple);
+            }
+            // Current page drained — load the next, copying its tuples out
+            // before the page pin drops (same as the borrowing `tuples`).
+            let &pid = self.ws.pages.get(self.next_page)?;
+            self.next_page += 1;
+            if let Ok(page) = self.ws.heap.page(pid) {
+                let buf: Vec<Vec<u8>> = page
+                    .iter()
+                    .filter_map(|t| t.bytes().map(|b| b.to_vec()))
+                    .collect();
+                self.page = buf.into_iter();
+            }
+        }
+    }
+}
+
 impl Drop for FileWorkspace {
     fn drop(&mut self) {
         // Best-effort cleanup of the scratch file; nothing to recover.

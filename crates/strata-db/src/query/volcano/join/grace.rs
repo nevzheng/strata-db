@@ -1,40 +1,46 @@
 //! Grace hash join — equi-joins of any type, built to keep the hash table in
-//! memory no matter how big the inputs are.
+//! memory at any scale and to *stream* its output.
 //!
-//! The naive hash join builds a table from one whole input; if it doesn't fit,
-//! it spills the *table* to disk and every probe becomes a random disk read —
-//! the worst possible I/O pattern. Grace avoids that: it hash-partitions both
-//! inputs to disk first (sequential writes), so equal keys co-locate and each
-//! partition pair is an independent join over ~1/N of the data. Then it builds
-//! the table from one partition at a time.
+//! Partitioning is a pipeline breaker: both inputs are consumed up front and
+//! hash-partitioned to disk (sequential writes), so equal keys co-locate and
+//! each partition pair is an independent join over ~1/N of the data. Everything
+//! after that streams — [`GraceHashStream`] is a real lazy iterator, not a
+//! materialized `Vec` wrapped in a stream.
 //!
-//! If a partition's build side *still* doesn't fit (skew, or just a lot of
-//! data), we **recursively repartition** it with a fresh hash seed so the keys
-//! actually redistribute — re-hashing with the same seed would just re-collide.
-//! The fit decision reads [`Workspace::used`] (the partition's spilled
-//! footprint); we never grow an unbounded in-memory table. When even
-//! repartitioning can't split a partition (one key value larger than the
-//! budget), we fall back to a streaming nested loop — sequential reads, no
-//! random I/O.
+//! For each partition pair we **build the hash table from the smaller side**
+//! (the build side must fit in memory; the smaller it is, the more often it
+//! does) and **probe by streaming the larger side one tuple at a time** — the
+//! probe side is never held in memory.
+//!
+//! If the smaller side still won't fit, we **recursively repartition** with a
+//! fresh hash seed so keys actually redistribute (re-hashing with the same seed
+//! would just re-collide). The fit decision reads [`Workspace::used`] (the
+//! partition's spilled footprint). A partition that even repartitioning can't
+//! split is a single key value larger than the budget; we build it in memory
+//! anyway rather than spill the table to disk — one big in-memory map is O(n+m)
+//! with no random I/O, where a disk-resident hash table would be random reads,
+//! the worst case.
 //!
 //! NULL keys can never match, so they bypass partitioning entirely; outer joins
 //! still emit them, NULL-padded, as unmatched rows.
 
 use std::collections::HashMap;
 
-use strata_store::{FileWorkspace, Workspace};
+use strata_store::{FileWorkspace, FileWorkspaceTuples, Workspace};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::catalog::schema::Schema;
 use crate::query::executor::RowStream;
-use crate::query::expression::Expr;
 use crate::query::logical_plan::JoinType;
 use crate::query::physical_plan::PlanNode;
 use crate::query::{QueryContext, QueryError};
 use crate::storage::types::{Tuple, Value};
 
-use super::super::build;
-use super::{concat, equi_keys, output_arity, pad_left, pad_right};
+// Renamed on import so it can't be confused with the hash-join *build* phase:
+// this materializes a volcano input stream (for partitioning), it does not build
+// a hash table.
+use super::super::build as build_input;
+use super::{JoinPlan, concat, equi_keys, output_arity, pad_left, pad_right};
 
 /// Fan-out per partitioning pass. Equal keys hash to the same partition, so the
 /// join decomposes into this many independent, smaller joins.
@@ -44,18 +50,18 @@ const HASH_PARTITIONS: usize = 16;
 const PARTITION_MEMORY: usize = 64 * 1024;
 /// Per-partition on-disk ceiling — the spill backstop.
 const PARTITION_DISK: usize = 1 << 30;
-/// A partition whose spilled footprint is at or under this builds its hash table
-/// in memory. Measured against [`Workspace::used`] (encoded bytes); the decoded
-/// table costs a few× more, so this is a deliberately conservative proxy.
+/// A partition whose smaller side's spilled footprint is at or under this builds
+/// its hash table in memory. Measured against [`Workspace::used`] (encoded
+/// bytes); the decoded table costs a few× more, so this is conservative.
 const BUILD_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 /// Cap on recursive repartitioning passes. Past this, a still-oversized
-/// partition is irreducible skew (one key value) → nested-loop fallback.
+/// partition is irreducible skew (one key value) — built in memory anyway.
 const MAX_REPARTITION_LEVELS: usize = 4;
 /// Base seed for partition routing (per the slab-bucket convention); each
 /// recursion level mixes in its depth so re-hashing actually redistributes.
 const BUCKET_SEED: u64 = 0xdead_beef_cafe_babe;
 
-/// Everything the recursive join needs that doesn't change between partitions.
+/// The join-invariant state shared across all partitions.
 struct HashJoinParams {
     join_type: JoinType,
     /// Join-key column within the left / right tuple.
@@ -71,38 +77,35 @@ struct HashJoinParams {
     build_budget: usize,
 }
 
-/// Grace hash join. See the module docs for the partition / repartition / fall
-/// back strategy.
-#[allow(clippy::too_many_arguments)]
+/// Grace hash join. Partitions eagerly (consuming the inputs), then returns a
+/// lazy stream over the partitions. See the module docs.
 pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
     left: PlanNode,
     right: PlanNode,
-    on: Option<Expr>,
-    join_type: JoinType,
-    left_schema: Schema,
-    right_schema: Schema,
+    plan: JoinPlan,
     ctx: &'ctx QueryContext<'_>,
 ) -> Result<RowStream<'ctx>, QueryError> {
-    let (left_key, right_key) = equi_keys(&on, &left)?;
+    let (left_key, right_key) = equi_keys(&plan.on, &left)?;
     let params = HashJoinParams {
-        join_type,
+        join_type: plan.join_type,
         left_key,
         right_key,
         left_width: output_arity(&left),
         right_width: output_arity(&right),
-        left_schema,
-        right_schema,
+        left_schema: plan.left_schema,
+        right_schema: plan.right_schema,
         build_budget: BUILD_MEMORY_BUDGET,
     };
 
-    // Pass 0 — partition both live inputs by the join key. NULL keys can't
-    // match, so they sit out; outer joins emit them (padded) at the very end.
+    // Pipeline breaker: partition both inputs to disk now (consuming the volcano
+    // input streams). NULL keys can't match, so they sit out of partitioning;
+    // outer joins emit them (padded) once the partitions are drained.
     let mut left_parts = new_partitions()?;
     let mut right_parts = new_partitions()?;
     let mut left_nulls: Vec<Tuple> = Vec::new();
     let mut right_nulls: Vec<Tuple> = Vec::new();
 
-    for row in build(left, ctx)? {
+    for row in build_input(left, ctx)? {
         let tuple = row?;
         match key_bytes(&tuple.values[params.left_key])? {
             None => left_nulls.push(tuple),
@@ -112,7 +115,7 @@ pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
             )?,
         }
     }
-    for row in build(right, ctx)? {
+    for row in build_input(right, ctx)? {
         let tuple = row?;
         match key_bytes(&tuple.values[params.right_key])? {
             None => right_nulls.push(tuple),
@@ -123,152 +126,277 @@ pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
         }
     }
 
-    // Join each partition pair — recursing when the build side won't fit.
-    let mut out: Vec<Tuple> = Vec::new();
-    for p in 0..HASH_PARTITIONS {
-        join_partition(&left_parts[p], &right_parts[p], 0, &params, &mut out)?;
-    }
+    let worklist = left_parts
+        .into_iter()
+        .zip(right_parts)
+        .map(|(l, r)| (l, r, 0usize))
+        .collect();
 
-    // NULL-keyed rows: unmatched by definition, kept only by the outer sides.
-    if matches!(params.join_type, JoinType::Left | JoinType::Full) {
-        for l in &left_nulls {
-            out.push(pad_right(l, params.right_width));
-        }
-    }
-    if matches!(params.join_type, JoinType::Right | JoinType::Full) {
-        for r in &right_nulls {
-            out.push(pad_left(params.left_width, r));
-        }
-    }
-
-    Ok(RowStream::new(out.into_iter().map(Ok)))
+    Ok(RowStream::new(GraceHashStream {
+        params,
+        worklist,
+        current: None,
+        left_nulls: left_nulls.into_iter(),
+        right_nulls: right_nulls.into_iter(),
+        failed: false,
+    }))
 }
 
-/// Join one partition pair, appending matches to `out`. `level` is how many
-/// times these inputs have already been (re)partitioned — it seeds the next
-/// hash and bounds the recursion.
-fn join_partition(
-    left: &FileWorkspace,
-    right: &FileWorkspace,
-    level: usize,
-    params: &HashJoinParams,
-    out: &mut Vec<Tuple>,
-) -> Result<(), QueryError> {
-    // Fits → build in memory and probe. (An empty build side uses 0 bytes, so
-    // this also covers the empty-partition case.)
-    if right.used() <= params.build_budget {
-        return build_probe(left, right, params, out);
-    }
-    // Doesn't fit, but we can still split: repartition both sides with a fresh
-    // seed so the keys land in different buckets this time, then recurse.
-    if level < MAX_REPARTITION_LEVELS {
-        let next = level + 1;
-        let left_sub = repartition(left, params.left_key, &params.left_schema, next)?;
-        let right_sub = repartition(right, params.right_key, &params.right_schema, next)?;
-        for p in 0..HASH_PARTITIONS {
-            join_partition(&left_sub[p], &right_sub[p], next, params, out)?;
-        }
-        return Ok(());
-    }
-    // Irreducible skew (one key value beyond the budget) — repartitioning can't
-    // help. Stream a nested loop: sequential reads, never a random hash spill.
-    nested_loop_fallback(left, right, params, out)
+/// Lazy stream over the partitioned join. Pulls one partition pair off the
+/// worklist at a time (repartitioning oversized ones), builds the smaller side's
+/// table, then yields probe matches one at a time.
+struct GraceHashStream {
+    params: HashJoinParams,
+    /// Pending `(left, right, level)` partition pairs. `level` is how many times
+    /// these inputs have already been (re)partitioned — it seeds the next hash
+    /// and bounds the recursion.
+    worklist: Vec<(FileWorkspace, FileWorkspace, usize)>,
+    /// The partition currently being probed, if any.
+    current: Option<Probe>,
+    /// NULL-keyed input rows, emitted (padded) by the outer sides at the end.
+    left_nulls: std::vec::IntoIter<Tuple>,
+    right_nulls: std::vec::IntoIter<Tuple>,
+    failed: bool,
 }
 
-/// Build a hash table from the right partition, probe it with the left.
-fn build_probe(
-    left: &FileWorkspace,
-    right: &FileWorkspace,
-    params: &HashJoinParams,
-    out: &mut Vec<Tuple>,
-) -> Result<(), QueryError> {
-    // key bytes → indices into `build_rows`. The HashMap compares full key
-    // bytes, so a hash collision is never mistaken for a match.
-    let mut build_rows: Vec<Tuple> = Vec::new();
-    let mut build_matched: Vec<bool> = Vec::new();
+/// One partition's build-side hash table plus the streaming probe cursor.
+struct Probe {
+    /// key bytes → indices into `build_rows`. Full key bytes are compared, so a
+    /// hash collision is never mistaken for a match.
+    table: HashMap<Vec<u8>, Vec<usize>>,
+    build_rows: Vec<Tuple>,
+    build_matched: Vec<bool>,
+    /// Whether the build side is the join's *left* input (so output and padding
+    /// go the right direction regardless of which side we chose to build on).
+    build_is_left: bool,
+    /// The larger side, streamed one tuple at a time.
+    probe: FileWorkspaceTuples,
+    /// Output rows buffered for the current probe row (one probe row can match
+    /// several build rows).
+    pending: std::vec::IntoIter<Tuple>,
+    /// `true` while consuming the probe side; `false` during the post-probe pass
+    /// over unmatched build rows (outer joins).
+    probing: bool,
+    /// Cursor into `build_matched` for that unmatched-build pass.
+    drain: usize,
+}
+
+impl Iterator for GraceHashStream {
+    type Item = Result<Tuple, QueryError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            // 1. Anything buffered for the current probe row.
+            if let Some(state) = self.current.as_mut()
+                && let Some(tuple) = state.pending.next()
+            {
+                return Some(Ok(tuple));
+            }
+            // 2. Advance the current partition.
+            if let Some(state) = self.current.as_mut() {
+                if state.probing {
+                    match state.probe.next() {
+                        Some(bytes) => {
+                            if let Err(e) = probe_one(&self.params, state, &bytes) {
+                                self.failed = true;
+                                return Some(Err(e));
+                            }
+                            continue; // loop back to drain `pending`
+                        }
+                        None => {
+                            state.probing = false; // probe done → unmatched-build pass
+                            continue;
+                        }
+                    }
+                } else if let Some(tuple) = next_unmatched_build(&self.params, state) {
+                    return Some(Ok(tuple));
+                } else {
+                    self.current = None; // partition fully drained
+                    continue;
+                }
+            }
+            // 3. No current partition: load the next (may repartition), else
+            //    fall through to the NULL-row tail.
+            match self.load_next_partition() {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+            // 4. Partitions exhausted — emit NULL-keyed rows for the outer sides.
+            if matches!(self.params.join_type, JoinType::Left | JoinType::Full)
+                && let Some(t) = self.left_nulls.next()
+            {
+                return Some(Ok(pad_right(&t, self.params.right_width)));
+            }
+            if matches!(self.params.join_type, JoinType::Right | JoinType::Full)
+                && let Some(t) = self.right_nulls.next()
+            {
+                return Some(Ok(pad_left(self.params.left_width, &t)));
+            }
+            return None;
+        }
+    }
+}
+
+impl GraceHashStream {
+    /// Pop the next partition pair, repartitioning while the smaller side is over
+    /// budget and we still have recursion levels left. Sets `self.current` and
+    /// returns `Ok(true)` when a partition is ready, `Ok(false)` when the
+    /// worklist is empty.
+    fn load_next_partition(&mut self) -> Result<bool, QueryError> {
+        while let Some((left_ws, right_ws, level)) = self.worklist.pop() {
+            let smaller = left_ws.used().min(right_ws.used());
+            if smaller > self.params.build_budget && level < MAX_REPARTITION_LEVELS {
+                let next = level + 1;
+                let left_sub = repartition(
+                    &left_ws,
+                    self.params.left_key,
+                    &self.params.left_schema,
+                    next,
+                )?;
+                let right_sub = repartition(
+                    &right_ws,
+                    self.params.right_key,
+                    &self.params.right_schema,
+                    next,
+                )?;
+                drop(left_ws); // free the parent partitions' temp files now
+                drop(right_ws);
+                for pair in left_sub.into_iter().zip(right_sub) {
+                    self.worklist.push((pair.0, pair.1, next));
+                }
+                continue;
+            }
+
+            // Build the table from the smaller side; stream-probe the larger.
+            let build_is_left = left_ws.used() <= right_ws.used();
+            let (build_ws, probe_ws, build_schema, build_key) = if build_is_left {
+                (
+                    left_ws,
+                    right_ws,
+                    &self.params.left_schema,
+                    self.params.left_key,
+                )
+            } else {
+                (
+                    right_ws,
+                    left_ws,
+                    &self.params.right_schema,
+                    self.params.right_key,
+                )
+            };
+            let (table, build_rows, build_matched) =
+                build_table(&build_ws, build_schema, build_key)?;
+            drop(build_ws); // table is materialized; the file is no longer needed
+
+            self.current = Some(Probe {
+                table,
+                build_rows,
+                build_matched,
+                build_is_left,
+                probe: probe_ws.into_tuples(),
+                pending: Vec::new().into_iter(),
+                probing: true,
+                drain: 0,
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// Build a hash table from one partition side. The obvious build phase: decode
+/// each tuple, index it by its join-key bytes. Returns the table, the rows it
+/// points into, and a per-row matched bitmap (for outer joins).
+type BuiltTable = (HashMap<Vec<u8>, Vec<usize>>, Vec<Tuple>, Vec<bool>);
+fn build_table(ws: &FileWorkspace, schema: &Schema, key: usize) -> Result<BuiltTable, QueryError> {
     let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for bytes in right.tuples() {
-        let tuple = params.right_schema.decode(&bytes)?;
-        let key = key_bytes(&tuple.values[params.right_key])?.expect("null keys never partition");
-        table.entry(key).or_default().push(build_rows.len());
-        build_matched.push(false);
-        build_rows.push(tuple);
+    let mut rows: Vec<Tuple> = Vec::new();
+    let mut matched: Vec<bool> = Vec::new();
+    for bytes in ws.tuples() {
+        let tuple = schema.decode(&bytes)?;
+        let k = key_bytes(&tuple.values[key])?.expect("null keys never partition");
+        table.entry(k).or_default().push(rows.len());
+        matched.push(false);
+        rows.push(tuple);
     }
+    Ok((table, rows, matched))
+}
 
-    for bytes in left.tuples() {
-        let l = params.left_schema.decode(&bytes)?;
-        let key = key_bytes(&l.values[params.left_key])?.expect("null keys never partition");
-        let mut matched = false;
-        if let Some(idxs) = table.get(&key) {
-            for &idx in idxs {
-                matched = true;
-                build_matched[idx] = true;
-                out.push(concat(&l, &build_rows[idx]));
-            }
-        }
-        // LEFT/FULL: an unmatched probe row survives, padded with right NULLs.
-        if !matched && matches!(params.join_type, JoinType::Left | JoinType::Full) {
-            out.push(pad_right(&l, params.right_width));
-        }
-    }
+/// Probe one streamed tuple against the build table, buffering its output rows
+/// into `state.pending` (matches, or one NULL-padded row if it's an unmatched
+/// outer-side row).
+fn probe_one(params: &HashJoinParams, state: &mut Probe, bytes: &[u8]) -> Result<(), QueryError> {
+    // The probe side is whichever input we didn't build on.
+    let (probe_schema, probe_key) = if state.build_is_left {
+        (&params.right_schema, params.right_key)
+    } else {
+        (&params.left_schema, params.left_key)
+    };
+    let probe = probe_schema.decode(bytes)?;
+    let key = key_bytes(&probe.values[probe_key])?.expect("null keys never partition");
 
-    // RIGHT/FULL: build rows that nothing probed, padded with left NULLs.
-    if matches!(params.join_type, JoinType::Right | JoinType::Full) {
-        for (idx, matched) in build_matched.iter().enumerate() {
-            if !matched {
-                out.push(pad_left(params.left_width, &build_rows[idx]));
+    let hits = state.table.get(&key).cloned().unwrap_or_default();
+    let mut out: Vec<Tuple> = Vec::with_capacity(hits.len());
+    for i in hits {
+        state.build_matched[i] = true;
+        // Output is always left ++ right, whichever side we built on.
+        out.push(if state.build_is_left {
+            concat(&state.build_rows[i], &probe)
+        } else {
+            concat(&probe, &state.build_rows[i])
+        });
+    }
+    if out.is_empty() {
+        // Unmatched probe row, kept only by the outer side it belongs to.
+        if state.build_is_left {
+            // probe side is the RIGHT input
+            if matches!(params.join_type, JoinType::Right | JoinType::Full) {
+                out.push(pad_left(params.left_width, &probe));
             }
+        } else if matches!(params.join_type, JoinType::Left | JoinType::Full) {
+            // probe side is the LEFT input
+            out.push(pad_right(&probe, params.right_width));
         }
     }
+    state.pending = out.into_iter();
     Ok(())
 }
 
-/// Streaming nested loop over two spilled partitions — the skew fallback. Reads
-/// are sequential (rescans the right file per left row); only a per-right-row
-/// matched bitmap is held in memory, never the tuples.
-fn nested_loop_fallback(
-    left: &FileWorkspace,
-    right: &FileWorkspace,
-    params: &HashJoinParams,
-    out: &mut Vec<Tuple>,
-) -> Result<(), QueryError> {
-    let right_count = right.tuples().count();
-    let mut right_matched = vec![false; right_count];
-
-    for lbytes in left.tuples() {
-        let l = params.left_schema.decode(&lbytes)?;
-        let lkey = key_bytes(&l.values[params.left_key])?.expect("null keys never partition");
-        let mut matched = false;
-        for (j, rbytes) in right.tuples().enumerate() {
-            let r = params.right_schema.decode(&rbytes)?;
-            let rkey = key_bytes(&r.values[params.right_key])?.expect("null keys never partition");
-            if lkey == rkey {
-                matched = true;
-                right_matched[j] = true;
-                out.push(concat(&l, &r));
-            }
-        }
-        if !matched && matches!(params.join_type, JoinType::Left | JoinType::Full) {
-            out.push(pad_right(&l, params.right_width));
+/// The next build row that nothing probed, padded for the outer side it belongs
+/// to — the post-probe pass. Advances `state.drain`; `None` when exhausted.
+fn next_unmatched_build(params: &HashJoinParams, state: &mut Probe) -> Option<Tuple> {
+    let keeps_unmatched = if state.build_is_left {
+        matches!(params.join_type, JoinType::Left | JoinType::Full)
+    } else {
+        matches!(params.join_type, JoinType::Right | JoinType::Full)
+    };
+    if !keeps_unmatched {
+        return None;
+    }
+    while state.drain < state.build_matched.len() {
+        let i = state.drain;
+        state.drain += 1;
+        if !state.build_matched[i] {
+            return Some(if state.build_is_left {
+                pad_right(&state.build_rows[i], params.right_width)
+            } else {
+                pad_left(params.left_width, &state.build_rows[i])
+            });
         }
     }
-
-    if matches!(params.join_type, JoinType::Right | JoinType::Full) {
-        for (j, rbytes) in right.tuples().enumerate() {
-            if !right_matched[j] {
-                out.push(pad_left(
-                    params.left_width,
-                    &params.right_schema.decode(&rbytes)?,
-                ));
-            }
-        }
-    }
-    Ok(())
+    None
 }
 
 /// Re-spill a partition into a fresh set of sub-partitions, hashing the join key
-/// at `level`'s seed. The encoded tuple bytes are re-spilled as-is (decode only
-/// to read the key) — no re-encode.
+/// at `level`'s seed. The encoded bytes are re-spilled as-is (decode only to
+/// read the key) — no re-encode.
 fn repartition(
     src: &FileWorkspace,
     key: usize,
@@ -350,26 +478,28 @@ mod tests {
         w
     }
 
-    fn params(join_type: JoinType, build_budget: usize) -> HashJoinParams {
-        HashJoinParams {
-            join_type,
+    /// Drive the lazy stream over a single partition pair with the given build
+    /// budget; sorted for order-independent comparison.
+    fn run_stream(budget: usize, jt: JoinType, l: &[(i32, i32)], r: &[(i32, i32)]) -> Vec<Tuple> {
+        let params = HashJoinParams {
+            join_type: jt,
             left_key: 1,
             right_key: 1,
             left_width: 2,
             right_width: 2,
             left_schema: schema(),
             right_schema: schema(),
-            build_budget,
-        }
-    }
-
-    /// Run a single partition-pair join with the given build budget, sorted for
-    /// order-independent comparison.
-    fn join_with(budget: usize, jt: JoinType, l: &[(i32, i32)], r: &[(i32, i32)]) -> Vec<Tuple> {
-        let (lw, rw) = (ws(l), ws(r));
-        let p = params(jt, budget);
-        let mut out = Vec::new();
-        join_partition(&lw, &rw, 0, &p, &mut out).unwrap();
+            build_budget: budget,
+        };
+        let stream = GraceHashStream {
+            params,
+            worklist: vec![(ws(l), ws(r), 0)],
+            current: None,
+            left_nulls: Vec::new().into_iter(),
+            right_nulls: Vec::new().into_iter(),
+            failed: false,
+        };
+        let mut out: Vec<Tuple> = stream.map(|r| r.unwrap()).collect();
         out.sort_by_key(|t| format!("{:?}", t.values));
         out
     }
@@ -378,7 +508,7 @@ mod tests {
     fn repartitioning_preserves_results() {
         // Many rows over 200 keys: a small budget forces a repartition pass,
         // then each sub-partition builds in memory. Result must equal the
-        // single-pass (huge-budget) join.
+        // single-pass (huge-budget) join, for every join type.
         let l: Vec<(i32, i32)> = (0..2000).map(|i| (i, i % 200)).collect();
         let r: Vec<(i32, i32)> = (0..2000).map(|i| (i, i % 200)).collect();
         for jt in [
@@ -387,33 +517,43 @@ mod tests {
             JoinType::Right,
             JoinType::Full,
         ] {
-            let repartitioned = join_with(8 * 1024, jt, &l, &r);
-            let single_pass = join_with(1 << 30, jt, &l, &r);
+            let repartitioned = run_stream(8 * 1024, jt, &l, &r);
+            let single_pass = run_stream(1 << 30, jt, &l, &r);
             assert_eq!(repartitioned, single_pass, "{jt:?} repartition mismatch");
         }
     }
 
     #[test]
-    fn irreducible_skew_falls_back_to_nested_loop() {
-        // One key value, more rows than any repartition can split — no hash
-        // seed separates identical keys, so this must reach the nested-loop
-        // fallback and still produce the full cartesian product.
-        let l: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
-        let r: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
-        let skewed = join_with(64, JoinType::Inner, &l, &r); // < 1 page → max recursion
-        assert_eq!(skewed.len(), 40 * 40, "single-key cartesian product");
-        assert_eq!(skewed, join_with(1 << 30, JoinType::Inner, &l, &r));
+    fn builds_on_the_smaller_side() {
+        // Tiny left, huge right: the stream must build on the left and probe the
+        // right, and still produce the correct inner join (every left key 5
+        // matches every right key-5 row).
+        let l = [(1, 5), (2, 5)];
+        let r: Vec<(i32, i32)> = (0..500).map(|i| (i, if i < 100 { 5 } else { 9 })).collect();
+        let rows = run_stream(1 << 30, JoinType::Inner, &l, &r);
+        assert_eq!(rows.len(), 2 * 100); // 2 left × 100 matching right
     }
 
     #[test]
-    fn fallback_handles_outer_joins() {
-        // Skewed keys (7 vs 9) that never match → fallback must still keep the
-        // unmatched rows for the outer sides.
+    fn irreducible_single_key_still_joins() {
+        // One key value, more rows than any repartition can split — no hash seed
+        // separates identical keys, so this exhausts the recursion and builds in
+        // memory anyway, producing the full cartesian product.
+        let l: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
+        let r: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
+        let skewed = run_stream(64, JoinType::Inner, &l, &r); // < 1 page → max recursion
+        assert_eq!(skewed.len(), 40 * 40);
+        assert_eq!(skewed, run_stream(1 << 30, JoinType::Inner, &l, &r));
+    }
+
+    #[test]
+    fn skew_preserves_outer_joins() {
+        // Skewed keys (7 vs 9) that never match → every left and right row
+        // survives, padded, even through the recursion.
         let l: Vec<(i32, i32)> = (0..30).map(|i| (i, 7)).collect();
         let r: Vec<(i32, i32)> = (0..30).map(|i| (i, 9)).collect();
-        let full = join_with(64, JoinType::Full, &l, &r);
-        // No matches: every left and every right row survives, padded.
+        let full = run_stream(64, JoinType::Full, &l, &r);
         assert_eq!(full.len(), 60);
-        assert_eq!(full, join_with(1 << 30, JoinType::Full, &l, &r));
+        assert_eq!(full, run_stream(1 << 30, JoinType::Full, &l, &r));
     }
 }

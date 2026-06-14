@@ -19,10 +19,22 @@ pub(super) use grace::grace_hash_join;
 pub(super) use merge::sort_merge_join;
 pub(super) use nested_loop::{block_nested_loop_join, nested_loop_join};
 
+use crate::catalog::schema::Schema;
 use crate::query::QueryError;
 use crate::query::expression::{BinaryOperator, Expr};
+use crate::query::logical_plan::JoinType;
 use crate::query::physical_plan::PlanNode;
 use crate::storage::types::{Tuple, Value};
+
+/// The join's semantics, bundled so an operator takes a few inputs instead of a
+/// long argument list: the predicate, the join type, and the two input row
+/// shapes (for the schema-driven codec on spilled tuples).
+pub(in crate::query::volcano) struct JoinPlan {
+    pub on: Option<Expr>,
+    pub join_type: JoinType,
+    pub left_schema: Schema,
+    pub right_schema: Schema,
+}
 
 /// The (left, right) join-key positions within their own tuples, parsed from an
 /// equi-join `col = col` predicate. `left` is the left input node, so its arity

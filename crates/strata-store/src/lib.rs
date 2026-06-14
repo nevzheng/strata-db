@@ -28,7 +28,8 @@ pub use filesystem::{TupleRef, TupleView};
 // Re-export the scratch-workspace surface so the execution engine can buffer
 // and spill join/sort intermediates without depending on `filesystem` directly.
 pub use filesystem::{
-    FileWorkspace, MemoryWorkspace, TupleBytes, Workspace, WorkspaceBlock, WorkspaceLoc,
+    FileWorkspace, FileWorkspaceTuples, MemoryWorkspace, TupleBytes, Workspace, WorkspaceBlock,
+    WorkspaceLoc,
 };
 
 /// The memtable types, kept under a `memstore` path for dependents.

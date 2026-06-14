@@ -48,7 +48,8 @@ pub use memory::{MemoryPool, OutOfMemory, Slab};
 // Workspace — bounded, journal-less scratch tuple storage (memory or file
 // spill), behind the `Workspace` trait.
 pub use workspace::{
-    FileWorkspace, MemoryWorkspace, TupleBytes, Workspace, WorkspaceBlock, WorkspaceLoc,
+    FileWorkspace, FileWorkspaceTuples, MemoryWorkspace, TupleBytes, Workspace, WorkspaceBlock,
+    WorkspaceLoc,
 };
 
 // Codec — the on-disk serialization vocabulary (used by page types and the LSM).
