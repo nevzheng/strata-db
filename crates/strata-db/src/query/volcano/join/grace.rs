@@ -51,7 +51,7 @@
 //! and almost never spills. See [`JoinConfig`], carried on the [`QueryContext`].
 
 // FIXME(nlz): this implementation is incorrect. It does not clearlt and correctly
-// consume the selected stream into a hash map. And then probe it properly. 
+// consume the selected stream into a hash map. And then probe it properly.
 //
 //   1. Take only ONE side and build its hash map (in full).
 //   2. Stream the LEFT side against that map and emit matching tuples.
