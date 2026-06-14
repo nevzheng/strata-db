@@ -1,28 +1,49 @@
-//! Grace hash join — equi-joins of any type, built to keep the hash table in
-//! memory at any scale and to *stream* its output.
+//! Grace hash join — equi-joins of any type, in two cleanly separated phases.
 //!
-//! Partitioning is a pipeline breaker: both inputs are consumed up front and
-//! hash-partitioned to disk (sequential writes), so equal keys co-locate and
-//! each partition pair is an independent join over ~1/N of the data. Everything
-//! after that streams — [`GraceHashStream`] is a real lazy iterator, not a
-//! materialized `Vec` wrapped in a stream.
+//! The algorithm splits in half, and so does this file:
 //!
-//! For each partition pair we **build the hash table from the smaller side**
-//! (the build side must fit in memory; the smaller it is, the more often it
-//! does) and **probe by streaming the larger side one tuple at a time** — the
-//! probe side is never held in memory.
+//! 1. **Build phase** ([`build`] + [`choose_build_side`]). We hash-partition both
+//!    inputs to disk up front — a pipeline breaker — so equal keys co-locate in
+//!    the same bucket and each bucket pair is an independent join over ~1/N of the
+//!    data. For each pair we load the *smaller* side into an in-memory hash index
+//!    keyed by the join-key bytes (the build side; the smaller it is, the more
+//!    often it fits). A bucket whose spilled size — read straight off the file
+//!    store stat, [`Workspace::used`] — exceeds the in-memory budget is
+//!    redistributed into sub-buckets with a fresh hash seed (so keys actually
+//!    move instead of re-colliding) and retried, up to a small cap.
 //!
-//! We don't predict the fit — we **build the table and measure it**, bailing
-//! the moment the materialized rows outgrow the budget. An oversized partition
-//! is then **repartitioned** with a fresh hash seed (so keys actually
-//! redistribute instead of re-colliding) and retried, up to a small cap. A
-//! partition that even repartitioning can't split is a single key value larger
-//! than the budget; on the last attempt we build it in memory anyway rather than
-//! spill the table to disk — one big in-memory map is O(n+m) with no random I/O,
-//! where a disk-resident hash table would be random reads, the worst case.
+//! 2. **Probe phase** ([`Probe`] + [`probe_one`]). We stream the *other*,
+//!    larger bucket one tuple at a time, look each up in the hash index, and emit
+//!    the matches. Nothing is materialized — [`GraceHashStream`] is a real lazy
+//!    iterator, and the probe side is never held in memory.
+//!
+//! The two phases never share a type: [`build`] returns a [`HashTable`], and the
+//! probe phase consumes it inside a [`Probe`]. The orchestrating iterator runs
+//! one bucket pair through build-then-probe before moving to the next.
+//!
+//! A bucket that even repartitioning can't split is a single key value larger
+//! than the budget; at the recursion cap we build it in memory anyway rather than
+//! spill the hash table to disk — one big in-memory map is O(n+m) with no random
+//! I/O, where a disk-resident table would be all random reads, the worst case.
 //!
 //! NULL keys can never match, so they bypass partitioning entirely; outer joins
 //! still emit them, NULL-padded, as unmatched rows.
+
+// FIXME(grace): this implementation is NOT up to par — do not trust it; it needs
+// a rewrite before it's wired into the planner. Review notes (2026-06-14):
+//
+//  1. The build phase doesn't stream. We eagerly partition BOTH inputs to disk
+//     up front, materializing the left *and* the right side. We should instead
+//     pick ONE stream as the build side and build its hash map while streaming —
+//     not pull both sides into spill files first.
+//  2. The hash-table structure is wrong. `HashMap<Vec<u8>, Vec<usize>>` plus the
+//     parallel `rows` / `matched` vectors needs to be redesigned.
+//  3. Repartitioning is bolted on. `repartition` is a whole second function that
+//     re-splits a bucket; it should split a bucket into sub-buckets in place, and
+//     ideally share/merge code with the initial partition pass instead of
+//     duplicating it.
+//
+// Bottom line: rework the build/repartition path — see notes 1–3 above.
 
 use std::collections::HashMap;
 
@@ -33,36 +54,29 @@ use crate::catalog::schema::Schema;
 use crate::query::executor::RowStream;
 use crate::query::logical_plan::JoinType;
 use crate::query::physical_plan::PlanNode;
-use crate::query::{QueryContext, QueryError};
+use crate::query::{JoinConfig, QueryContext, QueryError};
 use crate::storage::types::{Tuple, Value};
 
-// Renamed on import so it can't be confused with the hash-join *build* phase:
+// Renamed on import so it can't be confused with the hash-join *build phase*:
 // this materializes a volcano input stream (for partitioning), it does not build
 // a hash table.
 use super::super::build as build_input;
 use super::{JoinPlan, concat, equi_keys, output_arity, pad_left, pad_right};
 
-/// Fan-out per partitioning pass. Equal keys hash to the same partition, so the
-/// join decomposes into this many independent, smaller joins.
-const HASH_PARTITIONS: usize = 16;
-/// In-RAM working set per partition file; full pages spill to disk and the RAM
-/// is reused, so this is the per-partition write buffer, not its capacity.
-const PARTITION_MEMORY: usize = 64 * 1024;
-/// Per-partition on-disk ceiling — the spill backstop.
-const PARTITION_DISK: usize = 1 << 30;
-/// Build-side memory ceiling: a hash table whose materialized rows exceed this
-/// many bytes is abandoned and its partition repartitioned. Counts encoded
-/// bytes; the live table costs a few× more, so this is conservative.
-const BUILD_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
-/// Cap on repartitioning retries. Past this, a still-oversized partition is
+// Bucket sizing — fan-out, partition buffers, and the build-side memory ceiling
+// — is per-query and machine-derived; it lives in [`JoinConfig`], carried on the
+// `QueryContext`. The two constants below are algorithmic, not resource limits,
+// so they stay fixed.
+
+/// Cap on repartitioning retries. Past this, a still-oversized bucket is
 /// irreducible skew (one key value) — built in memory anyway. Small on purpose:
 /// each pass rewrites the data, and >2 rarely helps once a single key dominates.
 const MAX_REPARTITION_LEVELS: usize = 2;
-/// Base seed for partition routing (per the slab-bucket convention); each
-/// recursion level mixes in its depth so re-hashing actually redistributes.
+/// Base seed for bucket routing; each recursion level mixes in its depth so
+/// re-hashing actually redistributes instead of re-colliding.
 const BUCKET_SEED: u64 = 0xdead_beef_cafe_babe;
 
-/// The join-invariant state shared across all partitions.
+/// The join-invariant state shared across all buckets.
 struct HashJoinParams {
     join_type: JoinType,
     /// Join-key column within the left / right tuple.
@@ -74,12 +88,34 @@ struct HashJoinParams {
     /// The schema-driven codec for each side's spilled tuples.
     left_schema: Schema,
     right_schema: Schema,
-    /// Build-side fit threshold (a field so tests can shrink it).
-    build_budget: usize,
+    /// Machine-derived scratch sizing (partition buffers, build-side budget,
+    /// fan-out). Carried here so the stream's helpers read one source of truth;
+    /// tests shrink it to force spilling/repartitioning.
+    config: JoinConfig,
+}
+
+impl HashJoinParams {
+    /// Codec + key column of the side we build the hash table on.
+    fn build_of(&self, build_is_left: bool) -> (&Schema, usize) {
+        if build_is_left {
+            (&self.left_schema, self.left_key)
+        } else {
+            (&self.right_schema, self.right_key)
+        }
+    }
+    /// Codec + key column of the side we stream-probe.
+    fn probe_of(&self, build_is_left: bool) -> (&Schema, usize) {
+        if build_is_left {
+            (&self.right_schema, self.right_key)
+        } else {
+            (&self.left_schema, self.left_key)
+        }
+    }
 }
 
 /// Grace hash join. Partitions eagerly (consuming the inputs), then returns a
-/// lazy stream over the partitions. See the module docs.
+/// lazy stream that runs each bucket pair through build-then-probe. See the
+/// module docs.
 pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
     left: PlanNode,
     right: PlanNode,
@@ -87,6 +123,7 @@ pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
     ctx: &'ctx QueryContext<'_>,
 ) -> Result<RowStream<'ctx>, QueryError> {
     let (left_key, right_key) = equi_keys(&plan.on, &left)?;
+    let config = ctx.join_config();
     let params = HashJoinParams {
         join_type: plan.join_type,
         left_key,
@@ -95,46 +132,47 @@ pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
         right_width: output_arity(&right),
         left_schema: plan.left_schema,
         right_schema: plan.right_schema,
-        build_budget: BUILD_MEMORY_BUDGET,
+        config,
     };
 
     // Pipeline breaker: partition both inputs to disk now (consuming the volcano
     // input streams). NULL keys can't match, so they sit out of partitioning;
-    // outer joins emit them (padded) once the partitions are drained.
-    let mut left_parts = new_partitions()?;
-    let mut right_parts = new_partitions()?;
+    // outer joins emit them (padded) once the buckets are drained.
+    let mut left_parts = new_buckets(&config)?;
+    let mut right_parts = new_buckets(&config)?;
     let mut left_nulls: Vec<Tuple> = Vec::new();
     let mut right_nulls: Vec<Tuple> = Vec::new();
+    partition_input(
+        build_input(left, ctx)?,
+        params.left_key,
+        &params.left_schema,
+        config.hash_partitions,
+        &mut left_parts,
+        &mut left_nulls,
+    )?;
+    partition_input(
+        build_input(right, ctx)?,
+        params.right_key,
+        &params.right_schema,
+        config.hash_partitions,
+        &mut right_parts,
+        &mut right_nulls,
+    )?;
 
-    for row in build_input(left, ctx)? {
-        let tuple = row?;
-        match key_bytes(&tuple.values[params.left_key])? {
-            None => left_nulls.push(tuple),
-            Some(k) => spill(
-                &mut left_parts[bucket(&k, 0)],
-                &params.left_schema.encode(&tuple),
-            )?,
-        }
+    // Pick which input becomes the hash-table (build) side, then pair buckets as
+    // (build, probe) so the rest of the stream never re-decides.
+    let build_is_left = choose_build_side(&left_parts, &right_parts);
+    let worklist: Vec<_> = if build_is_left {
+        left_parts.into_iter().zip(right_parts)
+    } else {
+        right_parts.into_iter().zip(left_parts)
     }
-    for row in build_input(right, ctx)? {
-        let tuple = row?;
-        match key_bytes(&tuple.values[params.right_key])? {
-            None => right_nulls.push(tuple),
-            Some(k) => spill(
-                &mut right_parts[bucket(&k, 0)],
-                &params.right_schema.encode(&tuple),
-            )?,
-        }
-    }
-
-    let worklist = left_parts
-        .into_iter()
-        .zip(right_parts)
-        .map(|(l, r)| (l, r, 0usize))
-        .collect();
+    .map(|(build, probe)| (build, probe, 0usize))
+    .collect();
 
     Ok(RowStream::new(GraceHashStream {
         params,
+        build_is_left,
         worklist,
         current: None,
         left_nulls: left_nulls.into_iter(),
@@ -143,43 +181,24 @@ pub(in crate::query::volcano) fn grace_hash_join<'ctx>(
     }))
 }
 
-/// Lazy stream over the partitioned join. Pulls one partition pair off the
-/// worklist at a time (repartitioning oversized ones), builds the smaller side's
-/// table, then yields probe matches one at a time.
+/// Lazy stream over the partitioned join. Pulls one `(build, probe)` bucket pair
+/// off the worklist at a time, runs the **build phase** to get a [`HashTable`],
+/// then enters the **probe phase**, yielding matches one at a time.
 struct GraceHashStream {
     params: HashJoinParams,
-    /// Pending `(left, right, level)` partition pairs. `level` is how many times
+    /// Whether the build side is the join's *left* input. Fixed once, globally,
+    /// so output and NULL-padding always orient as `left ++ right`.
+    build_is_left: bool,
+    /// Pending `(build, probe, level)` bucket pairs. `level` is how many times
     /// these inputs have already been (re)partitioned — it seeds the next hash
     /// and bounds the recursion.
     worklist: Vec<(FileWorkspace, FileWorkspace, usize)>,
-    /// The partition currently being probed, if any.
+    /// The bucket currently in its probe phase, if any.
     current: Option<Probe>,
     /// NULL-keyed input rows, emitted (padded) by the outer sides at the end.
     left_nulls: std::vec::IntoIter<Tuple>,
     right_nulls: std::vec::IntoIter<Tuple>,
     failed: bool,
-}
-
-/// One partition's build-side hash table plus the streaming probe cursor.
-struct Probe {
-    /// key bytes → indices into `build_rows`. Full key bytes are compared, so a
-    /// hash collision is never mistaken for a match.
-    table: HashMap<Vec<u8>, Vec<usize>>,
-    build_rows: Vec<Tuple>,
-    build_matched: Vec<bool>,
-    /// Whether the build side is the join's *left* input (so output and padding
-    /// go the right direction regardless of which side we chose to build on).
-    build_is_left: bool,
-    /// The larger side, streamed one tuple at a time.
-    probe: FileWorkspaceTuples,
-    /// Output rows buffered for the current probe row (one probe row can match
-    /// several build rows).
-    pending: std::vec::IntoIter<Tuple>,
-    /// `true` while consuming the probe side; `false` during the post-probe pass
-    /// over unmatched build rows (outer joins).
-    probing: bool,
-    /// Cursor into `build_matched` for that unmatched-build pass.
-    drain: usize,
 }
 
 impl Iterator for GraceHashStream {
@@ -196,12 +215,14 @@ impl Iterator for GraceHashStream {
             {
                 return Some(Ok(tuple));
             }
-            // 2. Advance the current partition.
+            // 2. Advance the current bucket's probe phase.
             if let Some(state) = self.current.as_mut() {
                 if state.probing {
-                    match state.probe.next() {
+                    match state.cursor.next() {
                         Some(bytes) => {
-                            if let Err(e) = probe_one(&self.params, state, &bytes) {
+                            if let Err(e) =
+                                probe_one(&self.params, self.build_is_left, state, &bytes)
+                            {
                                 self.failed = true;
                                 return Some(Err(e));
                             }
@@ -212,16 +233,18 @@ impl Iterator for GraceHashStream {
                             continue;
                         }
                     }
-                } else if let Some(tuple) = next_unmatched_build(&self.params, state) {
+                } else if let Some(tuple) =
+                    next_unmatched_build(&self.params, self.build_is_left, state)
+                {
                     return Some(Ok(tuple));
                 } else {
-                    self.current = None; // partition fully drained
+                    self.current = None; // bucket fully drained
                     continue;
                 }
             }
-            // 3. No current partition: load the next (may repartition), else
-            //    fall through to the NULL-row tail.
-            match self.load_next_partition() {
+            // 3. No current bucket: run the build phase on the next one (which may
+            //    repartition), else fall through to the NULL-row tail.
+            match self.build_next_bucket() {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
@@ -229,7 +252,7 @@ impl Iterator for GraceHashStream {
                     return Some(Err(e));
                 }
             }
-            // 4. Partitions exhausted — emit NULL-keyed rows for the outer sides.
+            // 4. Buckets exhausted — emit NULL-keyed rows for the outer sides.
             if matches!(self.params.join_type, JoinType::Left | JoinType::Full)
                 && let Some(t) = self.left_nulls.next()
             {
@@ -246,136 +269,151 @@ impl Iterator for GraceHashStream {
 }
 
 impl GraceHashStream {
-    /// Pop the next partition pair, repartitioning while the smaller side is over
-    /// budget and we still have recursion levels left. Sets `self.current` and
-    /// returns `Ok(true)` when a partition is ready, `Ok(false)` when the
-    /// worklist is empty.
-    fn load_next_partition(&mut self) -> Result<bool, QueryError> {
-        while let Some((left_ws, right_ws, level)) = self.worklist.pop() {
-            // Build the table from the smaller side (cheap `used()` heuristic);
-            // stream-probe the larger.
-            let build_is_left = left_ws.used() <= right_ws.used();
-            let (build_ws, probe_ws, build_schema, build_key) = if build_is_left {
-                (
-                    left_ws,
-                    right_ws,
-                    &self.params.left_schema,
-                    self.params.left_key,
-                )
-            } else {
-                (
-                    right_ws,
-                    left_ws,
-                    &self.params.right_schema,
-                    self.params.right_key,
-                )
-            };
-
-            // Try to build it in memory, bailing if it outgrows the budget. Out
-            // of retries, build unconditionally (irreducible single-key skew).
-            let cap = (level < MAX_REPARTITION_LEVELS).then_some(self.params.build_budget);
-            let built = build_table(&build_ws, build_schema, build_key, cap)?;
-
-            let Some((table, build_rows, build_matched)) = built else {
-                // Didn't fit — repartition both sides with a fresh seed (so keys
-                // redistribute) and retry one level deeper.
+    /// Run the **build phase** on the next bucket pair: redistribute it while the
+    /// build side is over budget and recursion levels remain, otherwise build the
+    /// hash table and hand off to the probe phase (sets `self.current`). Returns
+    /// `Ok(true)` when a bucket is ready to probe, `Ok(false)` when the worklist
+    /// is empty.
+    fn build_next_bucket(&mut self) -> Result<bool, QueryError> {
+        let build_is_left = self.build_is_left;
+        let (build_schema, build_key) = self.params.build_of(build_is_left);
+        while let Some((build_ws, probe_ws, level)) = self.worklist.pop() {
+            // Fit decision: consult the file store stat (`used()` — page-granular
+            // bytes spilled). Over budget and levels left ⇒ redistribute both
+            // sides into sub-buckets with a fresh seed and retry one level deeper.
+            if build_ws.used() > self.params.config.build_budget && level < MAX_REPARTITION_LEVELS {
+                let (probe_schema, probe_key) = self.params.probe_of(build_is_left);
                 let next = level + 1;
-                let (probe_schema, probe_key) = if build_is_left {
-                    (&self.params.right_schema, self.params.right_key)
-                } else {
-                    (&self.params.left_schema, self.params.left_key)
-                };
-                let build_sub = repartition(&build_ws, build_key, build_schema, next)?;
-                let probe_sub = repartition(&probe_ws, probe_key, probe_schema, next)?;
-                drop(build_ws); // free the parent partitions' temp files now
+                let config = &self.params.config;
+                let build_sub = repartition(&build_ws, build_key, build_schema, next, config)?;
+                let probe_sub = repartition(&probe_ws, probe_key, probe_schema, next, config)?;
+                drop(build_ws); // free the parent buckets' temp files now
                 drop(probe_ws);
                 for (b, p) in build_sub.into_iter().zip(probe_sub) {
-                    // Restore left/right roles so output stays left ++ right.
-                    let pair = if build_is_left { (b, p) } else { (p, b) };
-                    self.worklist.push((pair.0, pair.1, next));
+                    self.worklist.push((b, p, next));
                 }
                 continue;
-            };
+            }
+
+            // BUILD PHASE: materialize the (smaller) bucket into a hash index. At
+            // the recursion cap an over-budget bucket is built anyway — it's
+            // irreducible single-key skew that no reseed can split.
+            let table = build(&build_ws, build_schema, build_key)?;
             drop(build_ws); // table is materialized; the file is no longer needed
 
-            self.current = Some(Probe {
-                table,
-                build_rows,
-                build_matched,
-                build_is_left,
-                probe: probe_ws.into_tuples(),
-                pending: Vec::new().into_iter(),
-                probing: true,
-                drain: 0,
-            });
+            // Hand off to the PROBE PHASE.
+            self.current = Some(Probe::new(table, probe_ws.into_tuples()));
             return Ok(true);
         }
         Ok(false)
     }
 }
 
-/// Build a hash table from one partition side — the obvious build phase: decode
-/// each tuple, index it by its join-key bytes. Returns the table, the rows it
-/// points into, and a per-row matched bitmap (for outer joins).
-///
-/// With `cap = Some(budget)`, gives up (returns `None`) once the materialized
-/// rows exceed `budget` bytes, so the caller can repartition instead of holding
-/// an oversized table; `cap = None` builds unconditionally.
-type BuiltTable = (HashMap<Vec<u8>, Vec<usize>>, Vec<Tuple>, Vec<bool>);
-fn build_table(
-    ws: &FileWorkspace,
-    schema: &Schema,
-    key: usize,
-    cap: Option<usize>,
-) -> Result<Option<BuiltTable>, QueryError> {
-    let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+// ---------------------------------------------------------------------------
+// Build phase
+// ---------------------------------------------------------------------------
+
+/// Pick which input becomes the build (hash-table) side. We prefer to build the
+/// *smaller* side — a smaller table fits in memory more often and is cheaper to
+/// hold while probing — estimated here by total bytes spilled per side. A
+/// deliberately simple heuristic; this is the seam where a real cardinality
+/// estimate plugs in. `true` ⇒ build the LEFT side.
+fn choose_build_side(left: &[FileWorkspace], right: &[FileWorkspace]) -> bool {
+    let total = |parts: &[FileWorkspace]| parts.iter().map(Workspace::used).sum::<usize>();
+    total(left) <= total(right)
+}
+
+/// The build phase's product: an in-memory hash index over one bucket's rows.
+struct HashTable {
+    /// key bytes → indices into `rows`. Full key bytes are compared on probe, so
+    /// a hash collision is never mistaken for a match.
+    index: HashMap<Vec<u8>, Vec<usize>>,
+    rows: Vec<Tuple>,
+    /// Per-row matched bitmap, for the outer-join unmatched-build pass.
+    matched: Vec<bool>,
+}
+
+/// **Build phase.** Load every tuple of `bucket` into a [`HashTable`] keyed by
+/// its join-key bytes. Whether the bucket fits was decided by the caller off the
+/// file store stat, so this just builds — at the recursion cap it builds an
+/// over-budget bucket anyway (irreducible single-key skew).
+fn build(bucket: &FileWorkspace, schema: &Schema, key: usize) -> Result<HashTable, QueryError> {
+    let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
     let mut rows: Vec<Tuple> = Vec::new();
     let mut matched: Vec<bool> = Vec::new();
-    let mut used = 0usize;
-    for bytes in ws.tuples() {
-        // Measure the real build as we go; bail the moment it won't fit.
-        used += bytes.len();
-        if let Some(budget) = cap
-            && used > budget
-        {
-            return Ok(None);
-        }
+    for bytes in bucket.tuples() {
         let tuple = schema.decode(&bytes)?;
         let k = key_bytes(&tuple.values[key])?.expect("null keys never partition");
-        table.entry(k).or_default().push(rows.len());
+        index.entry(k).or_default().push(rows.len());
         matched.push(false);
         rows.push(tuple);
     }
-    Ok(Some((table, rows, matched)))
+    Ok(HashTable {
+        index,
+        rows,
+        matched,
+    })
 }
 
-/// Probe one streamed tuple against the build table, buffering its output rows
-/// into `state.pending` (matches, or one NULL-padded row if it's an unmatched
-/// outer-side row).
-fn probe_one(params: &HashJoinParams, state: &mut Probe, bytes: &[u8]) -> Result<(), QueryError> {
-    // The probe side is whichever input we didn't build on.
-    let (probe_schema, probe_key) = if state.build_is_left {
-        (&params.right_schema, params.right_key)
-    } else {
-        (&params.left_schema, params.left_key)
-    };
+// ---------------------------------------------------------------------------
+// Probe phase
+// ---------------------------------------------------------------------------
+
+/// One bucket's probe phase: the built hash table plus the streaming probe
+/// cursor over the opposite bucket.
+struct Probe {
+    table: HashTable,
+    /// The larger side, streamed one tuple at a time (never materialized).
+    cursor: FileWorkspaceTuples,
+    /// Output rows buffered for the current probe row (one probe row can match
+    /// several build rows).
+    pending: std::vec::IntoIter<Tuple>,
+    /// `true` while consuming the probe side; `false` during the post-probe pass
+    /// over unmatched build rows (outer joins).
+    probing: bool,
+    /// Cursor into `table.matched` for that unmatched-build pass.
+    drain: usize,
+}
+
+impl Probe {
+    fn new(table: HashTable, cursor: FileWorkspaceTuples) -> Self {
+        Probe {
+            table,
+            cursor,
+            pending: Vec::new().into_iter(),
+            probing: true,
+            drain: 0,
+        }
+    }
+}
+
+/// **Probe phase.** Probe one streamed tuple against the build table, buffering
+/// its output rows into `state.pending` (matches, or one NULL-padded row if it's
+/// an unmatched outer-side row).
+fn probe_one(
+    params: &HashJoinParams,
+    build_is_left: bool,
+    state: &mut Probe,
+    bytes: &[u8],
+) -> Result<(), QueryError> {
+    let (probe_schema, probe_key) = params.probe_of(build_is_left);
     let probe = probe_schema.decode(bytes)?;
     let key = key_bytes(&probe.values[probe_key])?.expect("null keys never partition");
 
-    let hits = state.table.get(&key).cloned().unwrap_or_default();
+    let hits = state.table.index.get(&key).cloned().unwrap_or_default();
     let mut out: Vec<Tuple> = Vec::with_capacity(hits.len());
     for i in hits {
-        state.build_matched[i] = true;
+        state.table.matched[i] = true;
         // Output is always left ++ right, whichever side we built on.
-        out.push(if state.build_is_left {
-            concat(&state.build_rows[i], &probe)
+        out.push(if build_is_left {
+            concat(&state.table.rows[i], &probe)
         } else {
-            concat(&probe, &state.build_rows[i])
+            concat(&probe, &state.table.rows[i])
         });
     }
     if out.is_empty() {
         // Unmatched probe row, kept only by the outer side it belongs to.
-        if state.build_is_left {
+        if build_is_left {
             // probe side is the RIGHT input
             if matches!(params.join_type, JoinType::Right | JoinType::Full) {
                 out.push(pad_left(params.left_width, &probe));
@@ -391,8 +429,12 @@ fn probe_one(params: &HashJoinParams, state: &mut Probe, bytes: &[u8]) -> Result
 
 /// The next build row that nothing probed, padded for the outer side it belongs
 /// to — the post-probe pass. Advances `state.drain`; `None` when exhausted.
-fn next_unmatched_build(params: &HashJoinParams, state: &mut Probe) -> Option<Tuple> {
-    let keeps_unmatched = if state.build_is_left {
+fn next_unmatched_build(
+    params: &HashJoinParams,
+    build_is_left: bool,
+    state: &mut Probe,
+) -> Option<Tuple> {
+    let keeps_unmatched = if build_is_left {
         matches!(params.join_type, JoinType::Left | JoinType::Full)
     } else {
         matches!(params.join_type, JoinType::Right | JoinType::Full)
@@ -400,49 +442,80 @@ fn next_unmatched_build(params: &HashJoinParams, state: &mut Probe) -> Option<Tu
     if !keeps_unmatched {
         return None;
     }
-    while state.drain < state.build_matched.len() {
+    while state.drain < state.table.matched.len() {
         let i = state.drain;
         state.drain += 1;
-        if !state.build_matched[i] {
-            return Some(if state.build_is_left {
-                pad_right(&state.build_rows[i], params.right_width)
+        if !state.table.matched[i] {
+            return Some(if build_is_left {
+                pad_right(&state.table.rows[i], params.right_width)
             } else {
-                pad_left(params.left_width, &state.build_rows[i])
+                pad_left(params.left_width, &state.table.rows[i])
             });
         }
     }
     None
 }
 
-/// Re-spill a partition into a fresh set of sub-partitions, hashing the join key
-/// at `level`'s seed. The encoded bytes are re-spilled as-is (decode only to
-/// read the key) — no re-encode.
+// ---------------------------------------------------------------------------
+// Partitioning
+// ---------------------------------------------------------------------------
+
+/// Hash-partition a freshly-decoded input stream into `parts`, setting NULL-keyed
+/// rows aside (they can never match). The first partitioning pass, at level 0.
+fn partition_input(
+    rows: impl Iterator<Item = Result<Tuple, QueryError>>,
+    key: usize,
+    schema: &Schema,
+    hash_partitions: usize,
+    parts: &mut [FileWorkspace],
+    nulls: &mut Vec<Tuple>,
+) -> Result<(), QueryError> {
+    for row in rows {
+        let tuple = row?;
+        match key_bytes(&tuple.values[key])? {
+            None => nulls.push(tuple),
+            Some(k) => spill(
+                &mut parts[bucket(&k, 0, hash_partitions)],
+                &schema.encode(&tuple),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Re-spill a bucket into a fresh set of sub-buckets, hashing the join key at
+/// `level`'s seed. The encoded bytes are re-spilled as-is (decode only to read
+/// the key) — no re-encode.
 fn repartition(
     src: &FileWorkspace,
     key: usize,
     schema: &Schema,
     level: usize,
+    config: &JoinConfig,
 ) -> Result<Vec<FileWorkspace>, QueryError> {
-    let mut parts = new_partitions()?;
+    let mut parts = new_buckets(config)?;
     for bytes in src.tuples() {
         let tuple = schema.decode(&bytes)?;
         let k = key_bytes(&tuple.values[key])?.expect("null keys never partition");
-        spill(&mut parts[bucket(&k, level)], &bytes)?;
+        spill(
+            &mut parts[bucket(&k, level, config.hash_partitions)],
+            &bytes,
+        )?;
     }
     Ok(parts)
 }
 
-/// `HASH_PARTITIONS` spilling file workspaces.
-fn new_partitions() -> Result<Vec<FileWorkspace>, QueryError> {
-    (0..HASH_PARTITIONS)
+/// `config.hash_partitions` spilling file workspaces, sized by `config`.
+fn new_buckets(config: &JoinConfig) -> Result<Vec<FileWorkspace>, QueryError> {
+    (0..config.hash_partitions)
         .map(|_| {
-            FileWorkspace::new(PARTITION_MEMORY, PARTITION_DISK)
-                .map_err(|e| QueryError::Internal(format!("hash join partition: {e}")))
+            FileWorkspace::new(config.partition_memory, config.partition_disk)
+                .map_err(|e| QueryError::Internal(format!("hash join bucket: {e}")))
         })
         .collect()
 }
 
-/// Append an encoded tuple to a partition, mapping a full workspace to a query
+/// Append an encoded tuple to a bucket, mapping a full workspace to a query
 /// error.
 fn spill(part: &mut FileWorkspace, bytes: &[u8]) -> Result<(), QueryError> {
     part.append(bytes)
@@ -450,12 +523,12 @@ fn spill(part: &mut FileWorkspace, bytes: &[u8]) -> Result<(), QueryError> {
         .map_err(|e| QueryError::Internal(format!("hash join spill: {e}")))
 }
 
-/// The partition `key` routes to at this recursion `level`. xxh3's per-call seed
-/// gives each level an independent hash, so a repartition genuinely
-/// redistributes instead of re-colliding into the same bucket.
-fn bucket(key: &[u8], level: usize) -> usize {
+/// The bucket `key` routes to at this recursion `level`. xxh3's per-call seed
+/// gives each level an independent hash, so a repartition genuinely redistributes
+/// instead of re-colliding into the same bucket.
+fn bucket(key: &[u8], level: usize, hash_partitions: usize) -> usize {
     let seed = BUCKET_SEED ^ (level as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (xxh3_64_with_seed(key, seed) as usize) % HASH_PARTITIONS
+    (xxh3_64_with_seed(key, seed) as usize) % hash_partitions
 }
 
 /// A join key's canonical bytes (order-preserving encoding), or `None` for NULL.
@@ -485,10 +558,21 @@ mod tests {
         }
     }
 
+    /// Small, fixed scratch sizing with a caller-set build budget — the seam the
+    /// tests use (in place of machine-derived limits) to force spill/repartition.
+    fn test_config(build_budget: usize) -> JoinConfig {
+        JoinConfig {
+            partition_memory: 64 * 1024,
+            partition_disk: 1 << 30,
+            build_budget,
+            hash_partitions: 16,
+        }
+    }
+
     /// A file workspace filled with `(id, k)` rows encoded by [`schema`].
     fn ws(rows: &[(i32, i32)]) -> FileWorkspace {
         let s = schema();
-        let mut w = FileWorkspace::new(PARTITION_MEMORY, PARTITION_DISK).unwrap();
+        let mut w = FileWorkspace::new(64 * 1024, 1 << 30).unwrap();
         for &(id, k) in rows {
             let t = Tuple {
                 values: vec![Value::Int32(id), Value::Int32(k)],
@@ -498,7 +582,7 @@ mod tests {
         w
     }
 
-    /// Drive the lazy stream over a single partition pair with the given build
+    /// Drive the lazy stream over a single bucket pair with the given build
     /// budget; sorted for order-independent comparison.
     fn run_stream(budget: usize, jt: JoinType, l: &[(i32, i32)], r: &[(i32, i32)]) -> Vec<Tuple> {
         let params = HashJoinParams {
@@ -509,11 +593,24 @@ mod tests {
             right_width: 2,
             left_schema: schema(),
             right_schema: schema(),
-            build_budget: budget,
+            config: test_config(budget),
+        };
+        let left_ws = ws(l);
+        let right_ws = ws(r);
+        // Mirror `choose_build_side` so the pair is ordered (build, probe).
+        let build_is_left = choose_build_side(&[left_ws], &[right_ws]);
+        // `ws()` returns by value; rebuild since `choose_build_side` borrowed.
+        let left_ws = ws(l);
+        let right_ws = ws(r);
+        let pair = if build_is_left {
+            (left_ws, right_ws, 0)
+        } else {
+            (right_ws, left_ws, 0)
         };
         let stream = GraceHashStream {
             params,
-            worklist: vec![(ws(l), ws(r), 0)],
+            build_is_left,
+            worklist: vec![pair],
             current: None,
             left_nulls: Vec::new().into_iter(),
             right_nulls: Vec::new().into_iter(),
@@ -525,10 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn repartitioning_preserves_results() {
-        // Many rows over 200 keys: a small budget forces a repartition pass,
-        // then each sub-partition builds in memory. Result must equal the
-        // single-pass (huge-budget) join, for every join type.
+    fn recursion_preserves_results() {
+        // A sub-page budget forces every non-empty bucket over budget, so the
+        // build phase repartitions (twice) before building anyway. The result
+        // must equal the single-pass (huge-budget) join, for every join type —
+        // which also proves repartitioned sub-buckets stay correctly paired.
         let l: Vec<(i32, i32)> = (0..2000).map(|i| (i, i % 200)).collect();
         let r: Vec<(i32, i32)> = (0..2000).map(|i| (i, i % 200)).collect();
         for jt in [
@@ -537,10 +635,24 @@ mod tests {
             JoinType::Right,
             JoinType::Full,
         ] {
-            let repartitioned = run_stream(8 * 1024, jt, &l, &r);
+            let recursed = run_stream(1, jt, &l, &r);
             let single_pass = run_stream(1 << 30, jt, &l, &r);
-            assert_eq!(repartitioned, single_pass, "{jt:?} repartition mismatch");
+            assert_eq!(recursed, single_pass, "{jt:?} recursion mismatch");
         }
+    }
+
+    #[test]
+    fn fit_after_repartition() {
+        // A build bucket that spans several pages but whose keys redistribute:
+        // with a one-page budget the first pass is over budget and repartitions,
+        // and each sub-bucket then fits and builds. ~3200 keys keeps the output
+        // bounded while still overflowing a single bucket's first page.
+        let l: Vec<(i32, i32)> = (0..16000).map(|i| (i, i % 3200)).collect();
+        let r: Vec<(i32, i32)> = (0..16000).map(|i| (i, i % 3200)).collect();
+        let one_page = 8 * 1024;
+        let repartitioned = run_stream(one_page, JoinType::Inner, &l, &r);
+        let single_pass = run_stream(1 << 30, JoinType::Inner, &l, &r);
+        assert_eq!(repartitioned, single_pass);
     }
 
     #[test]
@@ -561,7 +673,7 @@ mod tests {
         // memory anyway, producing the full cartesian product.
         let l: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
         let r: Vec<(i32, i32)> = (0..40).map(|i| (i, 7)).collect();
-        let skewed = run_stream(64, JoinType::Inner, &l, &r); // < 1 page → max recursion
+        let skewed = run_stream(1, JoinType::Inner, &l, &r); // sub-page → max recursion
         assert_eq!(skewed.len(), 40 * 40);
         assert_eq!(skewed, run_stream(1 << 30, JoinType::Inner, &l, &r));
     }
@@ -572,7 +684,7 @@ mod tests {
         // survives, padded, even through the recursion.
         let l: Vec<(i32, i32)> = (0..30).map(|i| (i, 7)).collect();
         let r: Vec<(i32, i32)> = (0..30).map(|i| (i, 9)).collect();
-        let full = run_stream(64, JoinType::Full, &l, &r);
+        let full = run_stream(1, JoinType::Full, &l, &r);
         assert_eq!(full.len(), 60);
         assert_eq!(full, run_stream(1 << 30, JoinType::Full, &l, &r));
     }
