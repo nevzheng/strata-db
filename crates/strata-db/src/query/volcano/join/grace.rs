@@ -50,9 +50,8 @@
 //! from 25% of available system memory so a 48 GB host gets a ~3 GB build budget
 //! and almost never spills. See [`JoinConfig`], carried on the [`QueryContext`].
 
-// FIXME(grace): MARKED WRONG by the author — do not trust this; rework pending
-// review. The intended shape is a plain single-build hash join, not this
-// partitioning machinery:
+// FIXME(nlz): this implementation is incorrect. It does not clearlt and correctly
+// consume the selected stream into a hash map. And then probe it properly. 
 //
 //   1. Take only ONE side and build its hash map (in full).
 //   2. Stream the LEFT side against that map and emit matching tuples.
