@@ -1,0 +1,53 @@
+# CAST(x AS ty) / x::ty across the conversion matrix.
+
+# Text -> integer.
+query T
+SELECT CAST('42' AS INT)
+----
+42
+
+# Float -> integer rounds; :: shorthand.
+query T
+SELECT 1.7::INT
+----
+2
+
+# Integer -> text.
+query T
+SELECT CAST(42 AS TEXT)
+----
+42
+
+# Text -> boolean.
+query T
+SELECT CAST('yes' AS BOOLEAN)
+----
+t
+
+# Text -> date.
+query T
+SELECT CAST('2026-06-13' AS DATE)
+----
+2026-06-13
+
+# Timestamp -> date (drops the time of day).
+query T
+SELECT CAST(TIMESTAMPTZ '2026-06-13 14:30:00+00' AS DATE)
+----
+2026-06-13
+
+# Integer -> double, then compared.
+query T
+SELECT CAST(3 AS DOUBLE PRECISION) > 2.5
+----
+t
+
+# Text -> numeric (exact).
+query T
+SELECT CAST('3.14' AS NUMERIC)
+----
+3.14
+
+# An unconvertible value is a clear error.
+statement error
+SELECT CAST('abc' AS INT)

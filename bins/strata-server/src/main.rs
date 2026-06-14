@@ -184,10 +184,11 @@ fn run_query(db: &Db, sql: &str) -> Result<Vec<StatementResult>, QueryError> {
 /// The binder wraps every SELECT in a `Project`, so column count is the
 /// projection arity. Write plans (Insert/Delete) don't return rows.
 fn output_columns(root: &PlanNode) -> usize {
-    if let PlanNode::Project { expressions, .. } = root {
-        expressions.len()
-    } else {
-        0
+    match root {
+        PlanNode::Project { expressions, .. } => expressions.len(),
+        // LIMIT / OFFSET wrap the projection; look through them.
+        PlanNode::Limit { input, .. } | PlanNode::Offset { input, .. } => output_columns(input),
+        _ => 0,
     }
 }
 
@@ -218,6 +219,48 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Text(s) => Some(s.clone()),
         Value::Bytes(b) => Some(format!("\\x{}", hex_encode(b))),
         Value::Json(j) => Some(j.to_string()),
+        Value::Date(d) => Some(strata_db::storage::temporal::format_date(*d)),
+        Value::Timestamp(t) => Some(strata_db::storage::temporal::format_timestamptz(*t)),
+        // Render each at its native width so the shortest round-tripping
+        // form is preserved (widening an f32 to f64 would lengthen it).
+        Value::Float32(f) => Some(float_text(
+            f.is_finite(),
+            f.is_nan(),
+            *f >= 0.0,
+            f.to_string(),
+        )),
+        Value::Float64(f) => Some(float_text(
+            f.is_finite(),
+            f.is_nan(),
+            *f >= 0.0,
+            f.to_string(),
+        )),
+        Value::Numeric(d) => Some(d.to_string()),
+        Value::Time(t) => Some(strata_db::storage::temporal::format_time(*t)),
+        Value::Uuid(u) => Some(u.to_string()),
+        Value::Interval(i) => Some(strata_db::storage::temporal::format_interval(*i)),
+        Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|v| value_to_text(v).unwrap_or_else(|| "NULL".into()))
+                .collect();
+            Some(format!("{{{}}}", parts.join(",")))
+        }
+    }
+}
+
+/// Render a float in Postgres style: finite values use the shortest
+/// round-tripping form (`finite_repr`), non-finite use `Infinity` /
+/// `-Infinity` / `NaN`.
+fn float_text(finite: bool, is_nan: bool, nonneg: bool, finite_repr: String) -> String {
+    if finite {
+        finite_repr
+    } else if is_nan {
+        "NaN".into()
+    } else if nonneg {
+        "Infinity".into()
+    } else {
+        "-Infinity".into()
     }
 }
 

@@ -1,0 +1,118 @@
+# Order-preserving primary-key encoding. Rows scan back in column-0 key
+# order, so this verifies the signed-integer key codec (sign-bit flip +
+# big-endian) end to end — in particular the negative/positive boundary
+# that a naive little-endian encoding got wrong.
+#
+# Uses its own `strata.keyorder` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.keyorder
+
+# --- signed integer keys ----------------------------------------------
+
+statement ok
+CREATE TABLE strata.keyorder.ints (n INT, label TEXT)
+
+# Inserted out of order, spanning negatives and positives.
+statement ok
+INSERT INTO strata.keyorder.ints VALUES (5, 'five'), (-100, 'neg-hundred'), (0, 'zero'), (-1, 'neg-one'), (100, 'hundred')
+
+# Read back in true numeric order: negatives sort before positives.
+query TT
+SELECT * FROM strata.keyorder.ints
+----
+-100 neg-hundred
+-1 neg-one
+0 zero
+5 five
+100 hundred
+
+# --- BIGINT keys span the full width ----------------------------------
+
+statement ok
+CREATE TABLE strata.keyorder.bigs (n BIGINT, label TEXT)
+
+# Near-min and max of the i64 range. (Exact i64::MIN has no positive
+# magnitude to parse, so we use MIN + 1.)
+statement ok
+INSERT INTO strata.keyorder.bigs VALUES (1, 'one'), (-9223372036854775807, 'min'), (9223372036854775807, 'max'), (0, 'zero')
+
+query TT
+SELECT * FROM strata.keyorder.bigs
+----
+-9223372036854775807 min
+0 zero
+1 one
+9223372036854775807 max
+
+# --- DATE keys (ride on the i32 codec) --------------------------------
+
+statement ok
+CREATE TABLE strata.keyorder.timeline (d DATE, label TEXT)
+
+# Pre-epoch (negative day count) must sort before the epoch and later.
+statement ok
+INSERT INTO strata.keyorder.timeline VALUES (DATE '2026-06-13', 'future'), (DATE '1969-07-20', 'moon'), (DATE '1970-01-01', 'epoch'), (DATE '2000-01-01', 'y2k')
+
+query TT
+SELECT * FROM strata.keyorder.timeline
+----
+1969-07-20 moon
+1970-01-01 epoch
+2000-01-01 y2k
+2026-06-13 future
+
+# --- TIMESTAMPTZ keys (ride on the i64 codec) -------------------------
+
+statement ok
+CREATE TABLE strata.keyorder.instants (at TIMESTAMPTZ, label TEXT)
+
+# Pre-epoch instant (negative micros) sorts before the epoch and later.
+statement ok
+INSERT INTO strata.keyorder.instants VALUES (TIMESTAMPTZ '2026-06-13 14:30:00+00', 'future'), (TIMESTAMPTZ '1969-07-20 20:17:00+00', 'moon'), (TIMESTAMPTZ '1970-01-01 00:00:00+00', 'epoch')
+
+query TT
+SELECT * FROM strata.keyorder.instants
+----
+1969-07-20 20:17:00+00:00 moon
+1970-01-01 00:00:00+00:00 epoch
+2026-06-13 14:30:00+00:00 future
+
+# --- DOUBLE keys: order-preserving across sign and the infinities -----
+
+statement ok
+CREATE TABLE strata.keyorder.measures (x DOUBLE PRECISION, label TEXT)
+
+# An overflowing literal (1e400) lands on ±Infinity — handy for the ends.
+statement ok
+INSERT INTO strata.keyorder.measures VALUES (2.5, 'pos'), (-100.0, 'neg-hundred'), (0.0, 'zero'), (-1e400, 'neg-inf'), (1e400, 'pos-inf'), (-0.5, 'neg-half')
+
+query TT
+SELECT * FROM strata.keyorder.measures
+----
+-Infinity neg-inf
+-100 neg-hundred
+-0.5 neg-half
+0 zero
+2.5 pos
+Infinity pos-inf
+
+# --- NUMERIC keys: the custom order-preserving decimal encoding --------
+
+statement ok
+CREATE TABLE strata.keyorder.amounts (n NUMERIC, label TEXT)
+
+# Spans sign, magnitude, and fractional scales — the cases the
+# exponent-then-digits encoding has to get right.
+statement ok
+INSERT INTO strata.keyorder.amounts VALUES (NUMERIC '100', 'hundred'), (NUMERIC '-9.5', 'neg'), (NUMERIC '0.001', 'tiny'), (NUMERIC '0', 'zero'), (NUMERIC '-100', 'neg-hundred'), (NUMERIC '9.5', 'nine-half')
+
+query TT
+SELECT * FROM strata.keyorder.amounts
+----
+-100 neg-hundred
+-9.5 neg
+0 zero
+0.001 tiny
+9.5 nine-half
+100 hundred

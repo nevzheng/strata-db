@@ -1,0 +1,82 @@
+# NUMERIC (exact decimal) over pgwire. Values come from typed
+# `NUMERIC '…'` literals (a bare 1.5 still binds as a float); the point of
+# the type is exactness and an order-preserving key encoding.
+#
+# Uses its own `strata.num` schema so the file is self-contained.
+
+# --- typed literals ---------------------------------------------------
+
+query T
+SELECT NUMERIC '1.5'
+----
+1.5
+
+query T
+SELECT DECIMAL '-2.25'
+----
+-2.25
+
+# Trailing-zero scale is preserved on display but equal by value.
+query T
+SELECT NUMERIC '0.10' = NUMERIC '0.1'
+----
+t
+
+# --- comparisons (exact; coerces with integers) -----------------------
+
+query T
+SELECT NUMERIC '2.5' > 2
+----
+t
+
+query T
+SELECT NUMERIC '-0.001' < NUMERIC '0'
+----
+t
+
+# --- ABS over a numeric -----------------------------------------------
+
+query T
+SELECT ABS(NUMERIC '-3.25')
+----
+3.25
+
+# --- exactness: many digits survive that a double would round ---------
+
+query T
+SELECT NUMERIC '12345678901234567890.123456789'
+----
+12345678901234567890.123456789
+
+# --- NUMERIC column through DDL / DML ---------------------------------
+
+statement ok
+CREATE SCHEMA strata.num
+
+statement ok
+CREATE TABLE strata.num.prices (id INT, amount NUMERIC)
+
+# Insert from typed literals and an integer (which converts exactly).
+statement ok
+INSERT INTO strata.num.prices VALUES (1, NUMERIC '19.99'), (2, NUMERIC '0.001'), (3, 5)
+
+query TT
+SELECT * FROM strata.num.prices
+----
+1 19.99
+2 0.001
+3 5
+
+# Filter on a NUMERIC column with a typed literal.
+query T
+SELECT id FROM strata.num.prices WHERE amount = NUMERIC '0.001'
+----
+2
+
+# A non-numeric value into a NUMERIC column is rejected.
+statement error
+INSERT INTO strata.num.prices VALUES (4, 'nope')
+
+# An invalid numeric literal fails at bind time.
+statement error
+SELECT NUMERIC 'not-a-number'

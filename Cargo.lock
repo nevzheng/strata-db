@@ -2085,6 +2085,9 @@ dependencies = [
 name = "strata-db"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "pg_interval",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sqlparser",

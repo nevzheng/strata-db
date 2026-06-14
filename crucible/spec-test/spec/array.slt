@@ -1,0 +1,79 @@
+# ARRAY — one-dimensional, single element type. Literals (ARRAY[...]),
+# {a,b} rendering, element-wise comparison, element coercion, and the
+# rejected cases (nested arrays, wrong element type).
+#
+# Uses its own `strata.arr` schema so the file is self-contained.
+
+statement ok
+CREATE SCHEMA strata.arr
+
+statement ok
+CREATE TABLE strata.arr.t (id INT, tags INT[])
+
+statement ok
+INSERT INTO strata.arr.t VALUES (1, ARRAY[1, 2, 3]), (2, ARRAY[5]), (3, ARRAY[])
+
+# Round-trips through encode/decode and renders Postgres-style {a,b}.
+query TT
+SELECT * FROM strata.arr.t
+----
+1 {1,2,3}
+2 {5}
+3 {}
+
+# --- literals & comparison --------------------------------------------
+
+query T
+SELECT ARRAY[1, 2, 3]
+----
+{1,2,3}
+
+# Element-wise comparison: 2 < 3 decides.
+query T
+SELECT ARRAY[1, 2] < ARRAY[1, 3]
+----
+t
+
+# A prefix sorts before the longer array.
+query T
+SELECT ARRAY[1, 2] < ARRAY[1, 2, 0]
+----
+t
+
+query T
+SELECT ARRAY[1, 2] = ARRAY[1, 2]
+----
+t
+
+# Filter on an array column by equality.
+query T
+SELECT id FROM strata.arr.t WHERE tags = ARRAY[5]
+----
+2
+
+# --- text arrays ------------------------------------------------------
+
+statement ok
+CREATE TABLE strata.arr.names (id INT, vals TEXT[])
+
+statement ok
+INSERT INTO strata.arr.names VALUES (1, ARRAY['a', 'b'])
+
+query T
+SELECT vals FROM strata.arr.names WHERE id = 1
+----
+{a,b}
+
+# --- rejected cases ---------------------------------------------------
+
+# Nested arrays aren't supported in v1.
+statement error
+CREATE TABLE strata.arr.bad (id INT, m INT[][])
+
+# A wrong element type is rejected (text into an INT[] column).
+statement error
+INSERT INTO strata.arr.t VALUES (4, ARRAY['x', 'y'])
+
+# NULL array elements aren't supported.
+statement error
+INSERT INTO strata.arr.t VALUES (5, ARRAY[1, NULL, 3])

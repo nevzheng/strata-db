@@ -109,6 +109,10 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
             input: build(*input, ctx)?,
             remaining: count,
         })),
+        PlanNode::Offset { input, count } => Ok(RowStream::new(Offset {
+            input: build(*input, ctx)?,
+            remaining: count,
+        })),
         PlanNode::Values { rows } => Ok(RowStream::new(rows.into_iter().map(Ok))),
         // Sinks (Insert/Delete/CreateTable) are top-level only — they
         // need `&mut ctx` and can't sit inside a pull iterator chain
@@ -241,5 +245,27 @@ impl Iterator for Limit<'_> {
         let row = self.input.next()?;
         self.remaining -= 1;
         Some(row)
+    }
+}
+
+struct Offset<'ctx> {
+    input: RowStream<'ctx>,
+    /// Rows still to skip before passing input through.
+    remaining: usize,
+}
+
+impl Iterator for Offset<'_> {
+    type Item = RowResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Drop the first `remaining` rows, but surface an error hit while
+        // skipping instead of swallowing it.
+        while self.remaining > 0 {
+            match self.input.next()? {
+                Ok(_) => self.remaining -= 1,
+                err @ Err(_) => return Some(err),
+            }
+        }
+        self.input.next()
     }
 }

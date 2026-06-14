@@ -5,6 +5,15 @@ edition = "2024"
 
 [dependencies]
 strata-store = { path = "../strata-store" }
+# `NaiveDate` for calendar-date math; default features off to skip the
+# OS-clock / timezone deps we don't need (Value::Date is just a day count).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Exact decimal for NUMERIC. The order-preserving key encoding is ours
+# (rust_decimal's own byte form isn't sortable); see storage::codec.
+rust_decimal = { version = "1", features = ["serde"] }
+# Postgres INTERVAL parse/format (months/days/microseconds). Already in
+# the tree via the postgres stack; we keep our own serde-friendly type.
+pg_interval = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = { version = "0.62", features = ["serde"] }

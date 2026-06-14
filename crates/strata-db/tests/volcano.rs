@@ -111,6 +111,42 @@ fn limit_caps_output() {
 }
 
 #[test]
+fn offset_skips_leading_rows() {
+    let (_tmp, db) = common::temp_db();
+    let table = build_events_table(&db);
+
+    let plan = PhysicalPlan::new(PlanNode::Offset {
+        input: Box::new(PlanNode::SeqScan { table }),
+        count: 2,
+    });
+    let rows = run_rows(plan, &db);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Int32(3));
+    assert_eq!(rows[1].values[0], Value::Int32(4));
+}
+
+#[test]
+fn limit_over_offset_pages() {
+    let (_tmp, db) = common::temp_db();
+    let table = build_events_table(&db);
+
+    // OFFSET 1 then LIMIT 2 → rows 2 and 3 (Postgres LIMIT 2 OFFSET 1).
+    let plan = PhysicalPlan::new(PlanNode::Limit {
+        input: Box::new(PlanNode::Offset {
+            input: Box::new(PlanNode::SeqScan { table }),
+            count: 1,
+        }),
+        count: 2,
+    });
+    let rows = run_rows(plan, &db);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[0], Value::Int32(2));
+    assert_eq!(rows[1].values[0], Value::Int32(3));
+}
+
+#[test]
 fn filter_then_project_then_limit_composes() {
     let (_tmp, db) = common::temp_db();
     let table = build_events_table(&db);
