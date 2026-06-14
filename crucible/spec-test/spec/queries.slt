@@ -1,0 +1,60 @@
+# Integration: features combined in realistic queries (predicates +
+# functions + CASE + CAST + || + LIMIT together), where single-feature
+# specs don't reach. Uses its own `strata.app` schema.
+
+statement ok
+CREATE SCHEMA strata.app
+
+statement ok
+CREATE TABLE strata.app.products (id INT, name TEXT, price NUMERIC, qty INT, tag TEXT)
+
+statement ok
+INSERT INTO strata.app.products VALUES
+  (1, 'Apple', NUMERIC '1.49', 100, 'fruit'),
+  (2, 'Banana', NUMERIC '0.75', 5, 'fruit'),
+  (3, 'Carrot', NUMERIC '2.00', NULL, 'veg'),
+  (4, 'Avocado', NUMERIC '3.25', 20, NULL)
+
+# Combined predicate: LIKE + comparison + AND (NULL qty drops out).
+query T
+SELECT name FROM strata.app.products WHERE name LIKE 'A%' AND qty > 10
+----
+Apple
+Avocado
+
+# Projection stacking || + CASE over a filtered set.
+query T
+SELECT name || ' (' || CASE WHEN qty >= 20 THEN 'stocked' ELSE 'low' END || ')'
+FROM strata.app.products WHERE qty IS NOT NULL
+----
+Apple (stocked)
+Banana (low)
+Avocado (stocked)
+
+# Two-column projection mixing a string function and a CAST.
+query TT
+SELECT UPPER(name), CAST(price AS INT) FROM strata.app.products WHERE id IN (1, 3)
+----
+APPLE 1
+CARROT 2
+
+# COALESCE over a nullable column.
+query TT
+SELECT id, COALESCE(tag, 'none') FROM strata.app.products WHERE id >= 3
+----
+3 veg
+4 none
+
+# LIMIT over a numeric-filtered result (PK order).
+query T
+SELECT id FROM strata.app.products WHERE price > NUMERIC '1' LIMIT 2
+----
+1
+3
+
+# BETWEEN + NOT IN + IS NOT NULL combined.
+query T
+SELECT id FROM strata.app.products
+WHERE price BETWEEN NUMERIC '1' AND NUMERIC '3' AND id NOT IN (1) AND tag IS NOT NULL
+----
+3
