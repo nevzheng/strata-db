@@ -14,6 +14,7 @@
 
 use crate::catalog::ids::{DatasetId, ProjectId};
 use crate::catalog::schema::Schema;
+use crate::catalog::system::SystemRelation;
 use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
@@ -38,6 +39,10 @@ impl LogicalPlan {
 pub enum LogicalNode {
     /// Algorithm choice (sequential vs index) is deferred to lowering.
     Scan { table: Table },
+    /// A virtual system-catalog relation (`information_schema.*`,
+    /// `pg_catalog.*`, `st_*`). Rows are generated from catalog metadata
+    /// at execution, not read from storage.
+    SystemScan { relation: SystemRelation },
     /// `NULL` predicate drops the row, matching SQL `WHERE`.
     Filter {
         input: Box<LogicalNode>,

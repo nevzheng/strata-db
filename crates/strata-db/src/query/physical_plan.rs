@@ -11,6 +11,7 @@
 
 use crate::catalog::ids::{DatasetId, ProjectId};
 use crate::catalog::schema::Schema;
+use crate::catalog::system::SystemRelation;
 use crate::catalog::tables::Table;
 use crate::storage::types::Tuple;
 
@@ -36,6 +37,10 @@ impl PhysicalPlan {
 pub enum PlanNode {
     /// Read every tuple from a base table.
     SeqScan { table: Table },
+    /// Generate rows for a virtual system-catalog relation
+    /// (`information_schema.*`, `pg_catalog.*`, `st_*`) from catalog
+    /// metadata at execution time.
+    SystemScan { relation: SystemRelation },
     /// Drop rows where `predicate` is not `Bool(true)`.
     /// (A `NULL` predicate drops the row, matching SQL `WHERE`.)
     Filter {

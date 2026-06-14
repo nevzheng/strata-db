@@ -37,18 +37,20 @@ pub mod db;
 pub mod ids;
 pub mod project;
 pub mod schema;
+pub mod system;
 pub mod tables;
 
 use strata_store::StorageEngine;
 use strata_store::memstore::BTreeMapStore;
 
 use crate::catalog::consts::{
-    CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, SYSTEM_PROJECT_ID, TABLES_TABLE_ID,
-    system_table_schema,
+    CATALOG_DATASET_ID, DATASETS_TABLE_ID, PROJECTS_TABLE_ID, STATS_TABLE_ID, STATS_TABLE_NAME,
+    SYSTEM_PROJECT_ID, TABLES_TABLE_ID, system_table_schema,
 };
 use crate::catalog::db::TableApi;
 use crate::catalog::ids::{DatasetId, ProjectId, QueryId, TableId, TruncationId};
 use crate::catalog::schema::Schema;
+use crate::catalog::system::ColumnStats;
 use crate::catalog::tables::Table;
 use crate::query::QueryError;
 use crate::storage::table_api::{ScanOptions, TableReader, TableWriter};
@@ -190,6 +192,23 @@ fn datasets_meta_table() -> Table {
 
 fn tables_meta_table() -> Table {
     system_table(TABLES_TABLE_ID, "_tables")
+}
+
+fn stats_meta_table() -> Table {
+    system_table(STATS_TABLE_ID, STATS_TABLE_NAME)
+}
+
+/// Key for a column-statistics row: `schema\0table\0column`. NUL separators
+/// keep the variable-length parts unambiguous.
+// Test-only until ANALYZE exists; the read path needs no key.
+#[cfg(test)]
+fn stats_key(stats: &ColumnStats) -> Vec<u8> {
+    let mut key = Vec::new();
+    for part in [&stats.schemaname, &stats.tablename, &stats.attname] {
+        key.extend_from_slice(part.as_bytes());
+        key.push(0);
+    }
+    key
 }
 
 fn list_metas<T: serde::de::DeserializeOwned>(
@@ -491,6 +510,56 @@ impl<'a> CatalogReader<'a> {
     ) -> Result<Table, QueryError> {
         resolve_table(self.engine, project, dataset, table)
     }
+
+    /// Every project. Used by system-catalog enumeration.
+    pub(crate) fn list_projects(&self) -> Result<Vec<ProjectMeta>, QueryError> {
+        list_metas(self.engine, projects_meta_table(), &[])
+    }
+
+    /// Every dataset in `project_id`.
+    pub(crate) fn list_datasets(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<DatasetMeta>, QueryError> {
+        list_metas(self.engine, datasets_meta_table(), project_id.as_bytes())
+    }
+
+    /// One row per *live* table in `(project_id, dataset_id)` — the highest
+    /// incarnation of each name (see [`Catalog::list_tables`]).
+    pub(crate) fn list_tables(
+        &self,
+        project_id: ProjectId,
+        dataset_id: DatasetId,
+    ) -> Result<Vec<TableMeta>, QueryError> {
+        let metas: Vec<TableMeta> = list_metas(
+            self.engine,
+            tables_meta_table(),
+            &dataset_scope(project_id, dataset_id),
+        )?;
+        Ok(live_incarnations(metas))
+    }
+
+    /// Every stored column-statistics row (the `pg_stats` / `st_stats`
+    /// source). Empty until `ANALYZE` writes any.
+    pub(crate) fn list_column_stats(&self) -> Result<Vec<ColumnStats>, QueryError> {
+        list_metas(self.engine, stats_meta_table(), &[])
+    }
+}
+
+/// Collapse a name's table incarnations to the live one (highest
+/// `truncation_id`), dropping retained history. Shared by the read- and
+/// write-side `list_tables`.
+fn live_incarnations(metas: Vec<TableMeta>) -> Vec<TableMeta> {
+    let mut live: std::collections::HashMap<String, TableMeta> = std::collections::HashMap::new();
+    for meta in metas {
+        let keep = live
+            .get(&meta.name)
+            .is_none_or(|existing| meta.truncation_id > existing.truncation_id);
+        if keep {
+            live.insert(meta.name.clone(), meta);
+        }
+    }
+    live.into_values().collect()
 }
 
 // --- Catalog: write-side metadata operations ---
@@ -639,17 +708,18 @@ impl<'db> Catalog<'db> {
             tables_meta_table(),
             &dataset_scope(project_id, dataset_id),
         )?;
-        let mut live: std::collections::HashMap<String, TableMeta> =
-            std::collections::HashMap::new();
-        for meta in metas {
-            let keep = live
-                .get(&meta.name)
-                .is_none_or(|existing| meta.truncation_id > existing.truncation_id);
-            if keep {
-                live.insert(meta.name.clone(), meta);
-            }
-        }
-        Ok(live.into_values().collect())
+        Ok(live_incarnations(metas))
+    }
+
+    // --- column statistics ---
+
+    /// Store one column-statistics row, overwriting any existing row for the
+    /// same `(schema, table, column)`. Test-only injection point — when
+    /// `ANALYZE` lands it will own the real write path.
+    #[cfg(test)]
+    pub(crate) fn put_column_stats(&self, stats: &ColumnStats) -> Result<(), QueryError> {
+        let mut engine = self.api.write();
+        write_meta(&mut engine, &stats_meta_table(), &stats_key(stats), stats)
     }
 }
 

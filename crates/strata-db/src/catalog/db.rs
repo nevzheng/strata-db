@@ -141,4 +141,15 @@ impl Db {
             engine: self.engine.borrow_mut(),
         }
     }
+
+    /// Store one column-statistics row (the `pg_stats` / `st_stats` source).
+    /// Test-only injection point that lets stats be populated and read back;
+    /// `ANALYZE` will own the real write path once it exists.
+    #[cfg(test)]
+    pub(crate) fn put_column_stats(
+        &self,
+        stats: &crate::catalog::system::ColumnStats,
+    ) -> Result<(), QueryError> {
+        Catalog::new(self.api()).put_column_stats(stats)
+    }
 }

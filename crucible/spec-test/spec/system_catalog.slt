@@ -1,0 +1,160 @@
+# System catalog: virtual information_schema.* and pg_catalog.* (+ st_*)
+# relations that ORMs introspect on connect. Rows are generated from catalog
+# metadata, not stored.
+#
+# The spec server is shared across files, so every query is scoped with a
+# WHERE to this file's own `syscat` schema (or to deterministic string
+# columns like typname/relname/attname) — never the UUID-derived OIDs, which
+# aren't stable. Uses its own `strata.syscat` schema.
+
+statement ok
+CREATE SCHEMA strata.syscat
+
+statement ok
+CREATE TABLE strata.syscat.syscat_people (id INT, full_name TEXT NOT NULL, born DATE, syscat_marker INT NOT NULL)
+
+statement ok
+CREATE TABLE strata.syscat.syscat_orders (id INT)
+
+# --- information_schema.columns ---------------------------------------
+
+# Columns come back in declared (ordinal) order; data_type / is_nullable
+# are projected from the field's logical type and NOT NULL flag.
+query TTTT
+SELECT column_name, ordinal_position, is_nullable, data_type
+FROM information_schema.columns
+WHERE table_schema = 'syscat' AND table_name = 'syscat_people'
+----
+id 1 YES integer
+full_name 2 NO text
+born 3 YES date
+syscat_marker 4 NO integer
+
+# --- information_schema.tables ----------------------------------------
+
+query TT rowsort
+SELECT table_name, table_type
+FROM information_schema.tables
+WHERE table_schema = 'syscat'
+----
+syscat_orders BASE TABLE
+syscat_people BASE TABLE
+
+# --- information_schema.schemata --------------------------------------
+
+query TT
+SELECT catalog_name, schema_name
+FROM information_schema.schemata
+WHERE schema_name = 'syscat'
+----
+strata syscat
+
+# --- pg_class (qualified + unqualified) -------------------------------
+
+# relkind 'r' = ordinary table; relnatts = column count.
+query TTT
+SELECT relname, relkind, relnatts
+FROM pg_catalog.pg_class
+WHERE relname = 'syscat_people'
+----
+syscat_people r 4
+
+# pg_* names also resolve unqualified (ORMs rely on the search path).
+query T
+SELECT relnatts FROM pg_class WHERE relname = 'syscat_orders'
+----
+1
+
+# --- pg_attribute -----------------------------------------------------
+
+# atttypid is the canonical PG type OID (int4 = 23); attnotnull mirrors
+# NOT NULL. Filtered by the uniquely-named marker column.
+query TTT
+SELECT attname, atttypid, attnotnull
+FROM pg_attribute
+WHERE attname = 'syscat_marker'
+----
+syscat_marker 23 t
+
+# --- pg_type (static, canonical OIDs) ---------------------------------
+
+query TTTT
+SELECT oid, typname, typlen, typcategory
+FROM pg_type
+WHERE typname = 'int4'
+----
+23 int4 4 N
+
+query TT
+SELECT oid, typname FROM pg_type WHERE typname = 'uuid'
+----
+2950 uuid
+
+# --- pg_namespace / pg_database ---------------------------------------
+
+query T
+SELECT nspname FROM pg_namespace WHERE nspname = 'syscat'
+----
+syscat
+
+query T
+SELECT datname FROM pg_database WHERE datname = 'strata'
+----
+strata
+
+# --- prefix rules: st_ and pg_ are interchangeable -------------------
+
+# st_class returns exactly what pg_class does for the same table (compare
+# with the pg_class assertion above).
+query TTT
+SELECT relname, relkind, relnatts FROM st_class WHERE relname = 'syscat_people'
+----
+syscat_people r 4
+
+query TT
+SELECT oid, typname FROM st_type WHERE typname = 'text'
+----
+25 text
+
+# Both spellings also resolve under the explicit pg_catalog dataset.
+query T
+SELECT relname FROM pg_catalog.st_class WHERE relname = 'syscat_orders'
+----
+syscat_orders
+
+query T
+SELECT relname FROM pg_catalog.pg_class WHERE relname = 'syscat_orders'
+----
+syscat_orders
+
+# --- prefix rules: what does NOT resolve -----------------------------
+
+# Bare common words don't hijack a system relation — information_schema
+# views need the explicit qualifier.
+statement error
+SELECT 1 FROM tables
+
+statement error
+SELECT 1 FROM columns
+
+# information_schema views have no st_ alias.
+statement error
+SELECT 1 FROM st_columns
+
+# pg_ / st_ catalog tables are not hosted under information_schema.
+statement error
+SELECT 1 FROM information_schema.pg_class
+
+# --- pg_stats / st_stats: queryable but empty until ANALYZE ----------
+
+# Column statistics are stored by ANALYZE (not yet built), so the relation
+# resolves and runs end-to-end but returns no rows — exactly like Postgres
+# before a table is analyzed. The query succeeding (vs erroring) is the
+# proof the relation is wired.
+query TTT
+SELECT schemaname, tablename, attname FROM pg_stats WHERE schemaname = 'syscat'
+----
+
+query TTTT
+SELECT attname, null_frac, n_distinct, correlation FROM st_stats
+----
