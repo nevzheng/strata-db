@@ -216,6 +216,17 @@ impl<V: BlockStore> PageTuples<V> {
         self.page.page_id()
     }
 
+    /// Iterate this page's tuples as borrowed views, sharing the one pin — the
+    /// block read path. Yields a view per slot in order; a view's `bytes()` is
+    /// `None` for a deleted slot (a workspace never deletes, so its views are
+    /// always live).
+    pub fn iter(&self) -> impl Iterator<Item = TupleView<'_, V>> {
+        let count = TuplePage::open(&self.page.bytes())
+            .map(|p| p.slot_count())
+            .unwrap_or(0);
+        (0..count).map(move |slot| self.tuple(slot))
+    }
+
     /// A borrowed view of the tuple at `slot`. Cheap — no new pin, no I/O.
     pub fn tuple(&self, slot: u16) -> TupleView<'_, V> {
         TupleView {

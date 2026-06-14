@@ -68,6 +68,16 @@ pub enum Error {
     /// counterpart) and [`is_exhausted`](Self::is_exhausted).
     #[error("backing store exhausted: {0}")]
     Exhausted(String),
+
+    /// A workspace hit its size bound — an append needed `requested` more bytes
+    /// but only `capacity - used` were left. Workspaces are always bounded, so
+    /// this is the expected back-pressure signal (memory or disk), not a bug.
+    #[error("workspace full: need {requested} more bytes, {used}/{capacity} used")]
+    WorkspaceFull {
+        requested: usize,
+        used: usize,
+        capacity: usize,
+    },
 }
 
 impl Error {
@@ -77,7 +87,10 @@ impl Error {
     /// resource-exhausted error so a write fails cleanly while reads,
     /// which never allocate, keep serving.
     pub fn is_exhausted(&self) -> bool {
-        matches!(self, Error::PoolExhausted(_) | Error::Exhausted(_))
+        matches!(
+            self,
+            Error::PoolExhausted(_) | Error::Exhausted(_) | Error::WorkspaceFull { .. }
+        )
     }
 }
 
