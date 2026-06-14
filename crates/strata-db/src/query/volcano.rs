@@ -97,6 +97,12 @@ fn build<'ctx>(node: PlanNode, ctx: &'ctx QueryContext<'_>) -> Result<RowStream<
         PlanNode::SeqScan { table } => {
             Ok(RowStream::new(ctx.table(&table).scan(ScanOptions::new())))
         }
+        // Virtual catalog relation: rows are generated from catalog
+        // metadata, not read from storage.
+        PlanNode::SystemScan { relation } => {
+            let rows = relation.rows(&ctx.catalog())?;
+            Ok(RowStream::new(rows.into_iter().map(Ok)))
+        }
         PlanNode::Filter { input, predicate } => Ok(RowStream::new(Filter {
             input: build(*input, ctx)?,
             predicate,

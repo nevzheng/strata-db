@@ -58,6 +58,9 @@ impl LowerNode for LogicalNode {
             LogicalNode::Scan { table } => PlanNode::SeqScan {
                 table: table.clone(),
             },
+            LogicalNode::SystemScan { relation } => PlanNode::SystemScan {
+                relation: *relation,
+            },
             LogicalNode::Filter { input, predicate } => PlanNode::Filter {
                 input: Box::new(input.lower()),
                 predicate: predicate.clone(),

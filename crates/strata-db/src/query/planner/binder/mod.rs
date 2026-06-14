@@ -98,18 +98,22 @@ impl BindNode for Statement {
     }
 }
 
+/// The identifier segments of an object name (`a.b.c` → `[a, b, c]`).
+/// Errors `unsupported` if any segment isn't a plain identifier.
+fn name_idents(name: &ObjectName) -> Result<Vec<&str>, QueryError> {
+    name.0
+        .iter()
+        .map(|p| p.as_ident().map(|i| i.value.as_str()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))
+}
+
 /// Split a `project.dataset.table` object name into its three parts.
 /// Errors `unsupported` if it isn't exactly three identifier segments —
 /// we have no session defaults to fill in shorter names. Shared by the
 /// DDL, DML, and query binders.
 fn three_part_name(name: &ObjectName) -> Result<(&str, &str, &str), QueryError> {
-    let parts: Vec<&str> = name
-        .0
-        .iter()
-        .map(|p| p.as_ident().map(|i| i.value.as_str()))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| QueryError::unsupported(format!("non-identifier in name: {name}")))?;
-    match parts.as_slice() {
+    match name_idents(name)?.as_slice() {
         [p, d, t] => Ok((*p, *d, *t)),
         _ => Err(QueryError::unsupported(format!(
             "name needs project.dataset.table, got: {name}"

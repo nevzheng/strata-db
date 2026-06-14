@@ -7,12 +7,13 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::schema::Schema;
+use crate::catalog::system::SystemRelation;
 use crate::query::QueryError;
 use crate::query::expression::Expr;
 use crate::query::logical_plan::{LogicalNode, LogicalPlan};
 use crate::storage::types::{Tuple, Value};
 
-use super::{BindNode, Binder, three_part_name};
+use super::{BindNode, Binder, name_idents, three_part_name};
 
 impl BindNode for AstQuery {
     type Output = LogicalPlan;
@@ -163,7 +164,27 @@ impl BindNode for TableWithJoins {
                 self.relation
             )));
         };
-        // Three-part name only for now — no session defaults.
+
+        // System-catalog relations resolve specially: an unqualified `pg_*` /
+        // `st_*`, or a qualified `information_schema.x` / `pg_catalog.x`. They
+        // carry no project.dataset prefix, unlike user tables.
+        let parts = name_idents(name)?;
+        let (dataset_opt, leaf) = match parts.as_slice() {
+            [t] => (None, *t),
+            [d, t] => (Some(*d), *t),
+            [_, d, t] => (Some(*d), *t),
+            _ => {
+                return Err(QueryError::unsupported(format!(
+                    "name needs project.dataset.table, got: {name}"
+                )));
+            }
+        };
+        if let Some(relation) = SystemRelation::resolve(dataset_opt, leaf) {
+            let schema = relation.schema();
+            return Ok((LogicalNode::SystemScan { relation }, schema));
+        }
+
+        // User tables: three-part name only for now — no session defaults.
         let (project, dataset, table_name) = three_part_name(name)?;
         let table = binder
             .ctx()

@@ -134,6 +134,14 @@ pub const QUERIES_TABLE_NAME: &str = "_queries";
 /// Reserved [`TableId`] for the queries metadata table.
 pub const QUERIES_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000004"));
 
+/// Display name of the table storing per-column statistics — the stored
+/// source for the `pg_stats` / `st_stats` system relation, keyed by
+/// `(schema, table, column)`. Populated by a future `ANALYZE`.
+pub const STATS_TABLE_NAME: &str = "_stats";
+
+/// Reserved [`TableId`] for the column-statistics table.
+pub const STATS_TABLE_ID: TableId = TableId(uuid!("ffffffff-ffff-0000-0000-000000000005"));
+
 // --- Pre-built metas ---
 //
 // These can't be `const` because `*Meta` carries an owned `String` name.
