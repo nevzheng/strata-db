@@ -62,8 +62,7 @@ impl Heap<FileBlockStore> {
         } else {
             FileBlockStore::open(dir.join("tuples.db"))?
         };
-        let cache =
-            PageCache::with_journal(block, opts.frames, dir.join("tuples.journal"))?;
+        let cache = PageCache::with_journal(block, opts.frames, dir.join("tuples.journal"))?;
         Ok(Self::new(cache))
     }
 }

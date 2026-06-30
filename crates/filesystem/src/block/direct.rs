@@ -183,11 +183,7 @@ mod tests {
     #[test]
     fn block_is_page_aligned() {
         let block = Block::zeroed();
-        assert_eq!(
-            block.as_ptr() as usize % 4096,
-            0,
-            "Block is page-aligned"
-        );
+        assert_eq!(block.as_ptr() as usize % 4096, 0, "Block is page-aligned");
         assert_eq!(block.len(), 8192);
     }
 

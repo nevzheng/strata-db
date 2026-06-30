@@ -77,9 +77,7 @@ impl DbBuilder {
             None => BTreeMapStore::new(),
         };
         let engine = match self.levels {
-            Some(configs) => StorageEngine::builder(path, mem)
-                .levels(configs)
-                .build(),
+            Some(configs) => StorageEngine::builder(path, mem).levels(configs).build(),
             None => StorageEngine::new(path, mem),
         }?;
         // Startup: size query scratch to the machine unless the caller pinned it.

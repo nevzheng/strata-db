@@ -57,10 +57,7 @@ impl BlockStore for MemBlockStore {
     }
 
     fn read(&self, id: BlockId, block: &mut Block) -> Result<()> {
-        let stored = self
-            .blocks
-            .get(id.0 as usize)
-            .ok_or(Error::Checksum(id))?;
+        let stored = self.blocks.get(id.0 as usize).ok_or(Error::Checksum(id))?;
         block.copy_from_slice(&stored[..]);
         Ok(())
     }
