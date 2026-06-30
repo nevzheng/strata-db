@@ -30,12 +30,13 @@ use crate::block::journal::{BlockJournal, JournalOp};
 use crate::cache::policies::{EvictionPolicy, FrameId, LruK};
 use crate::error::Error;
 use crate::page::{finalize_checksum, verify_checksum};
-use crate::{BlockId, BlockStore, HEADER_LEN, PAGE_SIZE, PageHeader, Result};
+use crate::{Block, BlockId, BlockStore, HEADER_LEN, PageHeader, Result};
 
-/// A frame's page-sized buffer. Shared (`Rc`) so a handle can keep reading the
-/// bytes independently of the pool's own borrow; mutable (`RefCell`) so reads
-/// and writes both go through it.
-type FrameBuf = Rc<RefCell<Box<[u8]>>>;
+/// A frame's page-sized, aligned buffer. Shared (`Rc`) so a handle can keep
+/// reading the bytes independently of the pool's own borrow; mutable
+/// (`RefCell`) so reads and writes both go through it.  [`Block`]'s alignment
+/// means the kernel can DMA directly to/from it for direct I/O.
+type FrameBuf = Rc<RefCell<Block>>;
 
 /// One slot in the pool: a page-sized buffer plus its bookkeeping.
 ///
@@ -55,7 +56,7 @@ impl Frame {
     fn new() -> Self {
         Self {
             page_id: None,
-            buf: Rc::new(RefCell::new(vec![0u8; PAGE_SIZE].into_boxed_slice())),
+            buf: Rc::new(RefCell::new(Block::zeroed())),
             readers: 0,
             writer: false,
             dirty: false,
@@ -335,7 +336,9 @@ impl<V: BlockStore> PageCache<V> {
             if let JournalOp::Write { page_id, image } = op {
                 let id = BlockId(*page_id);
                 block.ensure_allocated(id)?;
-                block.write(id, image)?;
+                let mut b = Block::zeroed();
+                b[..image.len()].copy_from_slice(image);
+                block.write(id, &b)?;
             }
         }
         block.sync()
@@ -424,7 +427,7 @@ impl<V: BlockStore> ReadPage<V> {
 
     /// The whole page, header included.
     pub fn bytes(&self) -> Ref<'_, [u8]> {
-        Ref::map(self.buf.borrow(), |b| b.as_ref())
+        Ref::map(self.buf.borrow(), |b| &b[..])
     }
 
     /// The payload — bytes after the header.
@@ -468,12 +471,12 @@ impl<V: BlockStore> WritePage<V> {
 
     /// The whole page, header included.
     pub fn bytes(&self) -> Ref<'_, [u8]> {
-        Ref::map(self.buf.borrow(), |b| b.as_ref())
+        Ref::map(self.buf.borrow(), |b| &b[..])
     }
 
     /// The whole page, mutably.
     pub fn bytes_mut(&self) -> RefMut<'_, [u8]> {
-        RefMut::map(self.buf.borrow_mut(), |b| b.as_mut())
+        RefMut::map(self.buf.borrow_mut(), |b| &mut b[..])
     }
 
     /// The payload — bytes after the header.

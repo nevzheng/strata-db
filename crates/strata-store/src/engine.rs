@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::iterator::Scan;
 use crate::{StorageError, memstore::BTreeMapStore};
-use filesystem::{Heap, TupleLoc, TupleRef};
+use filesystem::{Heap, HeapOptions, TupleLoc, TupleRef};
 use lsm::{LevelConfig, Lsm, LsmConfig, MemStore};
 use tracing::{info, instrument};
 
@@ -32,27 +32,73 @@ pub struct StorageEngine<M: MemStore = BTreeMapStore> {
     heap: Heap,
 }
 
-impl<M: MemStore> StorageEngine<M> {
-    /// Open an engine rooted at `dir`, using `mem` as the memtable and the
-    /// default level configuration. Index files live under `dir`; heap files
-    /// live under `dir/heap`.
-    pub fn new(dir: &Path, mem: M) -> Result<Self, StorageError> {
-        Ok(Self {
-            index: Lsm::with_memtable(dir, LsmConfig::default(), mem)?,
-            heap: Heap::open(&dir.join("heap"), HEAP_FRAMES)?,
-        })
+/// Builder for [`StorageEngine`].  Construct via [`StorageEngine::builder`].
+pub struct EngineBuilder<'a, M: MemStore> {
+    dir: &'a Path,
+    mem: M,
+    heap_frames: usize,
+    direct_io: bool,
+    levels: Option<Vec<LevelConfig>>,
+}
+
+impl<M: MemStore> EngineBuilder<'_, M> {
+    /// Set the heap buffer-pool size in frames (8 KiB each).  Default: 1024.
+    pub fn heap_frames(mut self, n: usize) -> Self {
+        self.heap_frames = n;
+        self
     }
 
-    /// Open an engine with explicit per-level configuration.
-    pub fn with_levels(dir: &Path, mem: M, levels: Vec<LevelConfig>) -> Result<Self, StorageError> {
-        let config = LsmConfig {
-            levels,
-            ..LsmConfig::default()
+    /// Enable direct I/O on the heap.  Default: false.
+    pub fn direct_io(mut self, yes: bool) -> Self {
+        self.direct_io = yes;
+        self
+    }
+
+    /// Set explicit per-level LSM configuration.  Default: [`LsmConfig::default`].
+    pub fn levels(mut self, levels: Vec<LevelConfig>) -> Self {
+        self.levels = Some(levels);
+        self
+    }
+
+    /// Build the engine.
+    pub fn build(self) -> Result<StorageEngine<M>, StorageError> {
+        let config = match self.levels {
+            Some(levels) => LsmConfig {
+                levels,
+                ..LsmConfig::default()
+            },
+            None => LsmConfig::default(),
         };
-        Ok(Self {
-            index: Lsm::with_memtable(dir, config, mem)?,
-            heap: Heap::open(&dir.join("heap"), HEAP_FRAMES)?,
+        Ok(StorageEngine {
+            index: Lsm::with_memtable(self.dir, config, self.mem)?,
+            heap: Heap::open(
+                &self.dir.join("heap"),
+                HeapOptions {
+                    frames: self.heap_frames,
+                    direct_io: self.direct_io,
+                },
+            )?,
         })
+    }
+}
+
+impl<M: MemStore> StorageEngine<M> {
+    /// Create a builder for an engine rooted at `dir`, using `mem` as the
+    /// memtable.
+    pub fn builder(dir: &Path, mem: M) -> EngineBuilder<'_, M> {
+        EngineBuilder {
+            dir,
+            mem,
+            heap_frames: HEAP_FRAMES,
+            direct_io: false,
+            levels: None,
+        }
+    }
+
+    /// Open an engine with default settings: 1024 heap frames, buffered I/O,
+    /// default LSM levels. Convenience shortcut for `builder(dir, mem).build()`.
+    pub fn new(dir: &Path, mem: M) -> Result<Self, StorageError> {
+        Self::builder(dir, mem).build()
     }
 
     /// Insert a key-value pair: store the value in the heap, index its location.

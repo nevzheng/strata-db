@@ -11,6 +11,6 @@ mod heap;
 mod loc;
 mod page;
 
-pub use heap::{Heap, PageTuples, TupleMut, TupleRef, TupleView};
+pub use heap::{Heap, HeapOptions, PageTuples, TupleMut, TupleRef, TupleView};
 pub use loc::TupleLoc;
 pub use page::{TuplePage, TuplePageMut};

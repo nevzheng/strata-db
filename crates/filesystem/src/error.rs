@@ -37,12 +37,6 @@ pub enum Error {
     #[error("page {0:?} is locked by another handle")]
     Busy(BlockId),
 
-    /// A block buffer handed to the `BlockStore` was not exactly [`BLOCK_SIZE`] bytes.
-    ///
-    /// [`BLOCK_SIZE`]: crate::BLOCK_SIZE
-    #[error("block buffer must be {expected} bytes, got {got}")]
-    BadBlockSize { expected: usize, got: usize },
-
     /// A tuple is larger than an (empty) page can hold; it cannot live in the
     /// heap and needs out-of-line storage.
     #[error("tuple of {len} bytes exceeds the {max}-byte page capacity")]

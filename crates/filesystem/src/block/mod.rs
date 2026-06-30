@@ -10,10 +10,12 @@
 //! a page that holds no referenced data. (A dedicated `Sequencer` generalizing
 //! this is deferred; for v1 the block store is the allocator.)
 
+mod direct;
 mod file;
 pub mod journal;
 mod mem;
 
+pub use direct::DirectFile;
 pub use file::FileBlockStore;
 pub use mem::MemBlockStore;
 
@@ -25,9 +27,72 @@ use crate::{BlockId, Result};
 /// benchmarks, not a format commitment.
 pub const BLOCK_SIZE: usize = 8 * 1024;
 
-/// Raw block storage. Reads and writes whole blocks by [`BlockId`]; allocates
-/// new blocks; makes writes durable. Implementations choose their own physical
-/// addressing — the rest of the system only ever holds opaque `BlockId`s.
+/// A fixed-size, page-aligned block of [`BLOCK_SIZE`] bytes. The alignment
+/// guarantees a direct-I/O DMA target — no bounce buffer is needed.
+///
+/// Derefs to `[u8]` so all existing byte-slice code (page headers, checksums,
+/// tuple pages) works unchanged.
+#[repr(align(4096))]
+pub struct Block([u8; BLOCK_SIZE]);
+
+impl Block {
+    /// A zero-filled block.
+    pub fn zeroed() -> Self {
+        Self([0u8; BLOCK_SIZE])
+    }
+
+    /// The base pointer, for alignment checks.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Block")
+            .field(&format_args!("[{} bytes]", self.0.len()))
+            .finish()
+    }
+}
+
+impl Clone for Block {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Block {}
+
+impl std::ops::Deref for Block {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+/// Raw block storage. Reads and writes whole [`Block`]s by [`BlockId`];
+/// allocates new blocks; makes writes durable. Implementations choose their
+/// own physical addressing — the rest of the system only ever holds opaque
+/// `BlockId`s.
 pub trait BlockStore {
     /// Reserve a block and return its [`BlockId`] — a reused one from the free
     /// list, or a fresh id (growing the store) when the list is empty.
@@ -47,13 +112,13 @@ pub trait BlockStore {
     /// superblock, so the id is not re-issued later.
     fn ensure_allocated(&mut self, id: BlockId) -> Result<()>;
 
-    /// Read the block for `id` into `buf`, which must be exactly
-    /// [`BLOCK_SIZE`] bytes.
-    fn read(&self, id: BlockId, buf: &mut [u8]) -> Result<()>;
+    /// Read the block for `id` into `block`. The block's size and alignment are
+    /// fixed by the type — no runtime size check is needed.
+    fn read(&self, id: BlockId, block: &mut Block) -> Result<()>;
 
-    /// Write `buf` (exactly [`BLOCK_SIZE`] bytes) to the block for `id`. Not
-    /// durable until [`sync`](BlockStore::sync) returns.
-    fn write(&mut self, id: BlockId, buf: &[u8]) -> Result<()>;
+    /// Write `block` to the block for `id`. Not durable until
+    /// [`sync`](BlockStore::sync) returns.
+    fn write(&mut self, id: BlockId, block: &Block) -> Result<()>;
 
     /// Flush all prior writes (and the allocation high-water mark) to stable
     /// storage. This is the only durability point.

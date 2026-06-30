@@ -86,28 +86,7 @@ fn many_writes_with_periodic_flush_all_readable() {
     }
 }
 
-/// Unflushed writes do not yet survive a crash: the index journals every put,
-/// but the heap is durable only at `flush()`, so a reopen can find the index
-/// pointing at heap pages that never reached disk. Cross-journal ordering (one
-/// log / LSN protocol) is deferred — see the backlog.
-#[test]
-#[ignore = "cross-journal durability of unflushed writes is deferred (index durable per-put, heap durable per-flush)"]
-fn data_survives_reopen() {
-    let tmp = tempfile::tempdir().unwrap();
-    {
-        let mut engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
-        engine.put(b"config:theme", b"dark").unwrap();
-        engine.put(b"config:lang", b"en").unwrap();
-        engine.flush().unwrap();
-        engine.put(b"config:lang", b"fr").unwrap(); // unflushed override
-        engine.delete(b"config:theme").unwrap(); // unflushed tombstone
-    }
-    let engine = StorageEngine::new(tmp.path(), BTreeMapStore::new()).unwrap();
-    assert_eq!(get_bytes(&engine, b"config:theme"), None);
-    assert_eq!(get_bytes(&engine, b"config:lang"), Some(b"fr".to_vec()));
-}
-
-/// What *does* survive reopen today: everything committed by `flush()`.
+/// What survives reopen today: everything committed by `flush()`.
 #[test]
 fn flushed_data_survives_reopen() {
     let tmp = tempfile::tempdir().unwrap();

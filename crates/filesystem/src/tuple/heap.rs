@@ -23,6 +23,23 @@ use crate::{
     BlockId, BlockStore, FileBlockStore, PageCache, ReadPage, Result, TupleLoc, WritePage,
 };
 
+/// Options for opening a file-backed [`Heap`].
+pub struct HeapOptions {
+    /// Number of 8 KiB frames in the buffer pool. Default: 1024 (~8 MiB).
+    pub frames: usize,
+    /// Whether to use direct I/O (`O_DIRECT` / `F_NOCACHE`). Default: false.
+    pub direct_io: bool,
+}
+
+impl Default for HeapOptions {
+    fn default() -> Self {
+        Self {
+            frames: 1024,
+            direct_io: false,
+        }
+    }
+}
+
 /// A heap of tuples over a page cache. The block-store backend defaults to
 /// [`FileBlockStore`]; tests use [`MemBlockStore`](crate::MemBlockStore).
 pub struct Heap<V: BlockStore = FileBlockStore> {
@@ -32,20 +49,21 @@ pub struct Heap<V: BlockStore = FileBlockStore> {
 }
 
 impl Heap<FileBlockStore> {
-    /// Open a file-backed heap rooted at `dir`: tuple pages live in
+    /// Open a file-backed heap rooted at `dir`. Tuple pages live in
     /// `dir/tuples.db`, made durable by the journal at `dir/tuples.journal`,
-    /// fronted by a `frames`-frame buffer pool. Creates `dir` if absent.
+    /// fronted by a `opts.frames`-frame buffer pool. Creates `dir` if absent.
     ///
-    /// The block store and page cache are built and owned internally — callers
-    /// work with tuples and never touch the storage plumbing. Tuning their
-    /// behavior (cache policy, separate paths) can be exposed later.
-    pub fn open(dir: &Path, frames: usize) -> Result<Self> {
+    /// Use `HeapOptions { direct_io: true, .. }` to bypass the OS page cache
+    /// when the pool is large enough to cover the working set.
+    pub fn open(dir: &Path, opts: HeapOptions) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let cache = PageCache::with_journal(
-            FileBlockStore::open(dir.join("tuples.db"))?,
-            frames,
-            dir.join("tuples.journal"),
-        )?;
+        let block = if opts.direct_io {
+            FileBlockStore::open_direct(dir.join("tuples.db"))?
+        } else {
+            FileBlockStore::open(dir.join("tuples.db"))?
+        };
+        let cache =
+            PageCache::with_journal(block, opts.frames, dir.join("tuples.journal"))?;
         Ok(Self::new(cache))
     }
 }

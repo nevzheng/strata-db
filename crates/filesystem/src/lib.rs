@@ -39,7 +39,7 @@ pub mod workspace;
 // Block storage — raw block I/O plus the redo journal that makes its writes
 // durable.
 pub use block::journal::{BlockJournal, JournalOp};
-pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
+pub use block::{BLOCK_SIZE, Block, BlockStore, DirectFile, FileBlockStore, MemBlockStore, journal};
 
 // Memory — the allocator facade and the raw memory unit it hands out. The
 // module is interior; consumers reach the types through these re-exports.
@@ -67,7 +67,8 @@ pub use page::{HEADER_LEN, PAGE_SIZE, PageHeader, read_text, write_text};
 
 // Tuples — the tuple page format, the heap over it, and the tuple address.
 pub use tuple::{
-    Heap, PageTuples, TupleLoc, TupleMut, TuplePage, TuplePageMut, TupleRef, TupleView,
+    Heap, HeapOptions, PageTuples, TupleLoc, TupleMut, TuplePage, TuplePageMut, TupleRef,
+    TupleView,
 };
 
 // Errors.

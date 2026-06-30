@@ -9,6 +9,7 @@ edition = "2024"
 # Note: this is *not* the same polynomial as `crc32fast` (IEEE) used by the journal.
 crc32c = "0.6"
 journal = { path = "../journal" }
+libc = "0.2"
 thiserror = "2.0"
 
 [dev-dependencies]
