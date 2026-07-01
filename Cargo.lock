@@ -699,6 +699,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "journal",
+ "libc",
  "tempfile",
  "thiserror",
 ]
