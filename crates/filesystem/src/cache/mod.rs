@@ -30,12 +30,13 @@ use crate::block::journal::{BlockJournal, JournalOp};
 use crate::cache::policies::{EvictionPolicy, FrameId, LruK};
 use crate::error::Error;
 use crate::page::{finalize_checksum, verify_checksum};
-use crate::{BlockId, BlockStore, HEADER_LEN, PAGE_SIZE, PageHeader, Result};
+use crate::{Block, BlockId, BlockStore, HEADER_LEN, PageHeader, Result};
 
 /// A frame's page-sized buffer. Shared (`Rc`) so a handle can keep reading the
 /// bytes independently of the pool's own borrow; mutable (`RefCell`) so reads
-/// and writes both go through it.
-type FrameBuf = Rc<RefCell<Box<[u8]>>>;
+/// and writes both go through it. A [`Block`] so the pool's frames are aligned
+/// direct-I/O targets, not just any heap bytes.
+type FrameBuf = Rc<RefCell<Block>>;
 
 /// One slot in the pool: a page-sized buffer plus its bookkeeping.
 ///
@@ -55,7 +56,7 @@ impl Frame {
     fn new() -> Self {
         Self {
             page_id: None,
-            buf: Rc::new(RefCell::new(vec![0u8; PAGE_SIZE].into_boxed_slice())),
+            buf: Rc::new(RefCell::new(Block::zeroed())),
             readers: 0,
             writer: false,
             dirty: false,
@@ -335,7 +336,11 @@ impl<V: BlockStore> PageCache<V> {
             if let JournalOp::Write { page_id, image } = op {
                 let id = BlockId(*page_id);
                 block.ensure_allocated(id)?;
-                block.write(id, image)?;
+                // The journal stores raw page-sized images; lift into an
+                // aligned Block for the store's `write`.
+                let mut b = Block::zeroed();
+                b.copy_from_slice(image);
+                block.write(id, &b)?;
             }
         }
         block.sync()

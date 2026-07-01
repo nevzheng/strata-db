@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tuple::{TuplePage, TuplePageMut};
 use crate::{
-    BlockId, BlockStore, Error, FileBlockStore, Heap, MemoryPool, PAGE_SIZE, PageCache, PageTuples,
-    Result, Slab, TupleView,
+    BlockId, BlockStore, DiskBlockStore, Error, FileOptions, Heap, MemoryPool, PAGE_SIZE,
+    PageCache, PageTuples, Result, Slab, TupleView,
 };
 
 /// Where a tuple lives in a workspace: an opaque page handle plus a slot. Stable
@@ -210,7 +210,7 @@ impl TupleBytes for MemTuple<'_> {
 /// File-backed workspace: a journal-less page cache over a temp file. Spills hot
 /// pages to disk under cache pressure; bounded by `capacity` bytes on disk.
 pub struct FileWorkspace {
-    heap: Heap<FileBlockStore>,
+    heap: Heap<DiskBlockStore>,
     /// Page ids in insertion order, for sequential replay.
     pages: Vec<BlockId>,
     /// Hard cap on pages = `disk_budget / PAGE_SIZE`.
@@ -239,7 +239,7 @@ impl FileWorkspace {
         let max_pages = disk_budget / PAGE_SIZE;
         assert!(max_pages >= 1, "disk_budget must hold at least one page");
         let dir = temp_dir()?;
-        let store = FileBlockStore::open(dir.join("workspace.db"))?;
+        let store = DiskBlockStore::open(dir.join("workspace.db"), FileOptions::default())?;
         // `PageCache::new` (not `with_journal`) → no journal on any path. The
         // cache's frames *are* the working set; eviction is the flush-on-full.
         let heap = Heap::new(PageCache::new(store, frames));
@@ -360,16 +360,16 @@ impl Drop for FileWorkspace {
 
 /// A file block: owns a pinned page for the duration of its tuple stream.
 pub struct FileBlock {
-    page: PageTuples<FileBlockStore>,
+    page: PageTuples<DiskBlockStore>,
 }
 
 impl WorkspaceBlock for FileBlock {
     type Tuple<'b>
-        = TupleView<'b, FileBlockStore>
+        = TupleView<'b, DiskBlockStore>
     where
         Self: 'b;
 
-    fn tuples(&self) -> impl Iterator<Item = TupleView<'_, FileBlockStore>> + '_ {
+    fn tuples(&self) -> impl Iterator<Item = TupleView<'_, DiskBlockStore>> + '_ {
         self.page.iter()
     }
 }

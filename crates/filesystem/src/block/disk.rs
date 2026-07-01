@@ -9,13 +9,11 @@
 //! relocating allocator can change it without touching anything above this
 //! layer.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt; // positional read/write — no shared cursor to coordinate
 use std::path::Path;
 
-use super::{BLOCK_SIZE, BlockStore};
+use super::{BLOCK_SIZE, Block, BlockStore};
 use crate::error::Error;
-use crate::{BlockId, Result};
+use crate::{BlockId, File, FileOptions, Result};
 
 const SUPER_MAGIC: [u8; 4] = *b"SVFS";
 
@@ -25,7 +23,7 @@ const GROWTH_CHUNK_BLOCKS: u64 = 16;
 
 /// A `BlockStore` backed by a single local file.
 #[derive(Debug)]
-pub struct FileBlockStore {
+pub struct DiskBlockStore {
     file: File,
     /// Next id to hand out. Persisted in the superblock on [`sync`](BlockStore::sync).
     next_id: u64,
@@ -40,19 +38,14 @@ pub struct FileBlockStore {
     free_list: Vec<u64>,
 }
 
-impl FileBlockStore {
-    /// Open (creating if absent) the store at `path`. On a fresh file the
-    /// superblock is initialized; on an existing one the high-water mark is
-    /// recovered from it.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+impl DiskBlockStore {
+    /// Open (creating if absent) the store at `path`, per `opts`. On a fresh
+    /// file the superblock is initialized; on an existing one the high-water
+    /// mark is recovered from it.
+    pub fn open(path: impl AsRef<Path>, opts: FileOptions) -> Result<Self> {
+        let file = File::open(path, opts)?;
 
-        let len = file.metadata()?.len();
+        let len = file.size()?;
         let block = if len == 0 {
             let mut block = Self {
                 file,
@@ -111,7 +104,7 @@ impl FileBlockStore {
                 max: max_free,
             });
         }
-        let mut block = vec![0u8; BLOCK_SIZE];
+        let mut block = Block::zeroed();
         block[0..4].copy_from_slice(&SUPER_MAGIC);
         block[4..12].copy_from_slice(&self.next_id.to_be_bytes());
         block[12..20].copy_from_slice(&(self.free_list.len() as u64).to_be_bytes());
@@ -125,7 +118,7 @@ impl FileBlockStore {
     }
 
     fn read_superblock(&self) -> Result<(u64, Vec<u64>)> {
-        let mut block = vec![0u8; BLOCK_SIZE];
+        let mut block = Block::zeroed();
         self.file.read_exact_at(&mut block, 0)?;
         if block[0..4] != SUPER_MAGIC {
             return Err(Error::BadMagic);
@@ -146,7 +139,7 @@ impl FileBlockStore {
     }
 }
 
-impl BlockStore for FileBlockStore {
+impl BlockStore for DiskBlockStore {
     fn allocate(&mut self) -> Result<BlockId> {
         // Reuse a freed block first — it is already within the file's
         // grown capacity, so no `set_len` is needed.
@@ -174,15 +167,13 @@ impl BlockStore for FileBlockStore {
         Ok(())
     }
 
-    fn read(&self, id: BlockId, buf: &mut [u8]) -> Result<()> {
-        check_len(buf.len())?;
-        self.file.read_exact_at(buf, Self::offset(id))?;
+    fn read(&self, id: BlockId, block: &mut Block) -> Result<()> {
+        self.file.read_exact_at(block, Self::offset(id))?;
         Ok(())
     }
 
-    fn write(&mut self, id: BlockId, buf: &[u8]) -> Result<()> {
-        check_len(buf.len())?;
-        self.file.write_all_at(buf, Self::offset(id))?;
+    fn write(&mut self, id: BlockId, block: &Block) -> Result<()> {
+        self.file.write_all_at(block, Self::offset(id))?;
         Ok(())
     }
 
@@ -197,16 +188,6 @@ impl BlockStore for FileBlockStore {
     fn block_count(&self) -> u64 {
         self.next_id
     }
-}
-
-fn check_len(got: usize) -> Result<()> {
-    if got != BLOCK_SIZE {
-        return Err(Error::BadBlockSize {
-            expected: BLOCK_SIZE,
-            got,
-        });
-    }
-    Ok(())
 }
 
 /// `errno` for "no space left on device" — the same value on Linux,
@@ -234,7 +215,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let last = {
-            let mut store = FileBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
             // Allocate well past one growth chunk.
             let mut last = BlockId(0);
             for _ in 0..(GROWTH_CHUNK_BLOCKS * 2 + 3) {
@@ -249,7 +230,7 @@ mod tests {
 
         // Reopen: the high-water mark persists, so the next id continues
         // rather than colliding with an already-issued one.
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
         assert_eq!(store.allocate().unwrap().0, last.0 + 1);
     }
 
@@ -257,7 +238,7 @@ mod tests {
     fn allocate_reuses_freed_blocks_before_growing() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
 
         let a = store.allocate().unwrap();
         let b = store.allocate().unwrap();
@@ -283,7 +264,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let freed = {
-            let mut store = FileBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
             let _a = store.allocate().unwrap();
             let b = store.allocate().unwrap();
             store.free(b);
@@ -292,7 +273,7 @@ mod tests {
         };
 
         // Reopen recovers the free list, so the freed id is reused first.
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
         assert_eq!(store.allocate().unwrap(), freed);
     }
 
@@ -307,18 +288,18 @@ mod tests {
     fn writes_survive_chunked_growth() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
 
         // Allocate across a chunk boundary, write a marker to the last one.
         let mut id = BlockId(0);
         for _ in 0..GROWTH_CHUNK_BLOCKS + 1 {
             id = store.allocate().unwrap();
         }
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = Block::zeroed();
         buf[..4].copy_from_slice(b"MARK");
         store.write(id, &buf).unwrap();
 
-        let mut read = vec![0u8; BLOCK_SIZE];
+        let mut read = Block::zeroed();
         store.read(id, &mut read).unwrap();
         assert_eq!(&read[..4], b"MARK");
     }

@@ -18,6 +18,8 @@
 //!   `Cache`; the heap is built on the `PageCache`.
 //! - [`block`] — the [`BlockStore`] device (fixed-size block I/O over a file or
 //!   memory) and its redo [`BlockJournal`]. The bedrock the caches sit on.
+//! - [`file`] — the raw OS file handle with an explicit direct/buffered I/O
+//!   policy ([`FileOptions`]); the layer `block` itself is built on.
 //! - [`page`] — a block reinterpreted as a self-describing typed page.
 //!
 //! `cache`, `block`, and `page` are plumbing the first three sit on — public so
@@ -31,6 +33,7 @@ pub mod block;
 pub mod cache;
 pub mod codec;
 mod error;
+pub mod file;
 mod memory;
 pub mod page;
 pub mod tuple;
@@ -39,7 +42,13 @@ pub mod workspace;
 // Block storage — raw block I/O plus the redo journal that makes its writes
 // durable.
 pub use block::journal::{BlockJournal, JournalOp};
-pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
+pub use block::{
+    BLOCK_ALIGN, BLOCK_SIZE, Block, BlockStore, DiskBlockStore, MemBlockStore, journal,
+};
+
+// File — the raw OS handle with an explicit direct/buffered I/O policy, below
+// the block store.
+pub use file::{File, FileOptions};
 
 // Memory — the allocator facade and the raw memory unit it hands out. The
 // module is interior; consumers reach the types through these re-exports.

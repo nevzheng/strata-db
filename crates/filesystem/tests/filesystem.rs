@@ -4,8 +4,8 @@
 use filesystem::page::finalize_checksum;
 use filesystem::page::types::TUPLE_PAGE;
 use filesystem::{
-    BlockId, FileBlockStore, MemBlockStore, PAGE_SIZE, PageCache, PageHeader, TuplePage,
-    TuplePageMut,
+    BlockId, DiskBlockStore, FileOptions, MemBlockStore, PAGE_SIZE, PageCache, PageHeader,
+    TuplePage, TuplePageMut,
 };
 use filesystem::{BlockJournal, JournalOp, read_text, write_text};
 
@@ -17,7 +17,10 @@ fn page_survives_flush_and_reopen() {
     let path = dir.path().join("store.db");
 
     let id = {
-        let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 8);
+        let cache = PageCache::new(
+            DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap(),
+            8,
+        );
         let (id, page) = cache.allocate().unwrap();
         page.write_header(&PageHeader::new(TUPLE_PAGE, 1));
         page.payload_mut()[..5].copy_from_slice(b"hello");
@@ -27,7 +30,10 @@ fn page_survives_flush_and_reopen() {
     };
 
     // Fresh cache + freshly reopened file: the page must come back from disk.
-    let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 8);
+    let cache = PageCache::new(
+        DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap(),
+        8,
+    );
     let page = cache.read(id).unwrap();
     assert_eq!(page.header().unwrap().page_type, TUPLE_PAGE);
     assert_eq!(&page.payload()[..5], b"hello");
@@ -40,12 +46,18 @@ fn ids_are_not_reused_across_reopen() {
     let path = dir.path().join("store.db");
 
     let first = {
-        let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 4);
+        let cache = PageCache::new(
+            DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap(),
+            4,
+        );
         let (id, _page) = cache.allocate().unwrap();
         cache.flush().unwrap();
         id
     };
-    let cache = PageCache::new(FileBlockStore::open(&path).unwrap(), 4);
+    let cache = PageCache::new(
+        DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap(),
+        4,
+    );
     let (second, _page) = cache.allocate().unwrap();
     assert_ne!(first, second, "reopened store reissued a live id");
 }
@@ -117,9 +129,12 @@ fn journaled_flush_survives_reopen() {
     let journal_path = dir.path().join("pager.journal");
 
     let id = {
-        let cache =
-            PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
-                .unwrap();
+        let cache = PageCache::with_journal(
+            DiskBlockStore::open(&vfs_path, FileOptions { direct: true }).unwrap(),
+            8,
+            &journal_path,
+        )
+        .unwrap();
         let (id, page) = cache.allocate().unwrap();
         page.write_header(&PageHeader::new(TUPLE_PAGE, 1));
         page.payload_mut()[..3].copy_from_slice(b"hey");
@@ -128,8 +143,12 @@ fn journaled_flush_survives_reopen() {
         id
     };
 
-    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
-        .unwrap();
+    let cache = PageCache::with_journal(
+        DiskBlockStore::open(&vfs_path, FileOptions { direct: true }).unwrap(),
+        8,
+        &journal_path,
+    )
+    .unwrap();
     let page = cache.read(id).unwrap();
     assert_eq!(&page.payload()[..3], b"hey");
 }
@@ -165,8 +184,12 @@ fn recovery_replays_committed_write_the_vfs_never_had() {
         journal.append(&JournalOp::Commit).unwrap();
     }
 
-    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
-        .unwrap();
+    let cache = PageCache::with_journal(
+        DiskBlockStore::open(&vfs_path, FileOptions { direct: true }).unwrap(),
+        8,
+        &journal_path,
+    )
+    .unwrap();
 
     // The page is back, sourced purely from the journal.
     let page = cache.read(BlockId(1)).unwrap();
@@ -203,8 +226,12 @@ fn recovery_discards_uncommitted_writes() {
             .unwrap();
     }
 
-    let cache = PageCache::with_journal(FileBlockStore::open(&vfs_path).unwrap(), 8, &journal_path)
-        .unwrap();
+    let cache = PageCache::with_journal(
+        DiskBlockStore::open(&vfs_path, FileOptions { direct: true }).unwrap(),
+        8,
+        &journal_path,
+    )
+    .unwrap();
 
     // Page 1 was never committed, so it isn't there...
     assert!(cache.read(BlockId(1)).is_err());

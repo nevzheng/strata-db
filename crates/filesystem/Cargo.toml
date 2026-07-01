@@ -11,5 +11,10 @@ crc32c = "0.6"
 journal = { path = "../journal" }
 thiserror = "2.0"
 
+# Direct-I/O FFI: `O_DIRECT` (Linux) and `fcntl(F_NOCACHE)` (macOS) have no std
+# equivalent. Confined to `file.rs` — the one place we touch the raw fd.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
