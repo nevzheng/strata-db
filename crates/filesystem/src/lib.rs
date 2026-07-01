@@ -39,7 +39,9 @@ pub mod workspace;
 // Block storage — raw block I/O plus the redo journal that makes its writes
 // durable.
 pub use block::journal::{BlockJournal, JournalOp};
-pub use block::{BLOCK_SIZE, BlockStore, FileBlockStore, MemBlockStore, journal};
+pub use block::{
+    BLOCK_ALIGN, BLOCK_SIZE, Block, BlockStore, FileBlockStore, MemBlockStore, journal,
+};
 
 // Memory — the allocator facade and the raw memory unit it hands out. The
 // module is interior; consumers reach the types through these re-exports.

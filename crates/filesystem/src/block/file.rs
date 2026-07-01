@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt; // positional read/write — no shared cursor to coordinate
 use std::path::Path;
 
-use super::{BLOCK_SIZE, BlockStore};
+use super::{BLOCK_SIZE, Block, BlockStore};
 use crate::error::Error;
 use crate::{BlockId, Result};
 
@@ -174,15 +174,13 @@ impl BlockStore for FileBlockStore {
         Ok(())
     }
 
-    fn read(&self, id: BlockId, buf: &mut [u8]) -> Result<()> {
-        check_len(buf.len())?;
-        self.file.read_exact_at(buf, Self::offset(id))?;
+    fn read(&self, id: BlockId, block: &mut Block) -> Result<()> {
+        self.file.read_exact_at(block, Self::offset(id))?;
         Ok(())
     }
 
-    fn write(&mut self, id: BlockId, buf: &[u8]) -> Result<()> {
-        check_len(buf.len())?;
-        self.file.write_all_at(buf, Self::offset(id))?;
+    fn write(&mut self, id: BlockId, block: &Block) -> Result<()> {
+        self.file.write_all_at(block, Self::offset(id))?;
         Ok(())
     }
 
@@ -197,16 +195,6 @@ impl BlockStore for FileBlockStore {
     fn block_count(&self) -> u64 {
         self.next_id
     }
-}
-
-fn check_len(got: usize) -> Result<()> {
-    if got != BLOCK_SIZE {
-        return Err(Error::BadBlockSize {
-            expected: BLOCK_SIZE,
-            got,
-        });
-    }
-    Ok(())
 }
 
 /// `errno` for "no space left on device" — the same value on Linux,
@@ -314,11 +302,11 @@ mod tests {
         for _ in 0..GROWTH_CHUNK_BLOCKS + 1 {
             id = store.allocate().unwrap();
         }
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = Block::zeroed();
         buf[..4].copy_from_slice(b"MARK");
         store.write(id, &buf).unwrap();
 
-        let mut read = vec![0u8; BLOCK_SIZE];
+        let mut read = Block::zeroed();
         store.read(id, &mut read).unwrap();
         assert_eq!(&read[..4], b"MARK");
     }

@@ -25,6 +25,69 @@ use crate::{BlockId, Result};
 /// benchmarks, not a format commitment.
 pub const BLOCK_SIZE: usize = 8 * 1024;
 
+/// Alignment (bytes) a [`Block`] guarantees. 4 KiB covers every mainstream
+/// device's logical *and* physical sector size, which is what direct I/O
+/// requires of both the buffer address and the transfer offset/length. Our
+/// [`BLOCK_SIZE`] is a multiple of it, so block-granular I/O is always aligned.
+pub const BLOCK_ALIGN: usize = 4096;
+
+/// A [`BLOCK_SIZE`]-byte buffer aligned to [`BLOCK_ALIGN`] — the unit of I/O
+/// between the cache and a [`BlockStore`].
+///
+/// The alignment exists so the buffer is a legal direct-I/O target: `O_DIRECT`
+/// (Linux) and `F_NOCACHE` (macOS) demand a sector-aligned address, and this
+/// type carries that invariant in its layout instead of asking every call site
+/// to prove it. `Deref<Target = [u8]>` keeps the byte-slice code above
+/// (headers, checksums, tuple pages) working unchanged.
+#[repr(align(4096))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct Block([u8; BLOCK_SIZE]);
+
+impl Block {
+    /// A zero-filled block.
+    pub fn zeroed() -> Self {
+        Self([0u8; BLOCK_SIZE])
+    }
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl std::ops::Deref for Block {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for Block {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsMut<[u8]> for Block {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+// The array's own Debug would dump 8 KiB; a size summary is all a block is.
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Block([{BLOCK_SIZE} bytes])")
+    }
+}
+
 /// Raw block storage. Reads and writes whole blocks by [`BlockId`]; allocates
 /// new blocks; makes writes durable. Implementations choose their own physical
 /// addressing — the rest of the system only ever holds opaque `BlockId`s.
@@ -47,13 +110,13 @@ pub trait BlockStore {
     /// superblock, so the id is not re-issued later.
     fn ensure_allocated(&mut self, id: BlockId) -> Result<()>;
 
-    /// Read the block for `id` into `buf`, which must be exactly
-    /// [`BLOCK_SIZE`] bytes.
-    fn read(&self, id: BlockId, buf: &mut [u8]) -> Result<()>;
+    /// Read the block for `id` into `block`. Its size and alignment are fixed
+    /// by the [`Block`] type, so there is no length to check.
+    fn read(&self, id: BlockId, block: &mut Block) -> Result<()>;
 
-    /// Write `buf` (exactly [`BLOCK_SIZE`] bytes) to the block for `id`. Not
-    /// durable until [`sync`](BlockStore::sync) returns.
-    fn write(&mut self, id: BlockId, buf: &[u8]) -> Result<()>;
+    /// Write `block` to the block for `id`. Not durable until
+    /// [`sync`](BlockStore::sync) returns.
+    fn write(&mut self, id: BlockId, block: &Block) -> Result<()>;
 
     /// Flush all prior writes (and the allocation high-water mark) to stable
     /// storage. This is the only durability point.

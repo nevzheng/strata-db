@@ -1,7 +1,7 @@
 //! An in-memory [`BlockStore`] — blocks are `Vec` entries. Non-durable (`sync` is a
 //! no-op); for tests and ephemeral stores.
 
-use super::{BLOCK_SIZE, BlockStore};
+use super::{Block, BlockStore};
 use crate::error::Error;
 use crate::{BlockId, Result};
 
@@ -10,7 +10,7 @@ use crate::{BlockId, Result};
 /// keeping ids consistent if a store is later moved between backends.
 #[derive(Debug, Default)]
 pub struct MemBlockStore {
-    blocks: Vec<Box<[u8]>>,
+    blocks: Vec<Block>,
     next_id: u64,
     /// Freed block ids available for reuse, mirroring [`FileBlockStore`](super::FileBlockStore).
     free_list: Vec<u64>,
@@ -50,20 +50,18 @@ impl BlockStore for MemBlockStore {
         Ok(())
     }
 
-    fn read(&self, id: BlockId, buf: &mut [u8]) -> Result<()> {
-        check_len(buf.len())?;
-        let block = self.blocks.get(id.0 as usize).ok_or(Error::Checksum(id))?;
-        buf.copy_from_slice(block);
+    fn read(&self, id: BlockId, block: &mut Block) -> Result<()> {
+        let stored = self.blocks.get(id.0 as usize).ok_or(Error::Checksum(id))?;
+        block.copy_from_slice(stored);
         Ok(())
     }
 
-    fn write(&mut self, id: BlockId, buf: &[u8]) -> Result<()> {
-        check_len(buf.len())?;
-        let block = self
+    fn write(&mut self, id: BlockId, block: &Block) -> Result<()> {
+        let stored = self
             .blocks
             .get_mut(id.0 as usize)
             .ok_or(Error::Checksum(id))?;
-        block.copy_from_slice(buf);
+        stored.copy_from_slice(block);
         Ok(())
     }
 
@@ -76,16 +74,6 @@ impl BlockStore for MemBlockStore {
     }
 }
 
-fn zeroed() -> Box<[u8]> {
-    vec![0u8; BLOCK_SIZE].into_boxed_slice()
-}
-
-fn check_len(got: usize) -> Result<()> {
-    if got != BLOCK_SIZE {
-        return Err(Error::BadBlockSize {
-            expected: BLOCK_SIZE,
-            got,
-        });
-    }
-    Ok(())
+fn zeroed() -> Block {
+    Block::zeroed()
 }
