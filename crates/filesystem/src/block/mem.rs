@@ -6,13 +6,13 @@ use crate::error::Error;
 use crate::{BlockId, Result};
 
 /// Blocks held in memory, indexed by `BlockId`. Block 0 is reserved (so the
-/// first issued id is 1), mirroring [`FileBlockStore`](super::FileBlockStore)'s superblock and
+/// first issued id is 1), mirroring [`DiskBlockStore`](super::DiskBlockStore)'s superblock and
 /// keeping ids consistent if a store is later moved between backends.
 #[derive(Debug, Default)]
 pub struct MemBlockStore {
     blocks: Vec<Block>,
     next_id: u64,
-    /// Freed block ids available for reuse, mirroring [`FileBlockStore`](super::FileBlockStore).
+    /// Freed block ids available for reuse, mirroring [`DiskBlockStore`](super::DiskBlockStore).
     free_list: Vec<u64>,
 }
 

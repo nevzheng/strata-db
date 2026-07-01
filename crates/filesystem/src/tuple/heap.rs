@@ -20,18 +20,18 @@ use std::path::Path;
 use super::page::{TuplePage, TuplePageMut};
 use crate::error::Error;
 use crate::{
-    BlockId, BlockStore, FileBlockStore, PageCache, ReadPage, Result, TupleLoc, WritePage,
+    BlockId, BlockStore, DiskBlockStore, PageCache, ReadPage, Result, TupleLoc, WritePage,
 };
 
 /// A heap of tuples over a page cache. The block-store backend defaults to
-/// [`FileBlockStore`]; tests use [`MemBlockStore`](crate::MemBlockStore).
-pub struct Heap<V: BlockStore = FileBlockStore> {
+/// [`DiskBlockStore`]; tests use [`MemBlockStore`](crate::MemBlockStore).
+pub struct Heap<V: BlockStore = DiskBlockStore> {
     cache: PageCache<V>,
     /// The page currently being filled. `None` until the first insert.
     current: Cell<Option<BlockId>>,
 }
 
-impl Heap<FileBlockStore> {
+impl Heap<DiskBlockStore> {
     /// Open a file-backed heap rooted at `dir`: tuple pages live in
     /// `dir/tuples.db`, made durable by the journal at `dir/tuples.journal`,
     /// fronted by a `frames`-frame buffer pool. Creates `dir` if absent.
@@ -42,7 +42,7 @@ impl Heap<FileBlockStore> {
     pub fn open(dir: &Path, frames: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let cache = PageCache::with_journal(
-            FileBlockStore::open(dir.join("tuples.db"))?,
+            DiskBlockStore::open(dir.join("tuples.db"))?,
             frames,
             dir.join("tuples.journal"),
         )?;
@@ -149,7 +149,7 @@ impl<V: BlockStore> Heap<V> {
 
 /// A read view of one tuple, owning the pin on its page. The bytes it exposes
 /// borrow straight into the cached frame.
-pub struct TupleRef<V: BlockStore = FileBlockStore> {
+pub struct TupleRef<V: BlockStore = DiskBlockStore> {
     page: ReadPage<V>,
     slot: u16,
 }
@@ -172,7 +172,7 @@ impl<V: BlockStore> TupleRef<V> {
 
 /// A write view of one tuple, owning the exclusive pin on its page. Allows
 /// in-place, same-length mutation of the tuple's bytes.
-pub struct TupleMut<V: BlockStore = FileBlockStore> {
+pub struct TupleMut<V: BlockStore = DiskBlockStore> {
     page: WritePage<V>,
     slot: u16,
 }
@@ -206,7 +206,7 @@ impl<V: BlockStore> TupleMut<V> {
 
 /// A pinned tuple page, held to read many of its tuples. Owns the single
 /// [`ReadPage`] (one pin); every [`TupleView`] borrowed from it shares that pin.
-pub struct PageTuples<V: BlockStore = FileBlockStore> {
+pub struct PageTuples<V: BlockStore = DiskBlockStore> {
     page: ReadPage<V>,
 }
 
@@ -238,7 +238,7 @@ impl<V: BlockStore> PageTuples<V> {
 
 /// A borrowed view of one tuple, sharing its page's single pin via the
 /// [`PageTuples`] it came from. Holds no pin of its own.
-pub struct TupleView<'p, V: BlockStore = FileBlockStore> {
+pub struct TupleView<'p, V: BlockStore = DiskBlockStore> {
     page: &'p ReadPage<V>,
     slot: u16,
 }

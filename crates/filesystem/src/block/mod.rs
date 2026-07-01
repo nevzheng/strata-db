@@ -10,11 +10,11 @@
 //! a page that holds no referenced data. (A dedicated `Sequencer` generalizing
 //! this is deferred; for v1 the block store is the allocator.)
 
-mod file;
+mod disk;
 pub mod journal;
 mod mem;
 
-pub use file::FileBlockStore;
+pub use disk::DiskBlockStore;
 pub use mem::MemBlockStore;
 
 use crate::{BlockId, Result};

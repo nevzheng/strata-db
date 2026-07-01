@@ -25,7 +25,7 @@ const GROWTH_CHUNK_BLOCKS: u64 = 16;
 
 /// A `BlockStore` backed by a single local file.
 #[derive(Debug)]
-pub struct FileBlockStore {
+pub struct DiskBlockStore {
     file: File,
     /// Next id to hand out. Persisted in the superblock on [`sync`](BlockStore::sync).
     next_id: u64,
@@ -40,7 +40,7 @@ pub struct FileBlockStore {
     free_list: Vec<u64>,
 }
 
-impl FileBlockStore {
+impl DiskBlockStore {
     /// Open (creating if absent) the store at `path`. On a fresh file the
     /// superblock is initialized; on an existing one the high-water mark is
     /// recovered from it.
@@ -146,7 +146,7 @@ impl FileBlockStore {
     }
 }
 
-impl BlockStore for FileBlockStore {
+impl BlockStore for DiskBlockStore {
     fn allocate(&mut self) -> Result<BlockId> {
         // Reuse a freed block first — it is already within the file's
         // grown capacity, so no `set_len` is needed.
@@ -222,7 +222,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let last = {
-            let mut store = FileBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path).unwrap();
             // Allocate well past one growth chunk.
             let mut last = BlockId(0);
             for _ in 0..(GROWTH_CHUNK_BLOCKS * 2 + 3) {
@@ -237,7 +237,7 @@ mod tests {
 
         // Reopen: the high-water mark persists, so the next id continues
         // rather than colliding with an already-issued one.
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path).unwrap();
         assert_eq!(store.allocate().unwrap().0, last.0 + 1);
     }
 
@@ -245,7 +245,7 @@ mod tests {
     fn allocate_reuses_freed_blocks_before_growing() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path).unwrap();
 
         let a = store.allocate().unwrap();
         let b = store.allocate().unwrap();
@@ -271,7 +271,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let freed = {
-            let mut store = FileBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path).unwrap();
             let _a = store.allocate().unwrap();
             let b = store.allocate().unwrap();
             store.free(b);
@@ -280,7 +280,7 @@ mod tests {
         };
 
         // Reopen recovers the free list, so the freed id is reused first.
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path).unwrap();
         assert_eq!(store.allocate().unwrap(), freed);
     }
 
@@ -295,7 +295,7 @@ mod tests {
     fn writes_survive_chunked_growth() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = FileBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path).unwrap();
 
         // Allocate across a chunk boundary, write a marker to the last one.
         let mut id = BlockId(0);

@@ -40,7 +40,7 @@ pub mod workspace;
 // durable.
 pub use block::journal::{BlockJournal, JournalOp};
 pub use block::{
-    BLOCK_ALIGN, BLOCK_SIZE, Block, BlockStore, FileBlockStore, MemBlockStore, journal,
+    BLOCK_ALIGN, BLOCK_SIZE, Block, BlockStore, DiskBlockStore, MemBlockStore, journal,
 };
 
 // Memory — the allocator facade and the raw memory unit it hands out. The
