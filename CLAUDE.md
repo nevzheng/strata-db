@@ -19,3 +19,7 @@ Do not add `Co-Authored-By` lines to commit messages.
 ## Code Quality
 
 Pre-commit hooks run `cargo fmt --check` and `cargo clippy -- -D warnings`. All code must pass both before committing.
+
+## Comments
+
+Comments explain **why**, not how — the code already shows how. Write one only when the reasoning is non-obvious: an invariant, a trade-off, a subtle constraint, a "why not the obvious alternative". Keep them concise. When there's nothing meaningful to say, add no comment.
