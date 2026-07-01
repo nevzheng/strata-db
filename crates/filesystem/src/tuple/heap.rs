@@ -20,7 +20,8 @@ use std::path::Path;
 use super::page::{TuplePage, TuplePageMut};
 use crate::error::Error;
 use crate::{
-    BlockId, BlockStore, DiskBlockStore, PageCache, ReadPage, Result, TupleLoc, WritePage,
+    BlockId, BlockStore, DiskBlockStore, FileOptions, PageCache, ReadPage, Result, TupleLoc,
+    WritePage,
 };
 
 /// A heap of tuples over a page cache. The block-store backend defaults to
@@ -42,7 +43,8 @@ impl Heap<DiskBlockStore> {
     pub fn open(dir: &Path, frames: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let cache = PageCache::with_journal(
-            DiskBlockStore::open(dir.join("tuples.db"))?,
+            // The page cache manages its own pool, so bypass the OS cache.
+            DiskBlockStore::open(dir.join("tuples.db"), FileOptions { direct: true })?,
             frames,
             dir.join("tuples.journal"),
         )?;

@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tuple::{TuplePage, TuplePageMut};
 use crate::{
-    BlockId, BlockStore, DiskBlockStore, Error, Heap, MemoryPool, PAGE_SIZE, PageCache, PageTuples,
-    Result, Slab, TupleView,
+    BlockId, BlockStore, DiskBlockStore, Error, FileOptions, Heap, MemoryPool, PAGE_SIZE,
+    PageCache, PageTuples, Result, Slab, TupleView,
 };
 
 /// Where a tuple lives in a workspace: an opaque page handle plus a slot. Stable
@@ -239,7 +239,7 @@ impl FileWorkspace {
         let max_pages = disk_budget / PAGE_SIZE;
         assert!(max_pages >= 1, "disk_budget must hold at least one page");
         let dir = temp_dir()?;
-        let store = DiskBlockStore::open(dir.join("workspace.db"))?;
+        let store = DiskBlockStore::open(dir.join("workspace.db"), FileOptions::default())?;
         // `PageCache::new` (not `with_journal`) → no journal on any path. The
         // cache's frames *are* the working set; eviction is the flush-on-full.
         let heap = Heap::new(PageCache::new(store, frames));

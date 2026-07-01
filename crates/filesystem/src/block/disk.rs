@@ -9,13 +9,11 @@
 //! relocating allocator can change it without touching anything above this
 //! layer.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt; // positional read/write — no shared cursor to coordinate
 use std::path::Path;
 
 use super::{BLOCK_SIZE, Block, BlockStore};
 use crate::error::Error;
-use crate::{BlockId, Result};
+use crate::{BlockId, File, FileOptions, Result};
 
 const SUPER_MAGIC: [u8; 4] = *b"SVFS";
 
@@ -41,18 +39,13 @@ pub struct DiskBlockStore {
 }
 
 impl DiskBlockStore {
-    /// Open (creating if absent) the store at `path`. On a fresh file the
-    /// superblock is initialized; on an existing one the high-water mark is
-    /// recovered from it.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+    /// Open (creating if absent) the store at `path`, per `opts`. On a fresh
+    /// file the superblock is initialized; on an existing one the high-water
+    /// mark is recovered from it.
+    pub fn open(path: impl AsRef<Path>, opts: FileOptions) -> Result<Self> {
+        let file = File::open(path, opts)?;
 
-        let len = file.metadata()?.len();
+        let len = file.size()?;
         let block = if len == 0 {
             let mut block = Self {
                 file,
@@ -111,7 +104,7 @@ impl DiskBlockStore {
                 max: max_free,
             });
         }
-        let mut block = vec![0u8; BLOCK_SIZE];
+        let mut block = Block::zeroed();
         block[0..4].copy_from_slice(&SUPER_MAGIC);
         block[4..12].copy_from_slice(&self.next_id.to_be_bytes());
         block[12..20].copy_from_slice(&(self.free_list.len() as u64).to_be_bytes());
@@ -125,7 +118,7 @@ impl DiskBlockStore {
     }
 
     fn read_superblock(&self) -> Result<(u64, Vec<u64>)> {
-        let mut block = vec![0u8; BLOCK_SIZE];
+        let mut block = Block::zeroed();
         self.file.read_exact_at(&mut block, 0)?;
         if block[0..4] != SUPER_MAGIC {
             return Err(Error::BadMagic);
@@ -222,7 +215,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let last = {
-            let mut store = DiskBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
             // Allocate well past one growth chunk.
             let mut last = BlockId(0);
             for _ in 0..(GROWTH_CHUNK_BLOCKS * 2 + 3) {
@@ -237,7 +230,7 @@ mod tests {
 
         // Reopen: the high-water mark persists, so the next id continues
         // rather than colliding with an already-issued one.
-        let mut store = DiskBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
         assert_eq!(store.allocate().unwrap().0, last.0 + 1);
     }
 
@@ -245,7 +238,7 @@ mod tests {
     fn allocate_reuses_freed_blocks_before_growing() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = DiskBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
 
         let a = store.allocate().unwrap();
         let b = store.allocate().unwrap();
@@ -271,7 +264,7 @@ mod tests {
         let path = dir.path().join("t.db");
 
         let freed = {
-            let mut store = DiskBlockStore::open(&path).unwrap();
+            let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
             let _a = store.allocate().unwrap();
             let b = store.allocate().unwrap();
             store.free(b);
@@ -280,7 +273,7 @@ mod tests {
         };
 
         // Reopen recovers the free list, so the freed id is reused first.
-        let mut store = DiskBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
         assert_eq!(store.allocate().unwrap(), freed);
     }
 
@@ -295,7 +288,7 @@ mod tests {
     fn writes_survive_chunked_growth() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.db");
-        let mut store = DiskBlockStore::open(&path).unwrap();
+        let mut store = DiskBlockStore::open(&path, FileOptions { direct: true }).unwrap();
 
         // Allocate across a chunk boundary, write a marker to the last one.
         let mut id = BlockId(0);
